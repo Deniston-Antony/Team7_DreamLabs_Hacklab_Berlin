@@ -77,15 +77,17 @@ class Watching:
 class Workers:
     """Headless attempts, each with its own task, started one after another and collected at the end."""
 
-    def __init__(self, task, env, jobs, folder):
+    def __init__(self, task, env, jobs, folder, objects=None):
         """Save the scene and start one worker per job in the background.
         @param task The task dictionary: max_seconds.
         @param env Simulation environment whose current scene the workers copy.
         @param jobs List of dicts with `instruction`, `goal` ({"object", "target"} as main.parse_goal returns) and
             `attempt` (the number the attempt has in the request, 2 or more; its video is attempt-<n>.mp4).
         @param folder Folder for the scene copy and the workers' videos.
+        @param objects Scene objects whose poses each worker saves as evaluation evidence
+            (attempt-<n>.evidence.json); None saves no evidence.
         """
-        self.folder, self.jobs, self.procs, self.outputs = folder, jobs, [], {}
+        self.folder, self.jobs, self.procs, self.outputs, self.objects = folder, jobs, [], {}, objects
         self.watching = {job["attempt"]: Watching(job) for job in jobs}
         self.model_path, self.state_path = folder / "scene.mjb", folder / "scene.npz"
         mujoco.mj_saveModel(env.model, str(self.model_path))
@@ -94,6 +96,11 @@ class Workers:
         self.env = dict(os.environ)
         if sys.platform.startswith("linux"):
             self.env.setdefault("MUJOCO_GL", "egl")  # no window for a worker
+        if objects:  # the worker imports the backend's evaluation package to capture evidence
+            backend = Path(__file__).resolve().parent
+            paths = [str(backend), str(backend / ".deps")]
+            paths += [str(Path(item).resolve()) for item in self.env.get("PYTHONPATH", "").split(os.pathsep) if item]
+            self.env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
         self.thread = threading.Thread(target=self._launch, daemon=True)
         self.thread.start()
 
@@ -121,7 +128,16 @@ class Workers:
             job["goal"]["target"],
             "--record",
             str(self.folder / f"attempt-{job['attempt']}.mp4"),
-        ]
+        ] + (
+            [
+                "--evidence",
+                str(self.folder / f"attempt-{job['attempt']}.evidence.json"),
+                "--evidence-objects",
+                ",".join(self.objects),
+            ]
+            if self.objects
+            else []
+        )
 
     def _launch(self):
         for job in self.jobs:
@@ -211,12 +227,13 @@ class Workers:
 class Session:
     """One request's recording and hidden attempts: start it before dc.main, call finish() after."""
 
-    def __init__(self, task, env, goals):
+    def __init__(self, task, env, goals, objects=None):
         """Start recording the live attempt and, when asked and possible, every hidden attempt.
         @param task The task dictionary: task_id, max_seconds and `plan`, a list of {"instruction", "attempts"}.
         @param env The backend's simulation environment.
         @param goals One goal per plan entry ({"object", "target"} from main.parse_goal, or None when the
             instruction cannot be checked), in the same order.
+        @param objects Scene objects the hidden attempts record as evaluation evidence; None records none.
         """
         global current
         self.task, self.env, self.finished, self.workers = task, env, False, None
@@ -241,7 +258,7 @@ class Session:
                 number += 1
         if notes:
             task["attempts_note"] = " ".join(notes)
-        self.workers = Workers(task, env, self.jobs, self.folder) if self.jobs else None
+        self.workers = Workers(task, env, self.jobs, self.folder, objects) if self.jobs else None
         self.recorder = recording.attach(env, self.folder / "attempt-1.mp4")
         self.started = env.data.time
         current = self  # last, so the page never sees a half-built session

@@ -24,7 +24,69 @@ def group_scores(rows: list[tuple[TaskDefinition, TaskResult]], key: str) -> lis
     return output
 
 
+def summarize_run(rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[str, Any]:
+    ordered = sorted(rows, key=lambda row: row[0].attempt)
+    first = ordered[0][0]
+    results = [result for _, result, _ in ordered]
+    scored = [result.score for result in results if result.score is not None]
+    outcomes = [result.outcome for result in results]
+    evaluable = [item for item in outcomes if item != "NOT_EVALUABLE"]
+    successes = outcomes.count("SUCCESS")
+    if not evaluable:
+        outcome = "NOT_EVALUABLE"
+    elif "UNSAFE" in evaluable:
+        outcome = "UNSAFE"
+    elif successes == len(evaluable):
+        outcome = "SUCCESS"
+    elif successes or "PARTIAL_SUCCESS" in evaluable:
+        outcome = "PARTIAL_SUCCESS"
+    else:
+        outcome = "FAILURE"
+    advice = []
+    if len(ordered) > 1 and evaluable:
+        advice.append(f"{successes} of {len(evaluable)} scored attempts succeeded for '{first.instruction}'.")
+        if 0 < successes < len(evaluable):
+            best = max((row for row in ordered if row[1].score is not None), key=lambda row: row[1].score)
+            advice.append(f"Compare attempt {best[0].attempt} with the failed attempts to see which approach worked.")
+    if len(evaluable) < len(ordered):
+        advice.append(f"{len(ordered) - len(evaluable)} attempt(s) could not be scored and should be re-run.")
+    return {
+        "run_id": first.run,
+        "batch_id": first.batch_id,
+        "instruction": first.instruction,
+        "scene_id": first.scene_id,
+        "robot_id": first.robot_id,
+        "started_at": first.started_at,
+        "outcome": outcome,
+        "final_score": round(mean(scored), 2) if scored else None,
+        "best_score": max(scored) if scored else None,
+        "worst_score": min(scored) if scored else None,
+        "attempts_total": len(ordered),
+        "attempts_scored": len(evaluable),
+        "attempts_succeeded": successes,
+        "attempts": [
+            {
+                "attempt": task.attempt,
+                "where": task.where,
+                "task_id": task.task_id,
+                "execution_status": status,
+                "outcome": result.outcome,
+                "score": result.score,
+                "penalties": result.total_penalties,
+                "summary": result.summary,
+            }
+            for task, result, status in ordered
+        ],
+        "recommendations": advice,
+    }
+
+
 def aggregate(batch_id: str, rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[str, Any]:
+    grouped: dict[str, list[tuple[TaskDefinition, TaskResult, str]]] = {}
+    for row in rows:
+        grouped.setdefault(row[0].run, []).append(row)
+    runs = sorted((summarize_run(items) for items in grouped.values()), key=lambda item: item["started_at"] or 0, reverse=True)
+    started = [item["started_at"] for item in runs if item["started_at"] is not None]
     pairs = [(task, result) for task, result, _ in rows]
     evaluable = [(task, result) for task, result in pairs if result.outcome != "NOT_EVALUABLE" and result.score is not None]
     scores = [result.score for _, result in evaluable]
@@ -55,6 +117,10 @@ def aggregate(batch_id: str, rows: list[tuple[TaskDefinition, TaskResult, str]])
         recommendations.append("Re-run tasks that could not be evaluated.")
     return {
         "batch_id": batch_id,
+        "first_started_at": min(started) if started else None,
+        "last_started_at": max(started) if started else None,
+        "total_runs": len(runs),
+        "runs": runs,
         "total_tasks": total,
         "successful": outcomes["SUCCESS"],
         "partial": outcomes["PARTIAL_SUCCESS"],

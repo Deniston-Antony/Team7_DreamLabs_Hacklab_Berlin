@@ -9,6 +9,8 @@ SETTLE_STEPS = 250
 TRAJECTORY_EVERY_STEPS = 8
 CONTACT_GAP_S = 0.2
 CONTROL_STEP_S = 0.05
+APPROACH_M = 0.06
+ACTION_KEYS = {"q_l_chunk", "q_r_chunk"}
 CORNERS = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
 
 
@@ -26,6 +28,14 @@ class EvidenceCapture:
         self.open_contacts: dict[tuple[str, str], ContactEvent] = {}
         self.closed_contacts: list[ContactEvent] = []
         self.trajectory = {name: [] for name in self.object_ids}
+        self.tcp_sites = [
+            site
+            for site in (mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_tcp") for side in ("left", "right"))
+            if site >= 0
+        ]
+        self.min_tcp_distance: dict[str, float] = {}
+        self.first_reached: dict[str, float] = {}
+        self.model_output_keys: set[str] = set()
         self.initial, _ = self._settled("initial")
         self.max_heights = {item.object_id: item.position[2] for item in self.initial.objects}
 
@@ -38,6 +48,9 @@ class EvidenceCapture:
     def _count_model_call(self, round_trip):
         if getattr(round_trip, "error", None) is None:
             self.model_calls += 1
+            action = getattr(round_trip, "action", None)
+            if isinstance(action, dict):
+                self.model_output_keys.update(str(key) for key in action if key not in ACTION_KEYS)
 
     def _label(self, geom):
         m = self.env.model
@@ -73,6 +86,13 @@ class EvidenceCapture:
             z = float(d.xpos[body_id][2])
             if z > self.max_heights[name]:
                 self.max_heights[name] = round(z, 4)
+        if self.tcp_sites and self.steps > self.startup_steps:
+            tips = d.site_xpos[self.tcp_sites]
+            for name, body_id in self.bodies.items():
+                distance = float(np.linalg.norm(tips - d.xpos[body_id], axis=1).min())
+                self.min_tcp_distance[name] = min(distance, self.min_tcp_distance.get(name, distance))
+                if distance < APPROACH_M and name not in self.first_reached:
+                    self.first_reached[name] = round(now, 3)
         current = self._pairs(d)
         for pair in current:
             event = self.open_contacts.get(pair)
@@ -168,4 +188,12 @@ class EvidenceCapture:
             errors=errors,
             videos=videos,
             hidden_attempts=hidden_attempts,
+            approach=None
+            if not self.min_tcp_distance
+            else {
+                "reach_threshold_cm": APPROACH_M * 100,
+                "min_distance_cm": {name: round(value * 100, 1) for name, value in self.min_tcp_distance.items()},
+                "first_reached_s": self.first_reached,
+            },
+            model_output_keys=sorted(self.model_output_keys),
         )

@@ -9,7 +9,7 @@ The evaluation module scores each finished website task from MuJoCo evidence. It
 3. After the run, it records a settled final scene.
 4. It checks the task, finds disturbances, calculates the score and saves the report in `backend/evaluation_data/`.
 
-Hidden parallel attempts are listed with their success and closest distance. **Only the live attempt receives the full score**, because hidden workers do not yet send full snapshots.
+Every parallel attempt records its own snapshots, contacts, video and report. The run's **Final report** averages the scored attempts, and each attempt keeps its own recommendations. Reports and videos stay available under **Benchmark history** after a restart.
 
 ## Supported instructions
 
@@ -66,12 +66,13 @@ Only the most serious incident per object is scored, which prevents one collisio
 | `GET` | `/api/evaluation/batches` | Current and saved benchmarks |
 | `POST` | `/api/evaluation/batches` | Start a new benchmark |
 | `GET` | `/api/reports/tasks/{task_id}?format=json\|html` | Full task report |
+| `GET` | `/api/reports/runs/{run_id}?format=json\|html` | Final report with every attempt |
 | `GET` | `/api/reports/batches/{batch_id}?format=json\|html` | Full benchmark report |
 | `GET` | `/api/reports/batches/{batch_id}/summary` | Website summary |
 
 ## Limitations
 
-- Perception is `NOT_MEASURED` because Dream-1 does not expose what it recognised.
+- Dream-1's API returns arm actions, not detections or attention maps. **Perception (inferred)** uses which object the gripper reached first. It is evidence of behaviour, is not scored, and does not prove what the model recognised.
 - Contacts are sampled at control steps, so very brief contacts can be missed.
 - Uploaded STL collisions use a convex shape.
 - A small number of runs does not establish statistically meaningful performance.

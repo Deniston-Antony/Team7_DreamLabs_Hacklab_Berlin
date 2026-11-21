@@ -7,7 +7,7 @@ STYLE = """
 body{font:14px system-ui,sans-serif;color:#1c2024;background:#f4f5f6;margin:0;padding:24px}
 main{max-width:980px;margin:auto}section{background:#fff;border:1px solid #dfe3e6;border-radius:8px;padding:16px;margin:0 0 14px}
 h1{font-size:23px;margin:0 0 4px}h2{font-size:16px;margin:0 0 10px}table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:5px;border-bottom:1px solid #edf0f2;vertical-align:top}.score{font-size:34px;font-weight:700}.muted{color:#5f6871}
+th,td{text-align:left;padding:5px;border-bottom:1px solid #edf0f2;vertical-align:top}.score{font-size:34px;font-weight:700}.muted{color:#5f6871}video{width:100%;max-width:720px;display:block;margin:8px 0;background:#111}
 """
 
 
@@ -17,6 +17,9 @@ def task_report(task: TaskDefinition, evidence: Evidence, result: TaskResult) ->
         "task": {
             "task_id": task.task_id,
             "batch_id": task.batch_id,
+            "run_id": task.run,
+            "attempt": task.attempt,
+            "where": task.where,
             "scene": task.scene_id,
             "robot": task.robot_id,
             "instruction": task.instruction,
@@ -41,7 +44,9 @@ def task_report(task: TaskDefinition, evidence: Evidence, result: TaskResult) ->
             "contact_timeline": [item.model_dump() for item in (evidence.contacts or [])[:200]],
             "contact_events_total": None if evidence.contacts is None else len(evidence.contacts),
             "final_contacts": evidence.final_contacts,
-            "videos": [f"/api/tasks/{task.task_id}/video/{name}" for name in evidence.videos],
+            "videos": [f"/api/tasks/{task.run}/video/{name}" for name in evidence.videos if name == f"attempt-{task.attempt}"],
+            "approach": evidence.approach,
+            "model_output_keys": evidence.model_output_keys,
         },
     }
 
@@ -58,7 +63,7 @@ def page(title: str, body: str) -> str:
     return f'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{escape(title)}</title><style>{STYLE}</style></head><body><main>{body}</main></body></html>'
 
 
-def task_html(report: dict[str, Any]) -> str:
+def task_body(report: dict[str, Any]) -> str:
     task, execution, result = report["task"], report["execution"], report["result"]
     score = "Not scored" if result["score"] is None else f"{result['score']:g}/100"
     components = [
@@ -72,8 +77,12 @@ def task_html(report: dict[str, Any]) -> str:
         for check in item["checks"]
     ]
     understanding = [[name.replace("_", " "), item["status"], item["detail"]] for name, item in result["scene_understanding"].items()]
+    videos = "".join(f'<video controls preload="metadata" src="{escape(url, quote=True)}"></video>' for url in report["evidence"]["videos"])
+    start_state = report["evidence"]["initial_snapshot"] or {"objects": []}
+    end_state = {item["object_id"]: item for item in (report["evidence"]["final_snapshot"] or {"objects": []})["objects"]}
+    moved = [[item["object_id"], item["position"], end_state.get(item["object_id"], {}).get("position", "n/a")] for item in start_state["objects"]]
     body = f"""
-    <section><h1>Task report</h1><p class="muted">{escape(task['task_id'])} · {escape(task['scene'])} · {escape(task['robot'])}</p>
+    <section><h1>Attempt {task['attempt']} report</h1><p class="muted">{escape(task['task_id'])} · {escape(task['scene'])} · {escape(task['robot'])}</p>
     <p><strong>{escape(task['instruction'])}</strong></p><div class="score">{escape(score)}</div>
     <p>{escape(result['outcome'])} · coverage {result['coverage']:g}% · scoring {escape(result['config_version'])}</p><p>{escape(result['summary'])}</p></section>
     <section><h2>Execution</h2><table>{rows([['Status', execution['status']], ['Simulated duration (s)', execution['duration_seconds']], ['Actions', execution['action_count']], ['Dream-1 calls', execution['model_calls']]])}</table></section>
@@ -82,8 +91,31 @@ def task_html(report: dict[str, Any]) -> str:
     <section><h2>Task checks</h2><table><tr><th>Type</th><th>Check</th><th>Status</th><th>Detail</th></tr>{rows(checks)}</table></section>
     <section><h2>Scene understanding evidence</h2><table><tr><th>Category</th><th>Status</th><th>Detail</th></tr>{rows(understanding)}</table></section>
     <section><h2>What went well</h2>{bullets(result['went_well'])}<h2>What went wrong</h2>{bullets(result['went_wrong'])}<h2>Recommendations</h2>{bullets(result['recommendations'])}<h2>Missing evidence</h2>{bullets(result['missing_evidence'])}</section>
+    <section><h2>Evidence</h2>{videos}<h3>Initial and final object positions</h3><table><tr><th>Object</th><th>Initial (m)</th><th>Final (m)</th></tr>{rows(moved)}</table>
+    <p class="muted">Contact events recorded: {escape(str(report['evidence']['contact_events_total']))}</p></section>
     """
-    return page(f"Task report {task['task_id']}", body)
+    return body
+
+
+def task_html(report: dict[str, Any]) -> str:
+    return page(f"Task report {report['task']['task_id']}", task_body(report))
+
+
+def run_report(summary: dict[str, Any], attempts: list[dict[str, Any]], grid_url: str | None) -> dict[str, Any]:
+    return {"report_type": "run", "run": summary, "grid_url": grid_url, "attempts": attempts}
+
+
+def run_html(report: dict[str, Any]) -> str:
+    run = report["run"]
+    score = "Not scored" if run["final_score"] is None else f"{run['final_score']:g}/100"
+    table = [[item["attempt"], item["where"], item["execution_status"], item["outcome"], "n/a" if item["score"] is None else item["score"]] for item in run["attempts"]]
+    grid = f'<video controls preload="metadata" src="{escape(report["grid_url"], quote=True)}"></video>' if report.get("grid_url") else ""
+    body = f"""
+    <section><h1>Final run report</h1><p><strong>{escape(run['instruction'])}</strong></p><div class="score">{escape(score)}</div>
+    <p>{escape(run['outcome'])} · {run['attempts_succeeded']} of {run['attempts_total']} attempts succeeded</p>{grid}{bullets(run['recommendations'])}
+    <table><tr><th>Attempt</th><th>Where</th><th>Execution</th><th>Outcome</th><th>Score</th></tr>{rows(table)}</table></section>
+    """ + "".join(task_body(item) for item in report["attempts"])
+    return page(f"Run report {run['run_id']}", body)
 
 
 def batch_html(report: dict[str, Any]) -> str:

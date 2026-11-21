@@ -57,7 +57,10 @@ def missing_evidence(task: TaskDefinition, evidence: Evidence) -> list[str]:
         missing.append("Action count and duration")
     if evidence.model_calls is None:
         missing.append("Dream-1 call count")
-    missing.append("Dream-1 internal perception output (the model does not expose what it recognised)")
+    note = "Direct Dream-1 perception output (the API returns actions only, so perception is inferred from gripper motion)"
+    if evidence.model_output_keys:
+        note += f"; extra model fields seen: {', '.join(evidence.model_output_keys)}"
+    missing.append(note)
     return missing
 
 
@@ -213,7 +216,7 @@ def scene_understanding(task, evidence, verification, analysis):
     if analysis.measured:
         preservation = "PASS" if not analysis.incidents else "FAIL"
     return {
-        "perception": coverage_entry("NOT_MEASURED", "Dream-1 does not report what it recognised, so perception is not claimed from the result.", "unavailable"),
+        "perception": perception_entry(task, evidence),
         "object_selection": coverage_entry(selection, "Whether the robot contacted the requested object and avoided moving others.", "MuJoCo contacts"),
         "spatial_reasoning": coverage_entry(spatial, "Whether the final spatial relationship matched the instruction.", "MuJoCo poses"),
         "physical_manipulation": coverage_entry(physical, "Whether the requested physical result was achieved.", "MuJoCo poses and contacts"),
@@ -221,37 +224,71 @@ def scene_understanding(task, evidence, verification, analysis):
     }
 
 
+def perception_entry(task: TaskDefinition, evidence: Evidence) -> dict[str, str]:
+    source = "Inferred from gripper motion; Dream-1 does not return its detections"
+    if not task.criteria or not evidence.approach:
+        return coverage_entry("NOT_MEASURED", "No gripper-motion evidence is available.", "unavailable")
+    target = task.criteria[0].object_id
+    destinations = {item.destination_id for item in task.criteria}
+    reached = {k: v for k, v in evidence.approach.get("first_reached_s", {}).items() if k not in destinations}
+    distances = {k: v for k, v in evidence.approach.get("min_distance_cm", {}).items() if k not in destinations}
+    threshold = evidence.approach.get("reach_threshold_cm", 6)
+    if reached:
+        first = min(reached, key=lambda name: (reached[name], name))
+        if first == target:
+            return coverage_entry("PASS", f"The gripper reached the {target} first, which suggests it located the requested object.", source)
+        return coverage_entry("FAIL", f"The gripper reached the {first} before the {target}, which suggests a wrong first target.", source)
+    if target not in distances or not distances:
+        return coverage_entry("NOT_MEASURED", "The target's gripper distance is unavailable.", "unavailable")
+    closest = min(distances, key=distances.get)
+    if distances[closest] >= 15:
+        return coverage_entry("NOT_MEASURED", f"The gripper never came within 15 cm of a candidate object (closest {distances[closest]:g} cm), so its intended target cannot be inferred.", source)
+    if closest == target:
+        return coverage_entry("PARTIAL", f"The gripper moved closest to the {target} ({distances[target]:g} cm) but did not come within {threshold:g} cm.", source)
+    return coverage_entry("FAIL", f"The gripper moved closest to the {closest} ({distances[closest]:g} cm), not the {target} ({distances[target]:g} cm).", source)
+
+
 def explain(task, evidence, verification, analysis, outcome):
     good: list[str] = []
     bad: list[str] = []
     advice: list[str] = []
     for item in verification:
+        name = item.criterion.object_id
         for check in item.checks:
             if check.status == "PASS":
-                good.append(f"{item.criterion.object_id}: {check.name.replace('_', ' ')}.")
-            elif check.status == "FAIL":
-                bad.append(f"{item.criterion.object_id}: {check.detail}")
+                good.append(f"{name}: {check.name.replace('_', ' ')}.")
+            elif check.status == "FAIL" and not (check.name == "lifted" and item.status == "PASS"):
+                bad.append(f"{name}: {check.detail}")
     for incident in analysis.incidents:
         bad.append(incident.explanation)
+        advice.append(f"Protect or add clearance around the {incident.object_id}: {incident.explanation}")
     bad.extend(evidence.errors)
     if task.unresolved:
-        advice.append("Rewrite the instruction with a supported object and destination so it can be scored.")
+        advice.append(f"Reword '{task.instruction}' using an object and destination in the scene so it can be scored.")
     if evidence.execution_status == "CANCELLED":
-        advice.append("Run the task to completion to get a score.")
+        advice.append("This attempt was stopped early. Run it to completion to get a score.")
     if evidence.execution_status == "FAILED" and not evidence.action_count:
-        advice.append("Retry when Dream-1 is available. This run did not test robot behaviour.")
-    if analysis.target_contacted is False:
-        advice.append("The robot never touched the target. Check the target is visible and reachable, or reword the task.")
-    lifted_check = any(check.name == "lifted" and check.status == "FAIL" for item in verification for check in item.checks)
-    if analysis.target_contacted and lifted_check:
-        advice.append("The robot reached the target but did not lift it. Try a position closer to the gripper's natural approach.")
-    if any(check.name == "reached_destination" and check.status == "FAIL" for item in verification for check in item.checks) and not lifted_check:
-        advice.append("The object was lifted but missed the destination. Repeat with the destination nearer the active arm.")
-    if analysis.incidents:
-        advice.append("Add clearance around nearby objects or mark them as protected to compare approach paths.")
+        advice.append("Retry this attempt when Dream-1 is available. It did not test robot behaviour.")
+    distances = (evidence.approach or {}).get("min_distance_cm", {})
+    for item in verification:
+        if item.status == "PASS":
+            continue
+        name = item.criterion.object_id
+        checks = {check.name: check for check in item.checks}
+        closest = distances.get(name)
+        if analysis.target_contacted is False:
+            where = f" Its gripper got within {closest:g} cm." if closest is not None else ""
+            advice.append(f"The robot never touched the {name}.{where} Move the {name} closer to one arm or name it more specifically.")
+        elif "lifted" in checks and checks["lifted"].status == "FAIL":
+            advice.append(f"The robot touched the {name} but did not lift it. Try a clearer grasp position, away from other objects.")
+        elif "reached_destination" in checks and checks["reached_destination"].status == "FAIL":
+            advice.append(f"The {name} was lifted but missed the {item.criterion.destination_id}: {checks['reached_destination'].detail}. Place the destination nearer the arm carrying it.")
+        elif "released" in checks and checks["released"].status == "FAIL":
+            advice.append(f"The {name} reached the target but was still held. Allow more time for the gripper to release it.")
     if outcome == "SUCCESS" and not analysis.incidents:
-        advice.append("Repeat this task several times to measure reliability.")
-    return good, bad, advice
+        duration = f" in {evidence.duration_seconds:g} s" if evidence.duration_seconds is not None else ""
+        advice.append(f"This attempt succeeded cleanly{duration}. Repeat it from a shuffled layout to test reliability.")
+    return good, bad, list(dict.fromkeys(advice))
 
 
 def summary(task, outcome, score, analysis, evidence) -> str:

@@ -93,3 +93,13 @@ button.link { border: 0; background: none; padding: 0; color: #1f5fbf; text-deco
 button.link:disabled { color: #9aa3ab; cursor: default; }
 .attempt-videos figure.stopped { border-color: #9aa3ab; }
 .task-results { margin: 4px 0 8px; padding-left: 18px; font-size: 13px; }
+.report-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 12px 0; border-bottom: 1px solid #dfe3e6; }
+.report-tabs button { border: 0; border-bottom: 3px solid transparent; border-radius: 4px 4px 0 0; background: transparent; }
+.report-tabs button.active { border-bottom-color: #1f5fbf; color: #1f5fbf; font-weight: 600; }
+.report-tabs .mark-good { color: #17663a; }
+.report-tabs .mark-bad { color: #b23b32; }
+.history { display: grid; gap: 3px; margin-top: 8px; font-size: 12px; }
+.history select { width: 100%; }
+tr.open-run { background: #e8f0fc; }
+tr.run-row { cursor: pointer; }
+.report-video { width: 100%; max-width: 640px; aspect-ratio: 16 / 9; display: block; margin: 8px 0; background: #111; border-radius: 5px; }

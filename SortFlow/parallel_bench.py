@@ -46,6 +46,48 @@ STAGGER_S = 1.0  # seconds between the first workers' starts, so they do not ope
 HERE = Path(__file__).resolve().parent
 
 
+def write_evidence(capture, path, record):
+    """Save a hidden attempt's simulator evidence for the website's evaluator; a failure here never ends the trial."""
+    error = str(record.get("error") or "")
+    stopped = record.get("stopped") or error == "exit 143"
+    status = "COMPLETED" if record["success"] else "CANCELLED" if stopped else "FAILED" if error else "TIMED_OUT"
+    proof = capture.finish("pending", status, [error] if error and status == "FAILED" else [], [], [])
+    temporary = f"{path}.tmp"
+    with open(temporary, "w") as handle:
+        handle.write(proof.model_dump_json())
+    os.replace(temporary, path)
+
+
+def capture_evidence(env, objects, dream_control):
+    """Record the simulator evidence the website's evaluator reads: every step's object poses and the model calls.
+    @return The EvidenceCapture, or None when the backend's evaluation package cannot be imported.
+    """
+    try:
+        from evaluation.evidence import EvidenceCapture
+
+        capture = EvidenceCapture(env, objects, (dream_control.FRAMES - 1) * dream_control.FRAME_EVERY_STEPS + 1)
+    except Exception as exc:
+        print(f"Evidence capture unavailable: {exc}", file=sys.stderr, flush=True)
+        return None
+    rendered = env.images
+
+    def images():
+        result = rendered()
+        capture.on_step()
+        return result
+
+    env.images = images
+    opened = dream_control.open_policy
+
+    def open_policy(config, key):
+        client = opened(config, key)
+        capture.watch_model_calls(client)
+        return client
+
+    dream_control.open_policy = open_policy
+    return capture
+
+
 def run_worker(
     task,
     seconds,
@@ -58,6 +100,7 @@ def run_worker(
     scene=None,
     goal=None,
     live=None,
+    evidence=None,
 ):
     """Run one trial in this process: up to `tries` attempts, each from a reset scene.
     @param task The prompt, such as "put orange into the bowl"; it must name an item and a bowl or plate.
@@ -70,6 +113,8 @@ def run_worker(
     @param video Path of an MP4 to write the top camera to; None records nothing.
     @param live Binary stream (a pipe) to send the three cameras' newest frames and the trial's status to; None sends
         nothing. A reader that is slow or gone never slows the trial (see livefeed.py).
+    @param evidence (json_path, object_names) to save the simulator evidence the website's evaluator reads; None saves
+        nothing.
     @param scene (model_path, state_path) of a scene to start every attempt from: a compiled MuJoCo model saved with
         mujoco.mj_saveModel and an .npz of its qpos, qvel and ctrl. None uses the default Dream YAM scene.
     @param goal (body_name, target) judged by the website's contact rule, for any body in the scene; None parses the
@@ -116,6 +161,7 @@ def run_worker(
         from livefeed import attach as stream_to
 
         feed = stream_to(env, live)  # after the recording, so it is closed before it
+    capture = None
     record = {"task": task, "success": False, "success_try": None, "tries_used": 0, "sim_seconds": None, "error": None}
     closest = float("inf")
     started = time.monotonic()
@@ -123,6 +169,8 @@ def run_worker(
     try:
         for attempt in range(1, tries + 1):
             reset()
+            if evidence and capture is None:
+                capture = capture_evidence(env, evidence[1], dream_control)
             record["tries_used"] = attempt
             for refusals in range(3):  # a retryable refusal (no capacity, say) is asked again, at most twice
                 done = threading.Event()
@@ -157,6 +205,11 @@ def run_worker(
         if watcher is not None:
             closest = min(closest, watcher.min_distance)
     finally:
+        if capture:
+            try:
+                write_evidence(capture, evidence[0], record)
+            except Exception as exc:
+                print(f"Evidence could not be saved: {exc}", file=sys.stderr, flush=True)
         if feed:
             state = (
                 "stopped"
@@ -185,6 +238,7 @@ def worker_main(args):
     """Entry point of a worker process: run one trial and print its record as the last line."""
     scene = (args.scene_model, args.scene_state) if args.scene_model and args.scene_state else None
     goal = (args.goal_object, args.goal_target) if args.goal_object and args.goal_target else None
+    evidence = (args.evidence, args.evidence_objects.split(",")) if args.evidence and args.evidence_objects else None
     live = os.fdopen(args.live_fd, "wb", buffering=0) if args.live_fd is not None else None
     stop_on_sigterm()  # a plain SIGTERM would leave the MP4 unplayable; this lets run_worker finish it
     try:
@@ -198,6 +252,7 @@ def worker_main(args):
             scene=scene,
             goal=goal,
             live=live,
+            evidence=evidence,
         )
     except StopRequested:  # stopped before the run began
         record = {"task": args.task, "success": False, "error": "stopped", "stopped": True}
@@ -318,6 +373,8 @@ def main(argv=None):
     parser.add_argument("--goal-object", default=None, help="body name to judge with the website's contact rule")
     parser.add_argument("--goal-target", default=None, choices=["bowl", "plate"], help="target for --goal-object")
     parser.add_argument("--live-fd", type=int, default=None, help="file descriptor of a pipe to stream frames to")
+    parser.add_argument("--evidence", default=None, help="JSON path for a worker's simulator evidence")
+    parser.add_argument("--evidence-objects", default=None, help="comma-separated scene objects to record")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not (

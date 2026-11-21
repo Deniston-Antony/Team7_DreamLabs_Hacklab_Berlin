@@ -62,6 +62,13 @@ class TaskDefinition(BaseModel):
     max_duration_seconds: float
     weight: float = 1
     started_at: float | None = None
+    run_id: str | None = None
+    attempt: int = 1
+    where: Literal["live", "hidden"] = "live"
+
+    @property
+    def run(self) -> str:
+        return self.run_id or self.task_id
 
 
 class Evidence(BaseModel):
@@ -80,6 +87,9 @@ class Evidence(BaseModel):
     model_calls: int | None = None
     errors: list[str] = Field(default_factory=list)
     videos: list[str] = Field(default_factory=list)
+    run_videos: list[str] = Field(default_factory=list)
+    approach: dict[str, Any] | None = None
+    model_output_keys: list[str] = Field(default_factory=list)
     hidden_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
