@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import random
 import math
 import re
 import sys
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(list(dream_examples.__path__)[0]) / "yam_mujoco"))
 import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
+import environments  # noqa: E402
 
 DEFAULT_SCENE = "yam_tabletop"
 ROBOT_ID = "yam"
@@ -367,8 +369,8 @@ class SimAdapter:
         d.qvel[velocity : velocity + 6] = 0
         mujoco.mj_forward(m, d)
 
-    def _apply_scene(self, spec):
-        style = SCENES[self.scene_id]
+    def _apply_scene(self, spec, scene_id=None):
+        style = SCENES[scene_id or self.scene_id]
         if "table" not in style:
             return
         table = spec.geom("table")
@@ -394,13 +396,13 @@ class SimAdapter:
                 conaffinity=0,
             )
 
-    def _rebuild(self, keep_poses=True, poses=None):
-        saved = dict(poses or {})  # poses to put objects back to, such as a saved layout's
-        if keep_poses:
-            for body in self.managed():
-                if mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_BODY, body) >= 0:
-                    data = self.env.data.body(body)
-                    saved[body] = np.r_[data.xpos, data.xquat]
+    def _compile(self, saved, scene_id=None):
+        """Compile the scene: the Dream YAM scene with this adapter's added, removed and re-typed objects.
+        @param saved Poses by body name, used to place objects that are fixed.
+        @param scene_id The scene style; None uses the current one. Another style gives the same objects and
+            joints, so a simulation state can be moved between the two models.
+        @return The compiled MjModel.
+        """
         spec = mujoco.MjSpec.from_string(yam_env.build_xml())
         for name in self.removed:
             spec.delete(spec.body(name))
@@ -441,8 +443,17 @@ class SimAdapter:
                 if name in saved:
                     body.pos = saved[name][:3]
                     body.quat = saved[name][3:]
-        self._apply_scene(spec)
-        model = spec.compile()
+        self._apply_scene(spec, scene_id)
+        return spec.compile()
+
+    def _rebuild(self, keep_poses=True, poses=None):
+        saved = dict(poses or {})  # poses to put objects back to, such as a saved layout's
+        if keep_poses:
+            for body in self.managed():
+                if mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_BODY, body) >= 0:
+                    data = self.env.data.body(body)
+                    saved[body] = np.r_[data.xpos, data.xquat]
+        model = self._compile(saved)
         self.env.close()
         self.env.model = model
         self.env.data = mujoco.MjData(model)
@@ -761,6 +772,15 @@ class ExecuteTask(BaseModel):
     max_seconds: int = Field(default=MAX_TASK_SECONDS, ge=5, le=MAX_TASK_SECONDS)
     attempts: int = Field(default=1, ge=1, le=outcome.MAX_ATTEMPTS)
     tasks: list[SubTask] | None = Field(default=None, min_length=1, max_length=outcome.MAX_ATTEMPTS)
+    # What the parallel runs start from: a copy of the live scene, shuffled positions, or shuffled + other styles.
+    environments: str = Field(default="same", pattern="^(same|shuffle|shuffle_style)$")
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+
+
+class PrepareEnvironments(BaseModel):
+    count: int = Field(ge=0, le=outcome.MAX_ATTEMPTS - 1)
+    mode: str = Field(default="shuffle", pattern="^(same|shuffle|shuffle_style)$")
+    seed: int = Field(default=0, ge=0, le=2**31 - 1)
 
 
 # MuJoCo rendering contexts are thread-bound, so all simulator work stays on one thread.
@@ -777,13 +797,57 @@ async def on_sim(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
 
 
-async def change_scene(fn, *args):
+def prepare_environments(count, mode, seed, with_previews=False):
+    """Build the starting scenes of `count` parallel runs from the live scene; runs on the simulator thread.
+    @param count How many parallel runs.
+    @param mode `shuffle` (new object positions) or `shuffle_style` (new positions and another scene style each).
+    @param seed Seed for the layouts; the same scene, mode and seed give the same environments.
+    @param with_previews Also render each environment's three cameras for the run tabs.
+    @return A list of environments.Environment for runs 2, 3, ...
+    """
+    movable = list(sim._joint_by_body())
+    present = [n for n in sim.managed() if mujoco.mj_name2id(sim.env.model, mujoco.mjtObj.mjOBJ_BODY, n) >= 0]
+    fixed = [(sim.env.data.body(n).xpos[:2].copy(), FIXED_CLEARANCE_M.get(n, 0.09)) for n in present if n not in movable]
+    saved = {n: np.r_[sim.env.data.body(n).xpos, sim.env.data.body(n).xquat] for n in present}
+    styles = list(SCENES)
+    models = {sim.scene_id: sim.env.model}
+    envs = []
+    for index in range(count):
+        style = styles[(styles.index(sim.scene_id) + 1 + index) % len(styles)] if mode == "shuffle_style" else sim.scene_id
+        if style not in models:
+            models[style] = sim._compile(saved, style)
+        model = models[style]
+        if model.nq != sim.env.model.nq:  # a style must not change the objects; fall back to the live scene's
+            style, model = sim.scene_id, sim.env.model
+        data = mujoco.MjData(model)
+        data.qpos[:], data.qvel[:], data.ctrl[:] = sim.env.data.qpos, sim.env.data.qvel, sim.env.data.ctrl
+        mujoco.mj_forward(model, data)
+        shuffled = environments.shuffle_layout(
+            model, data, movable, fixed, np.random.default_rng([seed, index]), SHUFFLE_X, SHUFFLE_Y, SHUFFLE_SPACING_M
+        )
+        environment = environments.Environment(index + 2, model, data, style, SCENES[style]["name"], seed, shuffled)
+        if with_previews:
+            environment.previews = environments.render_previews(model, data)
+        envs.append(environment)
+    return envs
+
+
+def refresh_previews():
+    """Rebuild the prepared environments from the scene as it is now; runs on the simulator thread."""
+    shown = outcome.previews
+    if shown:
+        outcome.set_previews(prepare_environments(shown["count"], shown["mode"], shown["seed"], True), shown["mode"], shown["seed"])
+
+
+async def change_scene(fn, *args, refresh=True):
     if active_task is not None:
         raise HTTPException(409, "The scene cannot change while a task is running.")
 
     def apply():
         result = fn(*args)
         sim.publish()
+        if refresh:  # the parallel environments follow the live scene they are made from (not on every drag step)
+            refresh_previews()
         return result
 
     return await on_sim(apply)
@@ -818,7 +882,10 @@ def run_task(task, stop):
         sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
     session = None
     try:
-        session = outcome.Session(task, sim.env, goals)
+        envs = None
+        if task.get("environments", "same") != "same" and task["attempts"] > 1:
+            envs = prepare_environments(task["attempts"] - 1, task["environments"], task["seed"])
+        session = outcome.Session(task, sim.env, goals, envs)
         dc.main(
             [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
             shared_env=sim.env,
@@ -986,6 +1053,20 @@ async def save_layout():
     return {"saved": True, "objects": len(saved_layout["poses"])}
 
 
+@app.post("/api/environments")
+async def prepare_parallel_environments(body: PrepareEnvironments):
+    """Prepare and preview the parallel runs' environments; the run tabs show them until the next run."""
+    if active_task is not None:
+        raise HTTPException(409, "Environments cannot be prepared while a task is running.")
+    if body.count == 0 or body.mode == "same":
+        outcome.clear_previews()
+        return {"environments": []}
+    envs = await on_sim(prepare_environments, body.count, body.mode, body.seed, True)
+    outcome.clear_runs()
+    outcome.set_previews(envs, body.mode, body.seed)
+    return {"environments": [e.describe() for e in envs]}
+
+
 @app.delete("/api/scene/layout")
 def forget_layout():
     """Forget the saved layout; Reset scene goes back to the default scene."""
@@ -1040,12 +1121,12 @@ async def view_zoom(body: ZoomView):
 async def view_pick(body: ViewPoint):
     if body.camera not in VIEWS:
         raise HTTPException(404, "unknown camera")
-    return await change_scene(sim.pick, body.camera, body.u, body.v)
+    return await change_scene(sim.pick, body.camera, body.u, body.v, refresh=False)
 
 
 @app.post("/api/objects/select")
 async def select_object(body: SelectObject):
-    await change_scene(sim.select, body.object_id)
+    await change_scene(sim.select, body.object_id, refresh=False)
     return {"object_id": body.object_id}
 
 
@@ -1059,7 +1140,7 @@ async def set_object_type(body: ObjectType):
 async def view_drag(body: ViewPoint):
     if body.camera not in VIEWS:
         raise HTTPException(404, "unknown camera")
-    await change_scene(sim.drag, body.camera, body.u, body.v)
+    await change_scene(sim.drag, body.camera, body.u, body.v, refresh=False)
     return {"ok": True}
 
 
@@ -1151,6 +1232,8 @@ async def execute_task(body: ExecuteTask):
         "result_message": None,
         "attempts": total,
         "videos": [],
+        "environments": body.environments,
+        "seed": body.seed if body.seed is not None else random.randrange(2**31),
     }
     tasks[task["task_id"]] = task
     active_task = task

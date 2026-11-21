@@ -66,6 +66,7 @@ class OutcomeTest(unittest.TestCase):
     def setUp(self):
         """Every task starts from the default scene, with no saved layout."""
         main.saved_layout = None
+        outcome.clear_previews()
         self.client.post("/api/scene/reset")
 
     def tearDown(self):
@@ -426,6 +427,77 @@ class OutcomeTest(unittest.TestCase):
                 self.assertEqual(self.receive(ws, "text")["workers"], [])
         finally:
             outcome.SORTFLOW = self.keep[2]
+
+    def apple_xy(self, environment):
+        """Where the apple starts in a prepared environment."""
+        address = environment.model.jnt_qposadr[environment.model.joint("apple_free").id]
+        return np.round(environment.qpos[address : address + 2], 3).tolist()
+
+    def test_prepared_environments_shuffle_positions_and_styles_reproducibly(self):
+        """Three environments: other styles, new apple positions, the same again for the same seed, and previews."""
+        live_style = main.sim.scene_id
+        reply = self.client.post("/api/environments", json={"count": 3, "mode": "shuffle_style", "seed": 7})
+        self.assertEqual(reply.status_code, 200, reply.text)
+        described = reply.json()["environments"]
+        self.assertEqual([e["attempt"] for e in described], [2, 3, 4])
+        self.assertEqual(len({e["style"] for e in described}), 3)
+        self.assertNotIn(live_style, {e["style"] for e in described})
+        self.assertTrue(all(e["shuffled"] for e in described))
+        first = [self.apple_xy(e) for e in outcome.previews["envs"]]
+        self.assertEqual(len({tuple(xy) for xy in first}), 3, "every environment has its own layout")
+        self.assertNotIn([0.15, 0.105], first, "none is the untouched live layout")
+        self.client.post("/api/environments", json={"count": 3, "mode": "shuffle_style", "seed": 7})
+        self.assertEqual([self.apple_xy(e) for e in outcome.previews["envs"]], first, "same seed, same layouts")
+        self.client.post("/api/environments", json={"count": 3, "mode": "shuffle_style", "seed": 8})
+        self.assertNotEqual([self.apple_xy(e) for e in outcome.previews["envs"]], first)
+        self.assertEqual([s["state"] for s in outcome.attempt_states()], ["ready"] * 4)
+        sequence, frame = outcome.worker_frame(3, "left")
+        self.assertEqual(frame[:2], b"\xff\xd8")
+        self.assertEqual(Image.open(io.BytesIO(frame)).size, (640, 360))
+
+    def test_shuffle_only_keeps_the_live_style_and_same_clears(self):
+        """Shuffled positions keep the scene style; 'same' or a count of 0 removes the prepared environments."""
+        reply = self.client.post("/api/environments", json={"count": 2, "mode": "shuffle", "seed": 3})
+        self.assertEqual({e["style"] for e in reply.json()["environments"]}, {main.sim.scene_id})
+        self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "same"}).json()["environments"], [])
+        self.assertEqual(outcome.attempt_states(), [])
+        self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "warp"}).status_code, 422)
+
+    def test_each_parallel_run_starts_from_its_own_environment(self):
+        """A run with shuffled environments: every worker loads its own environment, matching its preview."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "shuffle_style", "seed": 11})
+        expected = [self.apple_xy(e)[0] * 100 for e in outcome.previews["envs"]]
+        outcome.SORTFLOW = self.fake_workers(
+            'print("RESULT " + json.dumps({"success": False, "sim_seconds": None, "closest_cm": x_cm}))'
+        )
+        try:
+            task = self.submit(
+                "put apple into the bowl", model(steps=20), attempts=3, environments="shuffle_style", seed=11
+            )
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+        hidden = [r for r in task["attempt_results"] if r["where"] == "hidden"]
+        self.assertEqual([r["closest_cm"] for r in hidden], [round(x) for x in expected])
+        self.assertTrue(all(r["env"] and r["env"].endswith("shuffled") for r in hidden))
+        self.assertEqual((task["environments"], task["seed"]), ("shuffle_style", 11))
+
+    def test_reset_rebuilds_the_prepared_environments_from_the_reset_scene(self):
+        """Reset scene resets the parallel environments too: they are prepared again from the reset scene."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "shuffle", "seed": 5})
+        before = [self.apple_xy(e) for e in outcome.previews["envs"]]
+        version = outcome.previews["version"]
+        self.client.post("/api/objects/move", json={"object_id": "orange", "position": {"x": -0.2, "y": 0.15, "z": 0.8}})
+        self.client.post("/api/scene/reset")
+        self.assertGreater(outcome.previews["version"], version)
+        self.assertEqual([self.apple_xy(e) for e in outcome.previews["envs"]], before, "same seed from the same scene")
+        self.assertEqual([s["state"] for s in outcome.attempt_states()], ["ready"] * 3)
+
+    def test_environments_cannot_be_prepared_while_a_task_runs(self):
+        """Preparing reads the scene, which moves during a run."""
+        main.dc.main = model(steps=4000)
+        self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20})
+        time.sleep(0.3)
+        self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "shuffle"}).status_code, 409)
 
     def test_success_keeps_the_backends_verdict_and_saves_a_video(self):
         """The apple settling in the bowl is COMPLETED / SUCCESS as before, now with a video the API serves."""

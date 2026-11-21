@@ -37,6 +37,7 @@ STOP_GRACE_S = 8  # how long a stopped worker may take to close its video and re
 
 
 current = None  # the newest request's Session: its workers' latest frames stay readable after the run ends
+previews = None  # prepared parallel environments shown before a run: {"mode", "seed", "count", "envs", "version"}
 
 
 def describe(goal):
@@ -90,6 +91,9 @@ class Workers:
         self.model_path, self.state_path = folder / "scene.mjb", folder / "scene.npz"
         mujoco.mj_saveModel(env.model, str(self.model_path))
         np.savez(self.state_path, qpos=env.data.qpos, qvel=env.data.qvel, ctrl=env.data.ctrl)
+        for job in jobs:  # a job with its own environment starts from that; the others from the live scene's copy
+            environment = job.get("environment")
+            job["scene"] = environment.save(folder) if environment is not None else (self.model_path, self.state_path)
         self.seconds = str(task["max_seconds"])
         self.env = dict(os.environ)
         if sys.platform.startswith("linux"):
@@ -112,9 +116,9 @@ class Workers:
             "--tries",
             "1",
             "--scene-model",
-            str(self.model_path),
+            str(job["scene"][0]),
             "--scene-state",
-            str(self.state_path),
+            str(job["scene"][1]),
             "--goal-object",
             job["goal"]["object"],
             "--goal-target",
@@ -211,12 +215,15 @@ class Workers:
 class Session:
     """One request's recording and hidden attempts: start it before dc.main, call finish() after."""
 
-    def __init__(self, task, env, goals):
+    def __init__(self, task, env, goals, environments=None):
         """Start recording the live attempt and, when asked and possible, every hidden attempt.
         @param task The task dictionary: task_id, max_seconds and `plan`, a list of {"instruction", "attempts"}.
         @param env The backend's simulation environment.
         @param goals One goal per plan entry ({"object", "target"} from main.parse_goal, or None when the
             instruction cannot be checked), in the same order.
+        @param environments Optional list of environments.Environment, one per hidden run in order: each
+            hidden run starts from its own scene (shuffled positions, another style). None starts every hidden
+            run from a copy of the live scene.
         """
         global current
         self.task, self.env, self.finished, self.workers = task, env, False, None
@@ -241,6 +248,8 @@ class Session:
                 number += 1
         if notes:
             task["attempts_note"] = " ".join(notes)
+        for position, job in enumerate(self.jobs):
+            job["environment"] = environments[position] if environments and position < len(environments) else None
         self.workers = Workers(task, env, self.jobs, self.folder) if self.jobs else None
         self.recorder = recording.attach(env, self.folder / "attempt-1.mp4")
         self.started = env.data.time
@@ -289,6 +298,7 @@ class Session:
                     "sim_seconds": record.get("sim_seconds"),
                     "closest_cm": record.get("closest_cm"),
                     "error": record.get("error"),
+                    "env": job["environment"].label if job.get("environment") is not None else None,
                 }
             )
         entries = []
@@ -337,6 +347,7 @@ class Session:
                 "task": 1,
                 "where": "live",
                 "label": label(self.plan[0]),
+                "env": "Live scene",
                 "state": "finished" if self.finished else "running",
             }
         ]
@@ -353,6 +364,7 @@ class Session:
                     "task": job["index"] + 1,
                     "where": "hidden",
                     "label": label(self.plan[job["index"]]),
+                    "env": job["environment"].label if job.get("environment") is not None else "Copy of live scene",
                     "state": state,
                 }
             )
@@ -369,9 +381,36 @@ def clear_runs():
     current = None
 
 
+def set_previews(envs, mode, seed):
+    """Show prepared environments in the run tabs until the next run.
+    @param envs List of environments.Environment with previews rendered.
+    @param mode The variation mode they came from.
+    @param seed Their seed.
+    """
+    global previews
+    version = (previews or {}).get("version", 0) + 1
+    previews = {"mode": mode, "seed": seed, "count": len(envs), "envs": envs, "version": version}
+
+
+def clear_previews():
+    """Stop showing prepared environments."""
+    global previews
+    previews = None
+
+
 def attempt_states():
-    """The newest request's attempts, for the dropdown; empty when there are no hidden attempts."""
-    return current.states() if current is not None and current.workers is not None else []
+    """Every run's state for the run tabs: the newest request's runs, or the prepared environments before a run.
+    @return A list of dicts (attempt, task, where, label, env, state); empty when there is nothing to show.
+    """
+    if current is not None and current.workers is not None:
+        return current.states()
+    if previews and previews["envs"]:
+        ready = [{"attempt": 1, "task": 1, "where": "live", "label": "", "env": "Live scene", "state": "ready"}]
+        return ready + [
+            {"attempt": e.attempt, "task": 1, "where": "hidden", "label": "", "env": e.label, "state": "ready"}
+            for e in previews["envs"]
+        ]
+    return []
 
 
 def worker_frame(attempt, camera):
@@ -380,9 +419,15 @@ def worker_frame(attempt, camera):
     @param camera `top`, `left` or `right`; any other (such as the free 3D view) shows the top camera.
     @return (sequence, JPEG bytes), or (None, None) until the worker has sent its first frame.
     """
-    if current is None or current.workers is None or attempt not in current.workers.watching:
-        return None, None
-    watching = current.workers.watching[attempt]
-    with watching.lock:
-        frame = watching.frames.get(camera) or watching.frames.get("top")
-        return watching.seq, frame
+    if current is not None and current.workers is not None and attempt in current.workers.watching:
+        watching = current.workers.watching[attempt]
+        with watching.lock:
+            frame = watching.frames.get(camera) or watching.frames.get("top")
+            if frame is not None or current.finished:
+                return watching.seq, frame
+    if previews:  # before a run, or until a run's worker sends its first frame: its environment's starting scene
+        for environment in previews["envs"]:
+            if environment.attempt == attempt:
+                frame = environment.previews.get(camera) or environment.previews.get("top")
+                return ("preview", previews["version"], camera), frame
+    return None, None

@@ -120,6 +120,16 @@ Open **http://127.0.0.1:5173**. Press `Ctrl+C` in each terminal to stop.
 
 Set **Runs for this task** to more than 1, for example 4. The first run is the live one in the picture; the others are parallel runs in the background. Each parallel run starts from a copy of the scene as it is when you press **Run task**, including objects you moved, added or removed, and is judged by the same success check. Parallel runs exist only while a task runs, so **Reset scene** before **Run task** gives every run, live and parallel, the same clean start. A stopped parallel run still keeps its video and shows **Stopped**. At the end the result reads, for example, **3 of 4 runs succeeded**, with each run's time or how close it got.
 
+### Give each parallel run its own environment
+
+With more than one run, **Parallel run environments** chooses what the parallel runs start from:
+
+- **Same as the live scene**: an exact copy of your scene.
+- **Shuffled object positions**: each parallel run gets its own collision-free layout of the movable objects (the bowl and plate stay put).
+- **Shuffled positions and scene styles**: each parallel run also gets another scene style (table, floor, walls and light), cycling through the other styles.
+
+The live run always keeps your scene. Before you press **Run**, the **Runs** tabs show every environment as **Ready**; click a tab to see its starting scene. **Layout seed** makes the environments reproducible (the same scene and seed give the same layouts), and **New layouts** picks a new seed. Editing the scene or pressing **Reset scene** rebuilds the environments from the new scene. Results name each run's environment, for example `Parallel run 3 (Sunny apartment style, shuffled)`. A shuffled layout can be harder than yours (an object farther from the arms), so compare success rates with that in mind.
+
 ### Run several different tasks at once
 
 Press **Add task** and enter another task, such as `put orange into the bowl`. Each task has its own number of runs. Press **Run 2 tasks**. The result lists each task, for example **2 of 3 tasks succeeded**. A task the checker cannot understand is refused before anything starts, and the message names it.
