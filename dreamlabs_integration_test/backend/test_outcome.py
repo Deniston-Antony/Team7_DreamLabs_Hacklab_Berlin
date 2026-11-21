@@ -366,15 +366,16 @@ class OutcomeTest(unittest.TestCase):
                 if [w["state"] for w in outcome.attempt_states()] == ["running", "running"]:
                     break
                 time.sleep(0.1)
+            workers = outcome.current.workers
             reply = self.client.post("/api/scene/reset")
             self.assertEqual(reply.status_code, 200, reply.text)
             self.assertTrue(reply.json()["stopped_task"])
+            self.assertTrue(all(proc.poll() is not None for proc in workers.procs), "no run left")
             task = self.client.get(f"/api/tasks/{task_id}/status").json()
             self.assertEqual(task["status"], "CANCELLED")
             hidden = task["attempt_results"][1]
             self.assertEqual((hidden["stopped"], hidden["error"]), (True, "stopped"))
-            self.assertEqual(outcome.attempt_states()[1]["state"], "stopped")
-            self.assertTrue(all(proc.poll() is not None for proc in outcome.current.workers.procs), "no run left")
+            self.assertEqual(outcome.attempt_states(), [], "the reset leaves only the live run in the tabs")
             self.assertIn("attempt-2", task["videos"])
             video = self.client.get(f"/api/tasks/{task_id}/video/attempt-2")
             self.assertEqual(video.status_code, 200)
@@ -410,6 +411,21 @@ class OutcomeTest(unittest.TestCase):
         self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20})
         time.sleep(0.3)
         self.assertEqual(self.client.post("/api/scene/layout").status_code, 409)
+
+    def test_reset_after_a_task_clears_the_finished_parallel_runs(self):
+        """After a task, Reset scene leaves only the live run: no tab keeps showing an old parallel run's picture."""
+        outcome.SORTFLOW = self.streaming_workers(steps=30)
+        try:
+            self.submit("put apple into the bowl", model(steps=20), attempts=2)
+            self.assertEqual(len(outcome.attempt_states()), 2, "the finished runs are listed after the task")
+            self.assertIsNotNone(outcome.worker_frame(2, "top")[1])
+            self.assertEqual(self.client.post("/api/scene/reset").status_code, 200)
+            self.assertEqual(outcome.attempt_states(), [])
+            self.assertEqual(outcome.worker_frame(2, "top"), (None, None))
+            with self.client.websocket_connect("/ws/live", headers={"origin": "http://127.0.0.1:5173"}) as ws:
+                self.assertEqual(self.receive(ws, "text")["workers"], [])
+        finally:
+            outcome.SORTFLOW = self.keep[2]
 
     def test_success_keeps_the_backends_verdict_and_saves_a_video(self):
         """The apple settling in the bowl is COMPLETED / SUCCESS as before, now with a video the API serves."""

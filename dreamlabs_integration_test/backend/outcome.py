@@ -359,6 +359,16 @@ class Session:
         return out
 
 
+def clear_runs():
+    """Forget the finished request's parallel runs, so the run tabs no longer show their last pictures.
+
+    Parallel runs only exist while a task runs; afterwards the tabs show what they last saw. A reset changes the
+    scene that every next run starts from, so those old pictures would be misleading.
+    """
+    global current
+    current = None
+
+
 def attempt_states():
     """The newest request's attempts, for the dropdown; empty when there are no hidden attempts."""
     return current.states() if current is not None and current.workers is not None else []

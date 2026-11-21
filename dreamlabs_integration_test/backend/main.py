@@ -972,6 +972,7 @@ async def reset_scene():
         await change_scene(restore_layout, saved_layout)
     else:
         await change_scene(sim.reset)
+    outcome.clear_runs()  # the finished parallel runs' last pictures no longer match the reset scene
     return {"placed": feed.objects, "stopped_task": stopped_task, "layout": saved_layout is not None}
 
 

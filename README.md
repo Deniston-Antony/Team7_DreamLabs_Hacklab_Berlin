@@ -132,7 +132,7 @@ The **Runs** tabs on the left of the picture list **Live run**, **Parallel run 2
 
 ### Reset, save a layout, restart
 
-- **Reset scene** puts every object and both arms back where they started. It also works while a task runs: after you confirm, it stops the live run and every parallel run, keeps their videos, then resets.
+- **Reset scene** puts every object and both arms back where they started. It also works while a task runs: after you confirm, it stops the live run and every parallel run, keeps their videos, then resets. Parallel runs only exist while a task runs; once it ends, their tabs show their last picture until **Reset scene** clears them, and the next task starts every run from the reset scene.
 - **Save layout** remembers the scene as it is now, including objects you moved, added, removed or set to Fixed. From then on, **Reset scene** puts that layout back instead of the default table. **Use default instead** forgets it.
 - **Restart** stops whatever is running, resets the scene and runs the last tasks again with the same runs and time limit. It uses credits again.
 
