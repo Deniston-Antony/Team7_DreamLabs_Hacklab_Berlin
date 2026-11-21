@@ -31,6 +31,7 @@ STAGGER_S = 0.5  # between worker starts, so they do not open their Dream sessio
 CLIP = re.compile(r"^(attempt-[1-9][0-9]*|grid)$")  # the video names the API serves
 POLL_S = 0.5
 WAIT_AFTER_LIVE_S = 90  # how long past the time limit a worker may take to report
+WORKER_EXIT_S = 10  # how long a stopped worker gets to finish its video
 
 
 class Workers:
@@ -94,9 +95,18 @@ class Workers:
     def stop(self):
         """End every worker now."""
         self.thread.join(timeout=self.count * STAGGER_S + 5)
-        for proc in self.procs:
-            if proc.poll() is None:
-                proc.terminate()
+        self._end_running()
+
+    def _end_running(self):
+        running = [proc for proc in self.procs if proc.poll() is None]
+        for proc in running:
+            proc.terminate()
+        deadline = time.monotonic() + WORKER_EXIT_S
+        for proc in running:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     def results(self, wait_s, cancelled):
         """Wait for the workers and read each one's record.
@@ -111,10 +121,9 @@ class Workers:
                 self.stop()
                 return None
             time.sleep(POLL_S)
+        self._end_running()
         records = []
         for proc in self.procs:
-            if proc.poll() is None:
-                proc.kill()
             out, err = proc.communicate()
             lines = [line for line in (out or "").splitlines() if line.startswith("RESULT ")]
             tail = ((err or "").strip().splitlines() or ["no output"])[-1]
@@ -191,8 +200,9 @@ class Session:
         entries = []
         for r in results:
             clip = self.folder / f"attempt-{r['attempt']}.mp4"
-            if clip.is_file():
-                label = f"attempt {r['attempt']}: " + (f"OK {r['sim_seconds']:.0f} s" if r["success"] else "FAIL")
+            if clip.is_file() and recording.readable(clip):
+                seconds = f" {r['sim_seconds']:.0f} s" if r["sim_seconds"] is not None else ""
+                label = f"attempt {r['attempt']}: " + (f"OK{seconds}" if r["success"] else "FAIL")
                 entries.append((clip, label, r["success"]))
         names = [clip.stem for clip, _, _ in entries]
         if len(entries) > 1 and recording.grid(entries, self.folder / "grid.mp4"):

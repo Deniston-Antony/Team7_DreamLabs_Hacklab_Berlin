@@ -6,3 +6,4 @@ frontend/dist/
 *.tsbuildinfo
 .env
 backend/task_videos/
+backend/evaluation_data/

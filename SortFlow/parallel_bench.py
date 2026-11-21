@@ -12,6 +12,7 @@ Each attempt calls the API, so the cost is about trials x tries x seconds / 120 
 import argparse
 import json
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -123,6 +124,8 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
 
 def worker_main(args):
     """Entry point of a worker process: run one trial and print its record as the last line."""
+    # Exiting through Python lets run_worker finish the MP4; a plain SIGTERM would leave it unplayable.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     scene = (args.scene_model, args.scene_state) if args.scene_model and args.scene_state else None
     goal = (args.goal_object, args.goal_target) if args.goal_object and args.goal_target else None
     try:

@@ -96,43 +96,87 @@ def read_frames(path):
         return [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
 
 
+def readable(path):
+    """Whether a video was finished properly and holds at least one frame.
+    @param path The MP4.
+    @return True when its first frame decodes.
+    """
+    try:
+        with av.open(str(path)) as container:
+            return next(container.decode(video=0), None) is not None
+    except (OSError, av.error.FFmpegError):
+        return False
+
+
+class _Clip:
+    """One video read a frame at a time, holding its last frame once it ends."""
+
+    def __init__(self, path, label, success):
+        self.label, self.success = label, success
+        self.container = av.open(str(path))
+        self.frames = self.container.decode(video=0)
+        self.frame = None
+        self.done = False
+        self.advance()
+
+    def advance(self):
+        try:
+            self.frame = next(self.frames).to_ndarray(format="rgb24")
+        except (StopIteration, OSError, av.error.FFmpegError):
+            self.done = True
+
+    def close(self):
+        self.container.close()
+
+
 def grid(entries, out, width=1280):
     """Join several runs into one video, side by side, each labelled and framed green or red.
+
+    Clips are decoded frame by frame, so a long run does not have to fit in memory.
     @param entries List of (path, label, success): an attempt's MP4, its caption and whether it succeeded.
     @param out Where to write the grid MP4.
     @param width Width of the whole grid in pixels.
     @return The number of frames written; 0 when no entry could be read.
     """
     clips = []
-    for path, label, success in entries:
-        try:
-            frames = read_frames(path)
-        except (OSError, av.error.FFmpegError):
-            continue
-        if frames:
-            clips.append((frames, label, success))
-    if not clips:
-        return 0
-    columns = 1 if len(clips) == 1 else 2 if len(clips) <= 4 else 3 if len(clips) <= 9 else 4
-    rows = -(-len(clips) // columns)
-    panel_w = (width // columns) // 2 * 2
-    panel_h = (panel_w * 9 // 16) // 2 * 2
-    length = max(len(frames) for frames, _, _ in clips)
-    recorder = Recorder(out, size=(panel_w * columns, panel_h * rows))
     try:
-        for index in range(length):
-            canvas = np.zeros((panel_h * rows, panel_w * columns, 3), dtype=np.uint8)
-            for number, (frames, label, success) in enumerate(clips):
-                frame = frames[min(index, len(frames) - 1)]  # a finished run holds its last frame
-                tile = Image.fromarray(frame).resize((panel_w, panel_h))
-                draw = ImageDraw.Draw(tile)
-                colour = GREEN if success else RED
-                draw.rectangle([0, 0, panel_w - 1, panel_h - 1], outline=colour, width=4)
-                draw.rectangle([0, 0, panel_w - 1, 22], fill=colour)
-                draw.text((8, 5), label, fill=(255, 255, 255))
-                top, left = divmod(number, columns)
-                canvas[top * panel_h : (top + 1) * panel_h, left * panel_w : (left + 1) * panel_w] = np.asarray(tile)
-            recorder.add(canvas)
+        for path, label, success in entries:
+            try:
+                clip = _Clip(path, label, success)
+            except (OSError, av.error.FFmpegError):
+                continue
+            if clip.frame is None:
+                clip.close()
+            else:
+                clips.append(clip)
+        if not clips:
+            return 0
+        columns = 1 if len(clips) == 1 else 2 if len(clips) <= 4 else 3 if len(clips) <= 9 else 4
+        rows = -(-len(clips) // columns)
+        panel_w = (width // columns) // 2 * 2
+        panel_h = (panel_w * 9 // 16) // 2 * 2
+        recorder = Recorder(out, size=(panel_w * columns, panel_h * rows))
+        written = 0
+        try:
+            while not all(clip.done for clip in clips):
+                canvas = np.zeros((panel_h * rows, panel_w * columns, 3), dtype=np.uint8)
+                for number, clip in enumerate(clips):
+                    tile = Image.fromarray(clip.frame).resize((panel_w, panel_h))
+                    draw = ImageDraw.Draw(tile)
+                    colour = GREEN if clip.success else RED
+                    draw.rectangle([0, 0, panel_w - 1, panel_h - 1], outline=colour, width=4)
+                    draw.rectangle([0, 0, panel_w - 1, 22], fill=colour)
+                    draw.text((8, 5), clip.label, fill=(255, 255, 255))
+                    top, left = divmod(number, columns)
+                    canvas[top * panel_h : (top + 1) * panel_h, left * panel_w : (left + 1) * panel_w] = np.asarray(tile)
+                recorder.add(canvas)
+                written += 1
+                for clip in clips:
+                    if not clip.done:
+                        clip.advance()
+        finally:
+            recorder.close()
+        return written
     finally:
-        recorder.close()
-    return length
+        for clip in clips:
+            clip.close()

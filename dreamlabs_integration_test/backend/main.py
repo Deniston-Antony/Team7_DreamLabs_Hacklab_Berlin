@@ -1,5 +1,6 @@
 import asyncio
 import math
+import os
 import re
 import sys
 import threading
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(list(dream_examples.__path__)[0]) / "yam_mujoco"))
 import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
+import evaluation  # noqa: E402
 
 DEFAULT_SCENE = "yam_tabletop"
 ROBOT_ID = "yam"
@@ -230,6 +232,7 @@ class SimAdapter:
         self.watched_view = "top"
         self.type_overrides = {}
         self.goal = None
+        self.capture = None
         self.view_lock = threading.Lock()
         self.free_camera = mujoco.MjvCamera()
         self.free_camera.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -245,6 +248,8 @@ class SimAdapter:
         now = time.monotonic()
         self.feed.last_step = now
         self._check_goal()
+        if self.capture is not None:
+            self.capture.on_step()
         if now - self.last_publish < STREAM_PERIOD_S:
             return
         self.last_publish = now
@@ -763,6 +768,21 @@ tasks = {}
 active_task = None
 active_stop = None
 app = FastAPI(title="Dream Labs integration test")
+evaluations = evaluation.EvaluationStore(
+    Path(os.environ.get("DREAM_EVALUATION_DATA", Path(__file__).resolve().parent / "evaluation_data"))
+)
+app.include_router(evaluation.create_router(evaluations))
+_open_policy = dc.open_policy
+
+
+def open_counted_policy(config, key):
+    client = _open_policy(config, key)
+    if sim.capture is not None:
+        sim.capture.watch_model_calls(client)
+    return client
+
+
+dc.open_policy = open_counted_policy
 
 
 async def on_sim(fn, *args):
@@ -788,6 +808,40 @@ def unsupported(capability, reason):
     )
 
 
+def task_definition(task):
+    parsed = evaluation.parse_instruction(task["instruction"], sim.managed())
+    return evaluation.TaskDefinition(
+        task_id=task["task_id"],
+        batch_id=task["batch_id"],
+        scene_id=sim.scene_id,
+        robot_id=ROBOT_ID,
+        instruction=task["instruction"],
+        criteria=parsed.criteria,
+        protected_objects=parsed.protected,
+        unresolved=parsed.unresolved,
+        max_duration_seconds=task["max_seconds"],
+        started_at=task["started_at"],
+    )
+
+
+def evaluate_run(task, definition, capture, result):
+    proof = capture.finish(
+        task["task_id"],
+        result.get("status", "FAILED"),
+        [result["error"]] if result.get("error") else [],
+        [name for name in result.get("videos", []) if name != "grid"],
+        result.get("attempt_results", []),
+    )
+    scored = evaluations.submit(definition, proof)
+    return {
+        "outcome": scored.outcome,
+        "score": scored.score,
+        "coverage": scored.coverage,
+        "batch_id": scored.batch_id,
+        "report_url": f"/api/reports/tasks/{scored.task_id}",
+    }
+
+
 def run_task(task, stop):
     global active_task, active_stop
     result = {}
@@ -797,6 +851,16 @@ def run_task(task, stop):
     if goal:
         sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
     session = None
+    definition = None
+    capture = None
+    try:
+        definition = task_definition(task)
+        capture = evaluation.EvidenceCapture(
+            sim.env, sim.managed(), (dc.FRAMES - 1) * dc.FRAME_EVERY_STEPS + 1
+        )
+        sim.capture = capture
+    except Exception as error:  # scoring must never stop the robot run
+        result["evaluation_error"] = f"Evaluation could not start: {type(error).__name__}: {error}"
     try:
         session = outcome.Session(task, sim.env, goal)
         dc.main(
@@ -824,12 +888,18 @@ def run_task(task, stop):
         result["error"] = f"{type(error).__name__}: {error}"
     finally:
         sim.goal = None
+        sim.capture = None
         try:
             if session is not None:
                 session.finish(result)
         except Exception as error:  # a video or hidden-attempt problem must not leave the task stuck as running
             result["attempts_error"] = f"{type(error).__name__}: {error}"
         task["waiting_for_attempts"] = False
+        if capture is not None:
+            try:
+                result["evaluation"] = evaluate_run(task, definition, capture, result)
+            except Exception as error:  # a report problem must not leave the task stuck as running
+                result["evaluation_error"] = f"Evaluation failed: {type(error).__name__}: {error}"
         finished_at = time.time()
         sim.publish()
         active_task = None
@@ -1042,6 +1112,9 @@ async def execute_task(body: ExecuteTask):
         "result_message": None,
         "attempts": body.attempts,
         "videos": [],
+        "batch_id": evaluations.current_batch,
+        "evaluation": None,
+        "evaluation_error": None,
     }
     tasks[task["task_id"]] = task
     active_task = task

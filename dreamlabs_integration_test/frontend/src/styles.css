@@ -43,3 +43,29 @@ button.danger { background: #b23b32; border-color: #b23b32; color: #fff; }
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
 .attempts { margin-top: 8px; padding: 8px; border-radius: 6px; border: 1px solid #c9d1d9; font-size: 13px; }
 .attempts ul { margin: 6px 0; padding-left: 18px; }
+.attempt-videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin-top: 10px; }
+.attempt-videos figure { margin: 0; padding: 4px; border: 2px solid #c9d1d9; border-radius: 6px; }
+.attempt-videos figure.passed { border-color: #2ea043; }
+.attempt-videos figure.failed { border-color: #c83232; }
+.attempt-videos video { width: 100%; aspect-ratio: 16 / 9; display: block; background: #111; border-radius: 4px; }
+.attempt-videos figcaption { margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
+.evaluation h3 { margin: 14px 0 6px; font-size: 13px; }
+.evaluation ul { margin: 0; padding-left: 18px; font-size: 12px; }
+.evaluation p { margin: 3px 0; }
+.report-links { display: flex; gap: 10px; align-items: center; font-size: 12px; }
+.score-head { display: flex; gap: 18px; align-items: center; margin-top: 8px; }
+.score-value { min-width: 118px; font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.score-value small { color: #6b747c; font-size: 14px; font-weight: 400; }
+.pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.pill.small { padding: 1px 6px; font-size: 11px; }
+.pill.good { background: #e3f5e9; color: #17663a; }
+.pill.warn { background: #fff4d6; color: #7a5600; }
+.pill.bad { background: #fdecea; color: #8a1f17; }
+.pill.neutral { background: #eef1f3; color: #4d5660; }
+.bar-row { display: grid; grid-template-columns: 170px minmax(80px, 1fr) 100px; gap: 8px; align-items: center; margin-bottom: 5px; font-size: 12px; }
+.bar { height: 8px; border-radius: 4px; background: #e8ebee; overflow: hidden; }
+.bar div { height: 100%; background: #1f5fbf; }
+.report-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; }
+.stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 10px 0; }
+.stat-grid div { display: grid; padding: 6px; border-radius: 5px; background: #f4f5f6; text-align: center; font-size: 11px; color: #5f6871; }
+.stat-grid strong { color: #1c2024; font-size: 16px; }

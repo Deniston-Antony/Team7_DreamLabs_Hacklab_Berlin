@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent } from "react";
+import { BatchPanel, TaskReportPanel } from "./EvaluationPanels";
+import type { EvaluationRef } from "./EvaluationPanels";
 
 type SceneObject = {
   object_id: string;
@@ -25,6 +27,8 @@ type Task = {
   attempts_note?: string;
   attempts_error?: string;
   waiting_for_attempts?: boolean;
+  evaluation?: EvaluationRef | null;
+  evaluation_error?: string | null;
 };
 type AttemptResult = {
   attempt: number;
@@ -94,36 +98,58 @@ function clock(seconds: number) {
 }
 
 function AttemptsPanel({ task }: { task: Task }) {
+  const videos = useRef<HTMLDivElement | null>(null);
   if (task.waiting_for_attempts) {
-    return <div className="attempts">Live attempt finished. Waiting for the {task.attempts - 1} hidden attempts...</div>;
+    return <div className="panel">Live attempt finished. Waiting for the {task.attempts - 1} hidden attempts...</div>;
   }
   if (task.status === "RUNNING") return null;
   const results = task.attempt_results ?? [];
-  const play = task.videos.includes("grid") ? "grid" : task.videos[0];
-  if (!results.length && !play && !task.attempts_note && !task.attempts_error) return null;
+  const clips = task.videos.filter((name) => name !== "grid");
+  if (!results.length && !clips.length && !task.attempts_note && !task.attempts_error) return null;
+  const url = (name: string) => `/api/tasks/${task.task_id}/video/${name}`;
+  const playTogether = () => {
+    videos.current?.querySelectorAll("video").forEach((video) => {
+      video.currentTime = 0;
+      void video.play();
+    });
+  };
+  const summary = (r: AttemptResult) =>
+    r.success
+      ? `Success${r.sim_seconds != null ? ` in ${r.sim_seconds} s` : ""}`
+      : r.error
+        ? `Failed: ${r.error}`
+        : r.closest_cm != null
+          ? `Failed, closest ${r.closest_cm} cm`
+          : "Failed";
   return (
-    <div className="attempts" aria-label="Attempts">
-      {results.length > 0 && (
-        <>
-          <strong>{task.attempts_succeeded} of {task.attempts} attempts succeeded</strong>
-          <ul>
-            {results.map((r) => (
-              <li key={r.attempt}>
-                Attempt {r.attempt} ({r.where}): {r.success ? `✓ ${r.sim_seconds ?? "?"} s` : r.error ? `✗ ${r.error}` : r.closest_cm != null ? `✗ closest ${r.closest_cm} cm` : "✗"}
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-      {task.attempts_note && <div>{task.attempts_note}</div>}
-      {task.attempts_error && <div>Videos or attempts failed: {task.attempts_error}</div>}
-      {play && <video controls loop src={`/api/tasks/${task.task_id}/video/${play}`} style={{ width: "100%" }} />}
-      {task.videos.length > 0 && (
-        <div>
-          {task.videos.map((name) => (
-            <a key={name} href={`/api/tasks/${task.task_id}/video/${name}`} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>{name}</a>
-          ))}
-        </div>
+    <div className="panel" aria-label="Attempts">
+      <div className="stream-bar">
+        <h2>
+          Run results
+          {results.length > 0 && <span className="muted"> {task.attempts_succeeded} of {task.attempts} attempts succeeded</span>}
+        </h2>
+        {clips.length > 1 && <button onClick={playTogether}>Play all together</button>}
+      </div>
+      {task.attempts_note && <p className="hint">{task.attempts_note}</p>}
+      {task.attempts_error && <p className="hint">Videos or attempts failed: {task.attempts_error}</p>}
+      <div className="attempt-videos" ref={videos}>
+        {clips.map((name) => {
+          const result = results.find((r) => `attempt-${r.attempt}` === name);
+          return (
+            <figure key={name} className={result ? (result.success ? "passed" : "failed") : ""}>
+              <video controls loop muted playsInline preload="metadata" src={url(name)} />
+              <figcaption>
+                <strong>{name.replace("-", " ")}</strong>{result ? `: ${summary(result)}` : ""}
+              </figcaption>
+            </figure>
+          );
+        })}
+      </div>
+      {results.filter((r) => !clips.includes(`attempt-${r.attempt}`)).map((r) => (
+        <p className="hint" key={r.attempt}>Attempt {r.attempt} has no video. {summary(r)}</p>
+      ))}
+      {task.videos.includes("grid") && (
+        <p className="hint"><a href={url("grid")} target="_blank" rel="noreferrer">Open combined video</a></p>
       )}
     </div>
   );
@@ -498,6 +524,11 @@ export default function App() {
                   : "Ctrl + drag opens the 3D view. Use top or 3D view to select and move objects."}
             </p>
           </div>
+          {task && <AttemptsPanel key={task.task_id} task={task} />}
+          {task && task.status !== "RUNNING" && (
+            <TaskReportPanel key={`report-${task.task_id}`} taskId={task.task_id} evaluation={task.evaluation} error={task.evaluation_error} />
+          )}
+          <BatchPanel refresh={task?.evaluation ? task.task_id : ""} locked={running} />
           <div className="panel">
             <h2>Live scene state from simulator <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
             <table>
@@ -615,7 +646,6 @@ export default function App() {
                 {task.error && <div>{task.error}</div>}
               </div>
             )}
-            {task && <AttemptsPanel task={task} />}
             <div className={`status spaced ${status.error ? "error" : ""}`}>{status.text}</div>
           </div>
         </aside>

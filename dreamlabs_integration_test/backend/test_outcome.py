@@ -6,6 +6,11 @@ endpoints are the real ones. Run from this folder with the backend's dependencie
     MUJOCO_GL=egl PYTHONPATH=.deps python -m unittest test_outcome
 """
 
+import os
+import tempfile
+
+os.environ.setdefault("DREAM_EVALUATION_DATA", tempfile.mkdtemp(prefix="dream-evaluation-tests-"))
+
 import tempfile
 import textwrap
 import time
