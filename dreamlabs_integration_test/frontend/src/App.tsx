@@ -25,20 +25,42 @@ type Task = {
   attempt_results?: AttemptResult[];
   attempts_succeeded?: number;
   attempts_note?: string;
+  task_results?: TaskResult[];
+  tasks_succeeded?: number;
   attempts_error?: string;
   waiting_for_attempts?: boolean;
   evaluation?: EvaluationRef | null;
   evaluation_error?: string | null;
 };
+type TaskResult = {
+  task: number;
+  instruction: string;
+  attempts: number;
+  succeeded: number;
+  passed: boolean;
+  results: AttemptResult[];
+};
 type AttemptResult = {
   attempt: number;
+  task?: number;
   where: "live" | "hidden";
   success: boolean;
   sim_seconds: number | null;
   closest_cm?: number | null;
   error?: string | null;
+  stopped?: boolean;
+};
+type WorkerState = {
+  attempt: number;
+  task: number;
+  where: "live" | "hidden";
+  label: string;
+  state: "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped";
 };
 type Live = {
+  layout_saved?: boolean;
+  attempt?: number;
+  workers?: WorkerState[];
   phase: "idle" | "running" | "waiting_for_dream";
   scene_id: string;
   selected: string | null;
@@ -55,21 +77,32 @@ type Sessions = {
 type Point = { camera: string; u: number; v: number };
 
 const CAMERAS = ["top", "left", "right", "free"];
-const CAMERA_LABEL: Record<string, string> = { top: "top", left: "left", right: "right", free: "3D view" };
+const CAMERA_LABEL: Record<string, string> = { top: "Overhead", left: "Left wrist", right: "Right wrist", free: "3D view" };
+const RUN_STATE_LABEL: Record<WorkerState["state"], string> = {
+  starting: "Starting",
+  running: "Running",
+  finished: "Finished",
+  succeeded: "Succeeded",
+  failed: "Failed",
+  error: "Error",
+  ended: "Stopped",
+  stopped: "Stopped",
+};
 const MAX_TASK_SECONDS = 200;
 const MAX_ATTEMPTS = 8;
+const CREDITS_PER_ATTEMPT_120S = 0.06;
 const FRAME_WIDTH = 640;
 const FRAME_HEIGHT = 360;
 
 const PHASE_LABEL: Record<Live["phase"], string> = {
   idle: "Idle",
-  running: "Robot moving",
-  waiting_for_dream: "Dream-1 thinking",
+  running: "Executing",
+  waiting_for_dream: "Waiting for Dream-1",
 };
 const TASK_LABEL: Record<Task["status"], string> = {
   RUNNING: "Running",
-  COMPLETED: "Success",
-  FAILED: "Failed",
+  COMPLETED: "Succeeded",
+  FAILED: "Error",
   TIMED_OUT: "Time limit reached",
   CANCELLED: "Stopped",
 };
@@ -97,10 +130,23 @@ function clock(seconds: number) {
   return `${String(Math.floor(whole / 60)).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}`;
 }
 
+// "apple>bowl" or "stl_coffee_cup>plate" -> "Apple → Bowl", "Coffee cup → Plate"
+function goalName(label: string) {
+  const nice = (part: string) => {
+    const words = part.replace(/^stl_/, "").replace(/_/g, " ").trim();
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  };
+  return label.includes(">") ? label.split(">").map(nice).join(" → ") : label;
+}
+
+function runName(attempt: number) {
+  return attempt === 1 ? "Live run" : `Parallel run ${attempt}`;
+}
+
 function AttemptsPanel({ task }: { task: Task }) {
   const videos = useRef<HTMLDivElement | null>(null);
   if (task.waiting_for_attempts) {
-    return <div className="panel">Live attempt finished. Waiting for the {task.attempts - 1} hidden attempts...</div>;
+    return <div className="panel">Live run finished. Waiting for {task.attempts - 1} parallel run{task.attempts > 2 ? "s" : ""} to complete…</div>;
   }
   if (task.status === "RUNNING") return null;
   const results = task.attempt_results ?? [];
@@ -115,41 +161,62 @@ function AttemptsPanel({ task }: { task: Task }) {
   };
   const summary = (r: AttemptResult) =>
     r.success
-      ? `Success${r.sim_seconds != null ? ` in ${r.sim_seconds} s` : ""}`
-      : r.error
-        ? `Failed: ${r.error}`
-        : r.closest_cm != null
-          ? `Failed, closest ${r.closest_cm} cm`
-          : "Failed";
+      ? `Succeeded${r.sim_seconds != null ? ` in ${r.sim_seconds} s` : ""}`
+      : r.stopped
+        ? "Stopped"
+        : r.error
+          ? `Failed: ${r.error}`
+          : r.closest_cm != null
+            ? `Not reached, closest ${r.closest_cm} cm`
+            : "Not reached";
+  const suite = task.task_results && task.task_results.length > 1 ? task.task_results : null;
+  const goalOf = (r: AttemptResult) => (suite ? suite.find((t) => t.task === r.task)?.instruction : undefined);
   return (
-    <div className="panel" aria-label="Attempts">
+    <div className="panel" aria-label="Run results">
       <div className="stream-bar">
         <h2>
           Run results
-          {results.length > 0 && <span className="muted"> {task.attempts_succeeded} of {task.attempts} attempts succeeded</span>}
+          {suite ? (
+            <span className="muted"> {task.tasks_succeeded} of {suite.length} tasks succeeded</span>
+          ) : (
+            results.length > 0 && <span className="muted"> {task.attempts_succeeded} of {task.attempts} runs succeeded</span>
+          )}
         </h2>
         {clips.length > 1 && <button onClick={playTogether}>Play all together</button>}
       </div>
+      {suite && (
+        <ul className="task-results">
+          {suite.map((t) => (
+            <li key={t.task}>
+              {t.passed ? "✓" : "✗"} {t.instruction}: {t.succeeded} of {t.attempts} run{t.attempts > 1 ? "s" : ""} succeeded
+            </li>
+          ))}
+        </ul>
+      )}
       {task.attempts_note && <p className="hint">{task.attempts_note}</p>}
-      {task.attempts_error && <p className="hint">Videos or attempts failed: {task.attempts_error}</p>}
+      {task.attempts_error && <p className="hint">Recording or parallel runs failed: {task.attempts_error}</p>}
       <div className="attempt-videos" ref={videos}>
         {clips.map((name) => {
-          const result = results.find((r) => `attempt-${r.attempt}` === name);
+          const number = Number(name.replace("attempt-", ""));
+          const result = results.find((r) => r.attempt === number);
+          const state = result ? (result.success ? "passed" : result.stopped ? "stopped" : "failed") : "";
           return (
-            <figure key={name} className={result ? (result.success ? "passed" : "failed") : ""}>
+            <figure key={name} className={state}>
               <video controls loop muted playsInline preload="metadata" src={url(name)} />
               <figcaption>
-                <strong>{name.replace("-", " ")}</strong>{result ? `: ${summary(result)}` : ""}
+                <strong>{runName(number)}</strong>
+                {result && goalOf(result) ? ` · ${goalOf(result)}` : ""}
+                {result ? `: ${summary(result)}` : ""}
               </figcaption>
             </figure>
           );
         })}
       </div>
       {results.filter((r) => !clips.includes(`attempt-${r.attempt}`)).map((r) => (
-        <p className="hint" key={r.attempt}>Attempt {r.attempt} has no video. {summary(r)}</p>
+        <p className="hint" key={r.attempt}>{runName(r.attempt)} has no video. {summary(r)}</p>
       ))}
       {task.videos.includes("grid") && (
-        <p className="hint"><a href={url("grid")} target="_blank" rel="noreferrer">Open combined video</a></p>
+        <p className="hint"><a href={url("grid")} target="_blank" rel="noreferrer">Open all runs side by side</a></p>
       )}
     </div>
   );
@@ -164,6 +231,7 @@ export default function App() {
   const [frameUrl, setFrameUrl] = useState("");
   const [fps, setFps] = useState(0);
   const [camera, setCamera] = useState("top");
+  const [viewAttempt, setViewAttempt] = useState(1);
   const [dragging, setDragging] = useState(false);
   const [pose, setPose] = useState({ x: 0.05, y: 0, z: 0.8, yaw: 45 });
   const [uploadStatus, setUploadStatus] = useState<Status | null>(null);
@@ -174,10 +242,13 @@ export default function App() {
   const [instruction, setInstruction] = useState("put apple into the bowl");
   const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
   const [attempts, setAttempts] = useState(1);
-  const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator", error: false });
+  const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
+  const [lastRequest, setLastRequest] = useState<Record<string, unknown> | null>(null);
+  const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator…", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
+  const attemptRef = useRef(1);
   const drag = useRef<{ active: boolean; sending: boolean; next: Point | null }>({ active: false, sending: false, next: null });
   const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
   const zoom = useRef({ sending: false, delta: 0 });
@@ -200,7 +271,7 @@ export default function App() {
       socket.current = ws;
       ws.onopen = () => {
         setConnected(true);
-        ws.send(JSON.stringify({ camera: cameraRef.current }));
+        ws.send(JSON.stringify({ camera: cameraRef.current, attempt: attemptRef.current }));
       };
       ws.onmessage = (event) => {
         if (typeof event.data === "string") {
@@ -241,7 +312,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    run("Connected to the real local MuJoCo simulator", async () => {
+    run("Connected to the local simulator", async () => {
       const [sceneList, robotList, sessionList] = await Promise.all([
         api<{ scene_id: string; name: string }[]>("/api/scenes"),
         api<{ robot_id: string; name: string; executable: boolean }[]>("/api/robots"),
@@ -252,6 +323,18 @@ export default function App() {
       setSessions(sessionList);
     });
   }, [run]);
+
+  const chooseAttempt = (attempt: number) => {
+    attemptRef.current = attempt;
+    setViewAttempt(attempt);
+    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ attempt }));
+  };
+
+  const workers = live?.workers ?? [];
+  useEffect(() => {
+    // the dropdown's list changed (a new task, or none): go back to the live simulation if the choice is gone
+    if (viewAttempt > 1 && !workers.some((worker) => worker.attempt === viewAttempt)) chooseAttempt(1);
+  }, [workers.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const chooseCamera = (name: string) => {
     cameraRef.current = name;
@@ -279,7 +362,7 @@ export default function App() {
       }
     };
     const onWheel = (event: WheelEvent) => {
-      if (cameraRef.current !== "free") return;
+      if (cameraRef.current !== "free" || attemptRef.current !== 1) return;
       event.preventDefault();
       const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
       zoom.current.delta += event.deltaY * unit * (event.ctrlKey ? 4 : 1);
@@ -296,6 +379,24 @@ export default function App() {
   const selectedPosition = selectedObject?.position.join(",");
   const task = live?.task ?? null;
   const running = task?.status === "RUNNING";
+  const totalAttempts = attempts + extras.reduce((sum, extra) => sum + extra.attempts, 0);
+  const suiteReady = extras.every((extra) => extra.text.trim()) && totalAttempts <= MAX_ATTEMPTS;
+  const request: Record<string, unknown> = extras.length
+    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds }
+    : { instruction, max_seconds: maxSeconds, attempts };
+  const layoutSaved = live?.layout_saved ?? false;
+  const resetScene = () => {
+    if (running && !window.confirm("Stop every run and reset the scene?")) return;
+    void run(running ? "Stopped every run and reset the scene" : layoutSaved ? "Saved layout restored" : "Scene reset", () => api("/api/scene/reset", {}));
+  };
+  const restart = () => {
+    if (!lastRequest) return;
+    if (!window.confirm(running ? "Stop every run, reset the scene and run the same tasks again? This uses credits." : "Reset the scene and run the same tasks again? This uses credits.")) return;
+    void run("Restarted from a reset scene", async () => {
+      await api("/api/scene/reset", {});
+      await api("/api/tasks/execute", lastRequest);
+    });
+  };
   const locked = busy || running || dragging;
   const position = { x: pose.x, y: pose.y, z: pose.z };
   const canDrag = (camera === "top" || camera === "free") && !running && !busy;
@@ -480,11 +581,29 @@ export default function App() {
 
   return (
     <main>
-      <h1>Dream Labs Integration Test</h1>
-      <p className="note">Live view of the real local Dream YAM Sim. The hosted Playground is not embedded or controlled.</p>
+      <h1>Dream-1 Simulation Console</h1>
+      <p className="note">Plan, run and evaluate Dream-1 tasks in the local YAM simulator.</p>
       <div className="layout">
         <section>
-          <div className="panel">
+          <div className="panel viewer">
+            <nav className="run-tabs" aria-label="Runs">
+              <div className="run-tabs-title">Runs</div>
+              {(workers.length > 1 ? workers : [{ attempt: 1, task: 1, where: "live", label: "", state: running ? "running" : "finished" } as WorkerState]).map((worker) => (
+                <button
+                  key={worker.attempt}
+                  className={`run-tab ${viewAttempt === worker.attempt ? "active" : ""}`}
+                  aria-pressed={viewAttempt === worker.attempt}
+                  onClick={() => chooseAttempt(worker.attempt)}
+                >
+                  <span className="run-tab-name">{runName(worker.attempt)}</span>
+                  {worker.label && <span className="run-tab-goal">{goalName(worker.label)}</span>}
+                  <span className={`run-tab-state ${worker.state}`}>
+                    {workers.length > 1 ? RUN_STATE_LABEL[worker.state] : connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Offline"}
+                  </span>
+                </button>
+              ))}
+            </nav>
+            <div className="viewer-main">
             <div className="stream-bar">
               <div className="cameras">
                 {CAMERAS.map((name) => (
@@ -495,7 +614,7 @@ export default function App() {
               </div>
               <div className="live-status" role="status">
                 <span className={`dot ${connected ? "on" : ""}`} />
-                {connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting"}
+                {connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting…"}
                 <span className="muted">{connected ? `${fps} FPS` : ""}</span>
               </div>
             </div>
@@ -503,26 +622,29 @@ export default function App() {
             {frameUrl ? (
               <img
                 className={`main-view ${canDrag ? "draggable" : ""} ${dragging || orbiting ? "dragging" : ""}`}
-                alt={`Live ${camera} simulator camera`}
+                alt={`${runName(viewAttempt)}, ${CAMERA_LABEL[camera]} camera`}
                 src={frameUrl}
                 draggable={false}
                 onContextMenu={(event) => event.preventDefault()}
-                onPointerDown={startDrag}
-                onPointerMove={moveDrag}
-                onPointerUp={endDrag}
-                onPointerCancel={endDrag}
+                onPointerDown={viewAttempt === 1 ? startDrag : undefined}
+                onPointerMove={viewAttempt === 1 ? moveDrag : undefined}
+                onPointerUp={viewAttempt === 1 ? endDrag : undefined}
+                onPointerCancel={viewAttempt === 1 ? endDrag : undefined}
               />
             ) : (
               <div className="main-view" />
             )}
             </div>
             <p className="hint">
-              {camera === "free"
-                ? "Click to select, drag to move. Ctrl + drag rotates the view. Two-finger scroll zooms."
+              {viewAttempt > 1
+                ? `Viewing ${runName(viewAttempt).toLowerCase()}: camera view only (overhead and wrist cameras). The object table shows the live run.`
+                : camera === "free"
+                ? "Click an object to select it, drag to move it. Ctrl + drag to orbit, scroll to zoom."
                 : camera === "top"
-                  ? "Click to select, drag to move. Ctrl + drag opens the rotating 3D view."
-                  : "Ctrl + drag opens the 3D view. Use top or 3D view to select and move objects."}
+                  ? "Click an object to select it, drag to move it. Ctrl + drag to open the 3D view."
+                  : "Ctrl + drag to open the 3D view. Use the overhead or 3D view to select and move objects."}
             </p>
+            </div>
           </div>
           {task && <AttemptsPanel key={task.task_id} task={task} />}
           {task && task.status !== "RUNNING" && (
@@ -530,7 +652,7 @@ export default function App() {
           )}
           <BatchPanel refresh={task?.evaluation ? task.task_id : ""} locked={running} />
           <div className="panel">
-            <h2>Live scene state from simulator <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
+            <h2>Scene objects <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
             <table>
               <thead>
                 <tr><th>Object</th><th>Position (m)</th><th>Orientation (wxyz)</th><th>Type</th></tr>
@@ -603,11 +725,26 @@ export default function App() {
               <button disabled={locked || !selectedMovable} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
               <button disabled={locked || !selectedMovable} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
               <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, () => api("/api/objects/remove", { object_id: selected }))}>Remove</button>
-              <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffel</button>
-              <button disabled={locked} onClick={() => run("Scene reset", () => api("/api/scene/reset", {}))}>Reset</button>
+              <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffle</button>
+              <button
+                disabled={busy || dragging}
+                title={running ? "Stops the live run and every parallel run, then resets the scene" : layoutSaved ? "Puts back your saved layout, with both arms home" : "Puts every object and both arms back where they started"}
+                onClick={resetScene}
+              >
+                Reset scene
+              </button>
+              <button disabled={locked} title="Reset scene will put back the scene as it is now" onClick={() => run("Layout saved: Reset scene now returns to it", () => api("/api/scene/layout", {}))}>
+                Save layout
+              </button>
+              {layoutSaved && (
+                <span className="hint layout-hint">
+                  Reset returns to your saved layout.{" "}
+                  <button className="link" disabled={busy} onClick={() => run("Saved layout forgotten: Reset scene returns to the default scene", () => fetch("/api/scene/layout", { method: "DELETE" }).then((r) => parse(r)))}>Use default instead</button>
+                </span>
+              )}
             </div>
             <div className="upload">
-              <label>STL file
+              <label>Mesh file (STL)
                 <input key={uploadKey} aria-label="STL file" type="file" accept=".stl" disabled={locked} onChange={(event) => setStlFile(event.target.files?.[0] ?? null)} />
               </label>
               <label>Size (cm)
@@ -615,30 +752,46 @@ export default function App() {
               </label>
             </div>
             <div className="row" style={{ marginTop: 8 }}>
-              <button disabled={locked || !stlFile} onClick={uploadStl}>Add STL object</button>
+              <button disabled={locked || !stlFile} onClick={uploadStl}>Import mesh</button>
             </div>
             {uploadStatus && <div className={`status ${uploadStatus.error ? "error" : ""}`}>{uploadStatus.text}</div>}
           </div>
           <div className="panel">
-            <h2>Task</h2>
-            <textarea aria-label="Task instruction" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
-            <label style={{ marginTop: 8 }}>Time limit (seconds)
+            <h2>Tasks</h2>
+            <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
+            <label style={{ marginTop: 8 }}>Time limit per run (seconds)
               <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
             </label>
-            <label style={{ marginTop: 8 }}>Attempts at once (each uses credits)
-              <input aria-label="Attempts" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
+            <label style={{ marginTop: 8 }}>Runs for this task
+              <input aria-label="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
             </label>
+            {extras.map((extra, index) => (
+              <div className="extra-task" key={index}>
+                <input aria-label={`Task ${index + 2}`} placeholder="e.g. put orange into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
+                <input aria-label={`Runs for task ${index + 2}`} title="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS} value={extra.attempts} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, attempts: Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)) } : e)))} />
+                <button disabled={running} onClick={() => setExtras(extras.filter((_, i) => i !== index))} aria-label={`Remove task ${index + 2}`} title="Remove task">×</button>
+              </div>
+            ))}
+            <div className="row" style={{ marginTop: 8 }}>
+              <button disabled={running || totalAttempts >= MAX_ATTEMPTS} onClick={() => setExtras([...extras, { text: "", attempts: 1 }])}>Add task</button>
+            </div>
+            <div className="hint">
+              {extras.length + 1} task{extras.length ? "s" : ""} · {totalAttempts} parallel run{totalAttempts > 1 ? "s" : ""} (max {MAX_ATTEMPTS}) · up to ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)} in credits
+            </div>
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
             <div className="row">
               {running ? (
-                <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop task</button>
+                <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop</button>
               ) : (
-                <button className="primary" disabled={locked || !connected || !instruction.trim()} onClick={() => run("Task started", () => api("/api/tasks/execute", { instruction, max_seconds: maxSeconds, attempts }))}>
-                  Execute task (uses credits)
+                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady} onClick={() => { setLastRequest(request); void run("Task started", () => api("/api/tasks/execute", request)); }}>
+                  {extras.length ? `Run ${extras.length + 1} tasks` : "Run task"}
                 </button>
               )}
+              <button disabled={!lastRequest || busy || !connected} title="Stop, reset the scene and run the last tasks again" onClick={restart}>
+                Restart
+              </button>
             </div>
             {task && (
               <div className={`status ${task.outcome === "SUCCESS" ? "success" : task.status === "FAILED" || task.outcome === "FAILURE" ? "error" : ""}`}>

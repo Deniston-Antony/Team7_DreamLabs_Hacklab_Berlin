@@ -21,13 +21,44 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+
+class StopRequested(BaseException):
+    """Raised in a worker when the process that started it asks it to stop (SIGTERM).
+
+    A BaseException, so the `except Exception` that records a failed attempt does not swallow it: the run unwinds
+    through its `finally` blocks, which close the video properly and send the final "stopped" status.
+    """
+
+
+def stop_on_sigterm():
+    """In a worker, turn the first SIGTERM into StopRequested; later ones are ignored while it cleans up."""
+
+    def handler(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise StopRequested()
+
+    signal.signal(signal.SIGTERM, handler)
+
+
 RESULT = "RESULT "  # a worker's last stdout line starts with this, followed by its JSON record
 MAX_WORKERS = 16
 STAGGER_S = 1.0  # seconds between the first workers' starts, so they do not open their sessions in one burst
 HERE = Path(__file__).resolve().parent
 
 
-def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, model=None, video=None, scene=None, goal=None):
+def run_worker(
+    task,
+    seconds,
+    actions,
+    tries,
+    runner=None,
+    retry_pause=2.0,
+    model=None,
+    video=None,
+    scene=None,
+    goal=None,
+    live=None,
+):
     """Run one trial in this process: up to `tries` attempts, each from a reset scene.
     @param task The prompt, such as "put orange into the bowl"; it must name an item and a bowl or plate.
     @param seconds Wall-clock limit per attempt.
@@ -37,6 +68,8 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
     @param retry_pause Seconds to wait before re-asking after a retryable refusal without a stated wait.
     @param model Model id for dream_control's --model; None uses its default.
     @param video Path of an MP4 to write the top camera to; None records nothing.
+    @param live Binary stream (a pipe) to send the three cameras' newest frames and the trial's status to; None sends
+        nothing. A reader that is slow or gone never slows the trial (see livefeed.py).
     @param scene (model_path, state_path) of a scene to start every attempt from: a compiled MuJoCo model saved with
         mujoco.mj_saveModel and an .npz of its qpos, qvel and ctrl. None uses the default Dream YAM scene.
     @param goal (body_name, target) judged by the website's contact rule, for any body in the scene; None parses the
@@ -78,9 +111,15 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
         from recording import attach
 
         recording = attach(env, video)
+    feed = None
+    if live is not None:
+        from livefeed import attach as stream_to
+
+        feed = stream_to(env, live)  # after the recording, so it is closed before it
     record = {"task": task, "success": False, "success_try": None, "tries_used": 0, "sim_seconds": None, "error": None}
     closest = float("inf")
     started = time.monotonic()
+    watcher = None
     try:
         for attempt in range(1, tries + 1):
             reset()
@@ -113,7 +152,27 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
                 break
             if record["success"] or record["error"]:
                 break
+    except StopRequested:  # the backend stopped this run: end cleanly, keep the video, report it as stopped
+        record.update(error="stopped", stopped=True)
+        if watcher is not None:
+            closest = min(closest, watcher.min_distance)
     finally:
+        if feed:
+            state = (
+                "stopped"
+                if record.get("stopped")
+                else "succeeded"
+                if record["success"]
+                else "error"
+                if record["error"]
+                else "failed"
+            )
+            feed.status(
+                state,
+                sim_seconds=record["sim_seconds"],
+                closest_cm=None if closest == float("inf") else round(closest * 100),
+            )
+            feed.close()
         if recording:
             recording.close()
         env.close()
@@ -124,12 +183,24 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
 
 def worker_main(args):
     """Entry point of a worker process: run one trial and print its record as the last line."""
-    # Exiting through Python lets run_worker finish the MP4; a plain SIGTERM would leave it unplayable.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     scene = (args.scene_model, args.scene_state) if args.scene_model and args.scene_state else None
     goal = (args.goal_object, args.goal_target) if args.goal_object and args.goal_target else None
+    live = os.fdopen(args.live_fd, "wb", buffering=0) if args.live_fd is not None else None
+    stop_on_sigterm()  # a plain SIGTERM would leave the MP4 unplayable; this lets run_worker finish it
     try:
-        record = run_worker(args.task, args.seconds, args.actions, args.tries, model=args.model, video=args.record, scene=scene, goal=goal)
+        record = run_worker(
+            args.task,
+            args.seconds,
+            args.actions,
+            args.tries,
+            model=args.model,
+            video=args.record,
+            scene=scene,
+            goal=goal,
+            live=live,
+        )
+    except StopRequested:  # stopped before the run began
+        record = {"task": args.task, "success": False, "error": "stopped", "stopped": True}
     except Exception as exc:
         record = {"task": args.task, "success": False, "error": f"{type(exc).__name__}: {exc}"}
     print(RESULT + json.dumps(record), flush=True)
@@ -246,6 +317,7 @@ def main(argv=None):
     parser.add_argument("--scene-state", default=None, help=".npz with that scene's qpos, qvel and ctrl")
     parser.add_argument("--goal-object", default=None, help="body name to judge with the website's contact rule")
     parser.add_argument("--goal-target", default=None, choices=["bowl", "plate"], help="target for --goal-object")
+    parser.add_argument("--live-fd", type=int, default=None, help="file descriptor of a pipe to stream frames to")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not (
