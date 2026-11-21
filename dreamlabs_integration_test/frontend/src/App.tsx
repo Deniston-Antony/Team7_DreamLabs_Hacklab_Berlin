@@ -16,6 +16,8 @@ type Task = {
   max_seconds: number;
   elapsed_s: number;
   error: string | null;
+  outcome: "SUCCESS" | "FAILURE" | "NOT_EVALUATED" | null;
+  result_message: string | null;
 };
 type Live = {
   phase: "idle" | "running" | "waiting_for_dream";
@@ -32,7 +34,8 @@ type Sessions = {
 };
 type Point = { camera: string; u: number; v: number };
 
-const CAMERAS = ["top", "left", "right"];
+const CAMERAS = ["top", "left", "right", "free"];
+const CAMERA_LABEL: Record<string, string> = { top: "top", left: "left", right: "right", free: "3D view" };
 const MAX_TASK_SECONDS = 200;
 const FRAME_WIDTH = 640;
 const FRAME_HEIGHT = 360;
@@ -44,9 +47,9 @@ const PHASE_LABEL: Record<Live["phase"], string> = {
 };
 const TASK_LABEL: Record<Task["status"], string> = {
   RUNNING: "Running",
-  COMPLETED: "Completed",
+  COMPLETED: "Success",
   FAILED: "Failed",
-  TIMED_OUT: "Time limit reached. Outcome not evaluated.",
+  TIMED_OUT: "Time limit reached",
   CANCELLED: "Stopped",
 };
 
@@ -85,6 +88,8 @@ export default function App() {
   const [camera, setCamera] = useState("top");
   const [dragging, setDragging] = useState(false);
   const [pose, setPose] = useState({ x: 0.05, y: 0, z: 0.8, yaw: 45 });
+  const [uploadStatus, setUploadStatus] = useState<Status | null>(null);
+  const [orbiting, setOrbiting] = useState(false);
   const [stlFile, setStlFile] = useState<File | null>(null);
   const [stlSize, setStlSize] = useState(8);
   const [uploadKey, setUploadKey] = useState(0);
@@ -95,6 +100,7 @@ export default function App() {
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
   const drag = useRef<{ active: boolean; sending: boolean; next: Point | null }>({ active: false, sending: false, next: null });
+  const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
 
   useEffect(() => {
     let closed = false;
@@ -211,7 +217,33 @@ export default function App() {
     }
   };
 
+  const sendOrbit = async () => {
+    const state = orbit.current;
+    if (state.sending) return;
+    state.sending = true;
+    try {
+      while (state.dx !== 0 || state.dy !== 0) {
+        const delta = { dx: state.dx, dy: state.dy };
+        state.dx = 0;
+        state.dy = 0;
+        await api("/api/view/orbit", delta);
+      }
+    } catch (error) {
+      setStatus({ text: error instanceof Error ? error.message : String(error), error: true });
+    } finally {
+      state.sending = false;
+    }
+  };
+
   const startDrag = async (event: PointerEvent<HTMLImageElement>) => {
+    if (event.ctrlKey) {
+      event.preventDefault();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      Object.assign(orbit.current, { active: true, x: event.clientX, y: event.clientY });
+      setOrbiting(true);
+      if (camera !== "free") chooseCamera("free");
+      return;
+    }
     if (!canDrag || event.button !== 0) return;
     const target = event.currentTarget;
     const pointerId = event.pointerId;
@@ -234,12 +266,26 @@ export default function App() {
   };
 
   const moveDrag = (event: PointerEvent<HTMLImageElement>) => {
+    if (orbit.current.active) {
+      const state = orbit.current;
+      state.dx += event.clientX - state.x;
+      state.dy += event.clientY - state.y;
+      state.x = event.clientX;
+      state.y = event.clientY;
+      void sendOrbit();
+      return;
+    }
     if (!drag.current.active) return;
     drag.current.next = framePoint(event);
     void sendDrag();
   };
 
   const endDrag = async () => {
+    if (orbit.current.active) {
+      orbit.current.active = false;
+      setOrbiting(false);
+      return;
+    }
     const state = drag.current;
     if (!state.active) return;
     state.active = false;
@@ -261,14 +307,28 @@ export default function App() {
 
   const uploadStl = () => {
     if (!stlFile) return;
-    run(`Added ${stlFile.name}`, async () => {
-      const query = new URLSearchParams({ filename: stlFile.name, size_cm: String(stlSize) });
+    const file = stlFile;
+    setUploadStatus({ text: `Adding ${file.name}...`, error: false });
+    run(`Added ${file.name}`, async () => {
+      const query = new URLSearchParams({ filename: file.name, size_cm: String(stlSize) });
       const response = await fetch(`/api/objects/upload?${query}`, {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream" },
-        body: stlFile,
+        body: file,
+      }).catch(() => {
+        throw new Error("Could not reach the backend.");
       });
-      const result = await parse<{ object_id: string }>(response);
+      let result: { object_id: string; original_triangles: number; triangles: number };
+      try {
+        result = await parse(response);
+      } catch (error) {
+        setUploadStatus({ text: error instanceof Error ? error.message : String(error), error: true });
+        throw error;
+      }
+      const simplified = result.triangles < result.original_triangles
+        ? ` Simplified from ${result.original_triangles.toLocaleString()} to ${result.triangles.toLocaleString()} triangles.`
+        : "";
+      setUploadStatus({ text: `Added ${result.object_id}.${simplified}`, error: false });
       setSelected(result.object_id);
       setStlFile(null);
       setUploadKey((value) => value + 1);
@@ -300,7 +360,7 @@ export default function App() {
               <div className="cameras">
                 {CAMERAS.map((name) => (
                   <button key={name} className={camera === name ? "active" : ""} onClick={() => chooseCamera(name)}>
-                    {name}
+                    {CAMERA_LABEL[name]}
                   </button>
                 ))}
               </div>
@@ -312,10 +372,11 @@ export default function App() {
             </div>
             {frameUrl ? (
               <img
-                className={`main-view ${canDrag ? "draggable" : ""} ${dragging ? "dragging" : ""}`}
+                className={`main-view ${canDrag ? "draggable" : ""} ${dragging || orbiting ? "dragging" : ""}`}
                 alt={`Live ${camera} simulator camera`}
                 src={frameUrl}
                 draggable={false}
+                onContextMenu={(event) => event.preventDefault()}
                 onPointerDown={startDrag}
                 onPointerMove={moveDrag}
                 onPointerUp={endDrag}
@@ -325,7 +386,7 @@ export default function App() {
               <div className="main-view" />
             )}
             <p className="hint">
-              {camera === "top" ? "Drag an object in this view to move it on the table." : "Switch to the top camera to drag objects."}
+              {camera === "top" ? "Drag an object to move it. Hold Ctrl and drag to rotate the 3D view." : "Hold Ctrl and drag to rotate the 3D view. Use the top camera to move objects."}
             </p>
           </div>
           <div className="panel">
@@ -405,6 +466,7 @@ export default function App() {
             <div className="row" style={{ marginTop: 8 }}>
               <button disabled={locked || !stlFile} onClick={uploadStl}>Add STL object</button>
             </div>
+            {uploadStatus && <div className={`status ${uploadStatus.error ? "error" : ""}`}>{uploadStatus.text}</div>}
           </div>
           <div className="panel">
             <h2>Task</h2>
@@ -425,8 +487,8 @@ export default function App() {
               )}
             </div>
             {task && (
-              <div className={`status ${task.status === "FAILED" ? "error" : ""}`}>
-                <strong>{TASK_LABEL[task.status]}</strong>: {task.instruction}
+              <div className={`status ${task.outcome === "SUCCESS" ? "success" : task.status === "FAILED" || task.outcome === "FAILURE" ? "error" : ""}`}>
+                <strong>{TASK_LABEL[task.status]}</strong>: {task.result_message ?? task.instruction}
                 {task.error && <div>{task.error}</div>}
               </div>
             )}

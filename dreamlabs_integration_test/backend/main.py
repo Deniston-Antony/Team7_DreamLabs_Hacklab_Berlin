@@ -24,6 +24,8 @@ import yam_env  # noqa: E402
 DEFAULT_SCENE = "yam_tabletop"
 ROBOT_ID = "yam"
 CAMERAS = ("top", "left", "right")
+FREE_VIEW = "free"
+VIEWS = (*CAMERAS, FREE_VIEW)
 X_RANGE = (-0.35, 0.35)
 Y_RANGE = (-0.20, 0.25)
 Z_RANGE = (0.76, 1.00)
@@ -32,8 +34,14 @@ JPEG_QUALITY = 70
 WAITING_AFTER_S = 0.3
 ALLOWED_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
 MAX_TASK_SECONDS = 200
-MAX_STL_BYTES = 25 * 1024 * 1024
-MAX_STL_TRIANGLES = 100_000
+MAX_STL_BYTES = 60 * 1024 * 1024
+MAX_STL_TRIANGLES = 1_500_000
+SIM_MESH_TRIANGLES = 60_000
+COLLISION_HULL_VERTICES = 64
+ORBIT_DEG_PER_PIXEL = 0.35
+GOAL_SETTLED_FRAMES = 30
+GOAL_SPEED_M_S = 0.03
+GOAL_TARGETS = {"bowl": 0.08, "plate": 0.07}
 MAX_ADDED_OBJECTS = 10
 TABLE_TOP_Z = 0.76
 RENDER_WIDTH = 640
@@ -62,6 +70,58 @@ ROBOTS_NEEDING_SETUP = (
     ("b601", "Seeed reBot B601", "b601_dm.urdf"),
     ("maker_arm", "MakerMods Maker Arm", "maker_arm_ik.urdf"),
 )
+
+
+def simplify_mesh(vertices, faces):
+    low = vertices.min(axis=0)
+    span = (vertices.max(axis=0) - low).max()
+
+    def cluster(resolution):
+        cells = np.minimum(((vertices - low) / span * resolution).astype(np.int64), resolution)
+        size = resolution + 1
+        _, inverse = np.unique(cells[:, 0] + cells[:, 1] * size + cells[:, 2] * size * size, return_inverse=True)
+        mapped = inverse[faces]
+        keep = (mapped[:, 0] != mapped[:, 1]) & (mapped[:, 1] != mapped[:, 2]) & (mapped[:, 0] != mapped[:, 2])
+        return inverse, mapped[keep]
+
+    best = None
+    lower, upper = 8, 1024
+    while lower <= upper:
+        resolution = (lower + upper) // 2
+        inverse, mapped = cluster(resolution)
+        if len(mapped) <= SIM_MESH_TRIANGLES:
+            best = (inverse, mapped)
+            lower = resolution + 1
+        else:
+            upper = resolution - 1
+    if best is None:
+        raise ValueError("The STL could not be simplified for simulation.")
+    inverse, mapped = best
+    counts = np.bincount(inverse)
+    merged = np.column_stack([np.bincount(inverse, vertices[:, axis]) / counts for axis in range(3)])
+    _, unique_faces = np.unique(np.sort(mapped, axis=1), axis=0, return_index=True)
+    mapped = mapped[np.sort(unique_faces)]
+    used, compact = np.unique(mapped, return_inverse=True)
+    return merged[used], np.asarray(compact).reshape(-1, 3)
+
+
+def parse_goal(instruction, movable):
+    match = re.search(r"\b(?:put|place|move|drop|set)\b(.*?)\b(?:into|inside|onto|in|on)\b(.*)", instruction.lower())
+    if not match:
+        return None
+    target_words = re.findall(r"[a-z]+", match.group(2))
+    target = next((word for word in target_words if word in GOAL_TARGETS), None)
+    if target is None:
+        return None
+    subject = set(re.findall(r"[a-z]+", match.group(1)))
+    found = []
+    for body in movable:
+        words = {word for word in re.findall(r"[a-z]+", body) if word != "stl"}
+        if body == "water_bottle":
+            words = {"bottle"}
+        if words & subject:
+            found.append(body)
+    return {"object": found[0], "target": target} if len(found) == 1 else None
 
 
 def parse_stl(data, max_size_m):
@@ -97,9 +157,13 @@ def parse_stl(data, max_size_m):
     scale = max_size_m / extent.max()
     if (extent * scale).min() < 0.001:
         raise ValueError("The STL is too flat to simulate as a solid object.")
+    original = len(faces)
+    if original > SIM_MESH_TRIANGLES:
+        vertices, faces = simplify_mesh(vertices, faces)
+        low, high = vertices.min(axis=0), vertices.max(axis=0)
     center = (low + high) / 2
     vertices = (vertices - [center[0], center[1], low[2]]) * scale
-    return vertices, faces
+    return vertices, faces, original
 
 
 class LiveFeed:
@@ -157,6 +221,14 @@ class SimAdapter:
         self.removed = set()
         self.scene_id = DEFAULT_SCENE
         self.grab = None
+        self.goal = None
+        self.view_lock = threading.Lock()
+        self.free_camera = mujoco.MjvCamera()
+        self.free_camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        self.free_camera.lookat[:] = [0, -0.02, 0.78]
+        self.free_camera.distance = 1.25
+        self.free_camera.azimuth = -90
+        self.free_camera.elevation = -35
         self.last_publish = 0.0
         self.env.on_images = self._on_images
         self.publish()
@@ -164,16 +236,54 @@ class SimAdapter:
     def _on_images(self, images):
         now = time.monotonic()
         self.feed.last_step = now
+        self._check_goal()
         if now - self.last_publish < STREAM_PERIOD_S:
             return
         self.last_publish = now
         state = self.env.state()
+        with self.view_lock:
+            self.env.renderer.update_scene(self.env.data, camera=self.free_camera)
+        free = self.env.renderer.render()[RENDER_CROP_TOP : RENDER_HEIGHT - RENDER_CROP_TOP].copy()
         self.feed.publish(
-            images,
+            {**images, FREE_VIEW: free},
             self.objects(),
             {side: np.round(values, 4).tolist() for side, values in state.items()},
             int(self.env.data.ncon),
         )
+
+    def orbit(self, dx, dy):
+        with self.view_lock:
+            self.free_camera.azimuth = (self.free_camera.azimuth - dx * ORBIT_DEG_PER_PIXEL) % 360
+            self.free_camera.elevation = float(np.clip(self.free_camera.elevation - dy * ORBIT_DEG_PER_PIXEL, -85, -5))
+
+    def goal_reached(self, name, target):
+        m, d = self.env.model, self.env.data
+        joint = self._joint_by_body().get(name)
+        if joint is None:
+            return False
+        offset = np.linalg.norm(d.body(name).xpos[:2] - d.body(target).xpos[:2])
+        dof = m.joint(joint).dofadr[0]
+        if offset >= GOAL_TARGETS[target] or np.linalg.norm(d.qvel[dof : dof + 3]) >= GOAL_SPEED_M_S:
+            return False
+        touches_target = False
+        for contact in d.contact[: d.ncon]:
+            names = {m.body(m.geom_bodyid[contact.geom1]).name, m.body(m.geom_bodyid[contact.geom2]).name}
+            if name not in names:
+                continue
+            other = next(iter(names - {name}), "")
+            if other.startswith(("left_", "right_")):
+                return False
+            touches_target = touches_target or other == target
+        return touches_target
+
+    def _check_goal(self):
+        goal = self.goal
+        if goal is None or goal["met"]:
+            return
+        goal["frames"] = goal["frames"] + 1 if self.goal_reached(goal["object"], goal["target"]) else 0
+        if goal["frames"] >= GOAL_SETTLED_FRAMES:
+            goal["met"] = True
+            goal["stop"].set()
 
     def publish(self):
         self.last_publish = 0.0
@@ -253,6 +363,7 @@ class SimAdapter:
                 )
                 continue
             spec.add_mesh(
+                maxhullvert=COLLISION_HULL_VERTICES,
                 name=f"{name}_mesh",
                 uservert=item["vertices"].ravel().tolist(),
                 userface=item["faces"].ravel().tolist(),
@@ -511,6 +622,11 @@ class RotateObject(ObjectRef):
     yaw_deg: float = Field(ge=-360, le=360)
 
 
+class OrbitView(BaseModel):
+    dx: float = Field(ge=-4000, le=4000)
+    dy: float = Field(ge=-4000, le=4000)
+
+
 class ViewPoint(BaseModel):
     camera: str
     u: float = Field(ge=0, le=RENDER_WIDTH)
@@ -557,21 +673,41 @@ def unsupported(capability, reason):
 
 def run_task(task, stop):
     global active_task, active_stop
+    result = {}
+    goal = parse_goal(task["instruction"], list(sim._joint_by_body()))
+    if goal:
+        sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
     try:
         dc.main(
             [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
             shared_env=sim.env,
             stop_event=stop,
         )
-        task["status"] = "CANCELLED" if stop.is_set() else "TIMED_OUT"
+        if goal and sim.goal["met"]:
+            result["status"] = "COMPLETED"
+            result["outcome"] = "SUCCESS"
+            result["result_message"] = f"{goal['object'].replace('_', ' ')} is in the {goal['target']}."
+        elif stop.is_set():
+            result["status"] = "CANCELLED"
+            result["result_message"] = "ended by the user."
+        elif goal:
+            result["status"] = "TIMED_OUT"
+            result["outcome"] = "FAILURE"
+            result["result_message"] = f"{goal['object'].replace('_', ' ')} is not in the {goal['target']}."
+        else:
+            result["status"] = "TIMED_OUT"
+            result["outcome"] = "NOT_EVALUATED"
+            result["result_message"] = "this instruction cannot be checked automatically."
     except (Exception, SystemExit) as error:
-        task["status"] = "FAILED"
-        task["error"] = f"{type(error).__name__}: {error}"
+        result["status"] = "FAILED"
+        result["error"] = f"{type(error).__name__}: {error}"
     finally:
-        task["finished_at"] = time.time()
+        sim.goal = None
+        finished_at = time.time()
         sim.publish()
         active_task = None
         active_stop = None
+        task.update(result, finished_at=finished_at)
 
 
 def task_view(task):
@@ -653,13 +789,22 @@ async def upload_stl(request: Request, filename: str = Query(min_length=1, max_l
     async for chunk in request.stream():
         total += len(chunk)
         if total > MAX_STL_BYTES:
-            raise HTTPException(413, "The STL is larger than 25 MB.")
+            raise HTTPException(413, "The STL is larger than 60 MB.")
         chunks.append(chunk)
     try:
-        vertices, faces = await asyncio.to_thread(parse_stl, b"".join(chunks), size_cm / 100)
+        vertices, faces, original = await asyncio.to_thread(parse_stl, b"".join(chunks), size_cm / 100)
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
-    return {"object_id": await change_scene(sim.add_stl, filename, vertices, faces)}
+    object_id = await change_scene(sim.add_stl, filename, vertices, faces)
+    return {"object_id": object_id, "original_triangles": original, "triangles": len(faces)}
+
+
+@app.post("/api/view/orbit")
+async def view_orbit(body: OrbitView):
+    sim.orbit(body.dx, body.dy)
+    if active_task is None:
+        await on_sim(sim.publish)
+    return {"ok": True}
 
 
 @app.post("/api/view/pick")
@@ -724,7 +869,7 @@ async def rotate_object(body: RotateObject):
 
 @app.get("/api/frame/{camera}")
 async def frame(camera: str):
-    if camera not in CAMERAS:
+    if camera not in VIEWS:
         raise HTTPException(404, "unknown camera")
     jpeg = await asyncio.to_thread(feed.jpeg, camera)
     return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -746,6 +891,8 @@ async def execute_task(body: ExecuteTask):
         "started_at": time.time(),
         "finished_at": None,
         "error": None,
+        "outcome": None,
+        "result_message": None,
     }
     tasks[task["task_id"]] = task
     active_task = task
@@ -782,7 +929,7 @@ async def live(socket: WebSocket):
     async def receive():
         while True:
             message = await socket.receive_json()
-            if isinstance(message, dict) and message.get("camera") in CAMERAS:
+            if isinstance(message, dict) and message.get("camera") in VIEWS:
                 selected["camera"] = message["camera"]
 
     receiver = asyncio.create_task(receive())
