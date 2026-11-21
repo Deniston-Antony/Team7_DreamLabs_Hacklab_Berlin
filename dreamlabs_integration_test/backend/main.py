@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import math
 import re
 import sys
@@ -393,8 +394,8 @@ class SimAdapter:
                 conaffinity=0,
             )
 
-    def _rebuild(self, keep_poses=True):
-        saved = {}
+    def _rebuild(self, keep_poses=True, poses=None):
+        saved = dict(poses or {})  # poses to put objects back to, such as a saved layout's
         if keep_poses:
             for body in self.managed():
                 if mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_BODY, body) >= 0:
@@ -913,10 +914,83 @@ def select_robot(body: SelectRobot):
     return {"robot_id": ROBOT_ID}
 
 
+RESET_STOP_TIMEOUT_S = 30  # how long Reset waits for a running task and its parallel runs to stop
+saved_layout = None  # the scene Reset puts back when the user saved one; None means the default scene
+
+
+def capture_layout():
+    """Everything Reset should put back: added and removed objects, object types, and every object's pose."""
+    poses = {}
+    for body in sim.managed():
+        if mujoco.mj_name2id(sim.env.model, mujoco.mjtObj.mjOBJ_BODY, body) >= 0:
+            data = sim.env.data.body(body)
+            poses[body] = np.r_[data.xpos, data.xquat]
+    return {
+        "added": copy.deepcopy(sim.added),
+        "removed": set(sim.removed),
+        "type_overrides": dict(sim.type_overrides),
+        "poses": poses,
+    }
+
+
+def restore_layout(layout):
+    """Rebuild the scene as a saved layout describes it, with both arms back home."""
+    sim.added.clear()
+    sim.added.update(copy.deepcopy(layout["added"]))
+    sim.removed.clear()
+    sim.removed.update(layout["removed"])
+    sim.type_overrides.clear()
+    sim.type_overrides.update(layout["type_overrides"])
+    sim.grab = None
+    sim.selected = None
+    sim._rebuild(keep_poses=False, poses=layout["poses"])
+
+
+async def stop_running_task():
+    """Stop the running task, live and parallel runs alike, and wait until it has ended.
+    @return True when no task is running any more, False when it did not stop within RESET_STOP_TIMEOUT_S.
+    """
+    task, stop = active_task, active_stop
+    if task is None:
+        return True
+    task["cancel_requested"] = True  # ends the parallel runs, also while the task waits for them
+    if stop is not None:
+        stop.set()  # ends the live run once its pending Dream-1 response returns
+    deadline = time.monotonic() + RESET_STOP_TIMEOUT_S
+    while active_task is task and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    return active_task is not task
+
+
 @app.post("/api/scene/reset")
 async def reset_scene():
-    await change_scene(sim.reset)
-    return {"placed": feed.objects}
+    # Reset also works while a task runs: it stops the live run and every parallel run first.
+    stopped_task = active_task is not None
+    if not await stop_running_task():
+        raise HTTPException(409, "The running task did not stop in time; press Reset scene again.")
+    if saved_layout is not None:
+        await change_scene(restore_layout, saved_layout)
+    else:
+        await change_scene(sim.reset)
+    return {"placed": feed.objects, "stopped_task": stopped_task, "layout": saved_layout is not None}
+
+
+@app.post("/api/scene/layout")
+async def save_layout():
+    """Remember the current scene; Reset scene then puts it back instead of the default scene."""
+    global saved_layout
+    if active_task is not None:
+        raise HTTPException(409, "The layout cannot be saved while a task is running.")
+    saved_layout = await on_sim(capture_layout)
+    return {"saved": True, "objects": len(saved_layout["poses"])}
+
+
+@app.delete("/api/scene/layout")
+def forget_layout():
+    """Forget the saved layout; Reset scene goes back to the default scene."""
+    global saved_layout
+    saved_layout = None
+    return {"saved": False}
 
 
 @app.post("/api/objects/shuffle")
@@ -1146,6 +1220,7 @@ async def live(socket: WebSocket):
                     "camera": selected["camera"],
                     "attempt": attempt,
                     "workers": outcome.attempt_states(),
+                    "layout_saved": saved_layout is not None,
                     "scene_id": sim.scene_id,
                     "selected": sim.selected,
                     "phase": live_phase(),

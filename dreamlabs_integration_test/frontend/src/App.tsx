@@ -43,15 +43,17 @@ type AttemptResult = {
   sim_seconds: number | null;
   closest_cm?: number | null;
   error?: string | null;
+  stopped?: boolean;
 };
 type WorkerState = {
   attempt: number;
   task: number;
   where: "live" | "hidden";
   label: string;
-  state: "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended";
+  state: "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped";
 };
 type Live = {
+  layout_saved?: boolean;
   attempt?: number;
   workers?: WorkerState[];
   phase: "idle" | "running" | "waiting_for_dream";
@@ -79,6 +81,7 @@ const RUN_STATE_LABEL: Record<WorkerState["state"], string> = {
   failed: "Failed",
   error: "Error",
   ended: "Stopped",
+  stopped: "Stopped",
 };
 const MAX_TASK_SECONDS = 200;
 const MAX_ATTEMPTS = 8;
@@ -164,7 +167,7 @@ function AttemptsPanel({ task }: { task: Task }) {
           <ul>
             {results.map((r) => (
               <li key={r.attempt}>
-                {runName(r.attempt)}: {r.success ? `✓ succeeded in ${r.sim_seconds ?? "?"} s` : r.error ? `✗ ${r.error}` : r.closest_cm != null ? `✗ not reached (closest ${r.closest_cm} cm)` : "✗ not reached"}
+                {runName(r.attempt)}: {r.success ? `✓ succeeded in ${r.sim_seconds ?? "?"} s` : r.stopped ? "■ stopped" : r.error ? `✗ ${r.error}` : r.closest_cm != null ? `✗ not reached (closest ${r.closest_cm} cm)` : "✗ not reached"}
               </li>
             ))}
           </ul>
@@ -207,6 +210,7 @@ export default function App() {
   const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
   const [attempts, setAttempts] = useState(1);
   const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
+  const [lastRequest, setLastRequest] = useState<Record<string, unknown> | null>(null);
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator…", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
@@ -344,6 +348,22 @@ export default function App() {
   const running = task?.status === "RUNNING";
   const totalAttempts = attempts + extras.reduce((sum, extra) => sum + extra.attempts, 0);
   const suiteReady = extras.every((extra) => extra.text.trim()) && totalAttempts <= MAX_ATTEMPTS;
+  const request: Record<string, unknown> = extras.length
+    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds }
+    : { instruction, max_seconds: maxSeconds, attempts };
+  const layoutSaved = live?.layout_saved ?? false;
+  const resetScene = () => {
+    if (running && !window.confirm("Stop every run and reset the scene?")) return;
+    void run(running ? "Stopped every run and reset the scene" : layoutSaved ? "Saved layout restored" : "Scene reset", () => api("/api/scene/reset", {}));
+  };
+  const restart = () => {
+    if (!lastRequest) return;
+    if (!window.confirm(running ? "Stop every run, reset the scene and run the same tasks again? This uses credits." : "Reset the scene and run the same tasks again? This uses credits.")) return;
+    void run("Restarted from a reset scene", async () => {
+      await api("/api/scene/reset", {});
+      await api("/api/tasks/execute", lastRequest);
+    });
+  };
   const locked = busy || running || dragging;
   const position = { x: pose.x, y: pose.y, z: pose.z };
   const canDrag = (camera === "top" || camera === "free") && !running && !busy;
@@ -668,7 +688,22 @@ export default function App() {
               <button disabled={locked || !selectedMovable} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
               <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, () => api("/api/objects/remove", { object_id: selected }))}>Remove</button>
               <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffle</button>
-              <button disabled={locked} onClick={() => run("Scene reset", () => api("/api/scene/reset", {}))}>Reset scene</button>
+              <button
+                disabled={busy || dragging}
+                title={running ? "Stops the live run and every parallel run, then resets the scene" : layoutSaved ? "Puts back your saved layout, with both arms home" : "Puts every object and both arms back where they started"}
+                onClick={resetScene}
+              >
+                Reset scene
+              </button>
+              <button disabled={locked} title="Reset scene will put back the scene as it is now" onClick={() => run("Layout saved: Reset scene now returns to it", () => api("/api/scene/layout", {}))}>
+                Save layout
+              </button>
+              {layoutSaved && (
+                <span className="hint layout-hint">
+                  Reset returns to your saved layout.{" "}
+                  <button className="link" disabled={busy} onClick={() => run("Saved layout forgotten: Reset scene returns to the default scene", () => fetch("/api/scene/layout", { method: "DELETE" }).then((r) => parse(r)))}>Use default instead</button>
+                </span>
+              )}
             </div>
             <div className="upload">
               <label>Mesh file (STL)
@@ -690,7 +725,7 @@ export default function App() {
               <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
             </label>
             <label style={{ marginTop: 8 }}>Runs for this task
-              <input aria-label="Attempts" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
+              <input aria-label="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
             </label>
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
@@ -712,10 +747,13 @@ export default function App() {
               {running ? (
                 <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop</button>
               ) : (
-                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady} onClick={() => run("Task started", () => api("/api/tasks/execute", extras.length ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds } : { instruction, max_seconds: maxSeconds, attempts }))}>
+                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady} onClick={() => { setLastRequest(request); void run("Task started", () => api("/api/tasks/execute", request)); }}>
                   {extras.length ? `Run ${extras.length + 1} tasks` : "Run task"}
                 </button>
               )}
+              <button disabled={!lastRequest || busy || !connected} title="Stop, reset the scene and run the last tasks again" onClick={restart}>
+                Restart
+              </button>
             </div>
             {task && (
               <div className={`status ${task.outcome === "SUCCESS" ? "success" : task.status === "FAILED" || task.outcome === "FAILURE" ? "error" : ""}`}>

@@ -33,6 +33,7 @@ STAGGER_S = 0.5  # between worker starts, so they do not open their Dream sessio
 CLIP = re.compile(r"^(attempt-[1-9][0-9]*|grid)$")  # the video names the API serves
 POLL_S = 0.5
 WAIT_AFTER_LIVE_S = 90  # how long past the time limit a worker may take to report
+STOP_GRACE_S = 8  # how long a stopped worker may take to close its video and report before it is killed
 
 
 current = None  # the newest request's Session: its workers' latest frames stay readable after the run ends
@@ -84,7 +85,7 @@ class Workers:
             `attempt` (the number the attempt has in the request, 2 or more; its video is attempt-<n>.mp4).
         @param folder Folder for the scene copy and the workers' videos.
         """
-        self.folder, self.jobs, self.procs = folder, jobs, []
+        self.folder, self.jobs, self.procs, self.outputs = folder, jobs, [], {}
         self.watching = {job["attempt"]: Watching(job) for job in jobs}
         self.model_path, self.state_path = folder / "scene.mjb", folder / "scene.npz"
         mujoco.mj_saveModel(env.model, str(self.model_path))
@@ -145,39 +146,39 @@ class Workers:
             ).start()
             time.sleep(STAGGER_S)
 
+    def _drain(self, index, timeout):
+        """Wait for one worker to exit (killing it after `timeout`), and keep its output for collect()."""
+        if index in self.outputs:
+            return
+        proc = self.procs[index]
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+        self.outputs[index] = (out or "", err or "")
+
     def stop(self):
-        """End every worker now, wait for each to exit and close its pipes, so none is left running or defunct."""
+        """Ask every worker to stop and wait for each to exit, so none is left running or defunct.
+
+        Workers stop gracefully on SIGTERM (parallel_bench.StopRequested): each closes its video and reports
+        "stopped". One that has not exited after STOP_GRACE_S is killed.
+        """
         self.thread.join(timeout=len(self.jobs) * STAGGER_S + 5)
         for proc in self.procs:
             if proc.poll() is None:
                 proc.terminate()
-        for proc in self.procs:
-            try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
+        for index in range(len(self.procs)):
+            self._drain(index, STOP_GRACE_S)
 
-    def results(self, wait_s, cancelled):
-        """Wait for the workers and read each one's record.
-        @param wait_s Seconds to wait in all before giving up on a worker.
-        @param cancelled Callable returning True once the user cancelled the task; the workers are then ended.
-        @return One record per job in start order, or None when the task was cancelled while waiting.
-        """
-        self.thread.join(timeout=len(self.jobs) * STAGGER_S + 5)
-        deadline = time.monotonic() + wait_s
-        while any(proc.poll() is None for proc in self.procs) and time.monotonic() < deadline:
-            if cancelled():
-                self.stop()
-                return None
-            time.sleep(POLL_S)
+    def collect(self):
+        """Each started worker's record, from what it printed; call once every worker has exited."""
         records = []
-        for proc in self.procs:
-            if proc.poll() is None:
-                proc.kill()
-            out, err = proc.communicate()
-            lines = [line for line in (out or "").splitlines() if line.startswith("RESULT ")]
-            tail = ((err or "").strip().splitlines() or ["no output"])[-1]
+        for index, proc in enumerate(self.procs):
+            self._drain(index, STOP_GRACE_S)
+            out, err = self.outputs[index]
+            lines = [line for line in out.splitlines() if line.startswith("RESULT ")]
+            tail = (err.strip().splitlines() or ["no output"])[-1]
             if lines:
                 record = json.loads(lines[-1][len("RESULT ") :])
                 if str(record.get("error") or "").startswith("exit "):  # dream_control refused to start: say why
@@ -186,6 +187,25 @@ class Workers:
             else:
                 records.append({"success": False, "error": f"worker exited {proc.returncode}: {tail}"})
         return records
+
+    def results(self, wait_s, cancelled):
+        """Wait for the workers and read each one's record.
+        @param wait_s Seconds to wait in all before giving up on a worker.
+        @param cancelled Callable returning True once the user cancelled the task; the workers are then stopped.
+        @return One record per started job in start order, or None when the task was cancelled while waiting
+            (the stopped workers' records are then available from collect()).
+        """
+        self.thread.join(timeout=len(self.jobs) * STAGGER_S + 5)
+        deadline = time.monotonic() + wait_s
+        while any(proc.poll() is None for proc in self.procs) and time.monotonic() < deadline:
+            if cancelled():
+                self.stop()
+                return None
+            time.sleep(POLL_S)
+        for proc in self.procs:
+            if proc.poll() is None:  # past the deadline: it will not report any more
+                proc.kill()
+        return self.collect()
 
 
 class Session:
@@ -244,8 +264,11 @@ class Session:
             }
         ]
         ended = result.get("status") in ("CANCELLED", "FAILED")
+        results[0]["stopped"] = result.get("status") == "CANCELLED"
+        records = []
         if self.workers and ended:
             self.workers.stop()
+            records = self.workers.collect()
         elif self.workers:
             self.task["waiting_for_attempts"] = True
             records = self.workers.results(
@@ -254,26 +277,28 @@ class Session:
             self.task["waiting_for_attempts"] = False
             if records is None:
                 result["status"], result["result_message"] = "CANCELLED", "ended by the user."
-            else:
-                for job, record in zip(self.jobs, records):
-                    results.append(
-                        {
-                            "attempt": job["attempt"],
-                            "task": job["index"] + 1,
-                            "where": "hidden",
-                            "success": bool(record.get("success")),
-                            "sim_seconds": record.get("sim_seconds"),
-                            "closest_cm": record.get("closest_cm"),
-                            "error": record.get("error"),
-                        }
-                    )
+                records = self.workers.collect()
+        for job, record in zip(self.jobs, records):
+            results.append(
+                {
+                    "attempt": job["attempt"],
+                    "task": job["index"] + 1,
+                    "where": "hidden",
+                    "success": bool(record.get("success")),
+                    "stopped": bool(record.get("stopped")),
+                    "sim_seconds": record.get("sim_seconds"),
+                    "closest_cm": record.get("closest_cm"),
+                    "error": record.get("error"),
+                }
+            )
         entries = []
         for r in results:
             clip = self.folder / f"attempt-{r['attempt']}.mp4"
             if clip.is_file():
                 goal = self.plan[r["task"] - 1]["goal"]
                 what = describe(goal) if goal and len(self.plan) > 1 else f"attempt {r['attempt']}"
-                label = f"{what} #{r['attempt']}: " + (f"OK {r['sim_seconds']:.0f} s" if r["success"] else "FAIL")
+                verdict = f"OK {r['sim_seconds']:.0f} s" if r["success"] else "STOPPED" if r.get("stopped") else "FAIL"
+                label = f"{what} #{r['attempt']}: {verdict}"
                 entries.append((clip, label, r["success"]))
         names = [clip.stem for clip, _, _ in entries]
         if len(entries) > 1 and recording.grid(entries, self.folder / "grid.mp4"):

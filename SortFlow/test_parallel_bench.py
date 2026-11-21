@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -186,6 +187,81 @@ class ParallelBenchTest(unittest.TestCase):
         final = json.loads([payload for kind, payload in messages if kind == livefeed.STATUS][-1])
         self.assertEqual(final["state"], "succeeded")
         self.assertEqual(final["sim_seconds"], record["sim_seconds"])
+
+    def test_a_stopped_worker_keeps_a_playable_video_and_reports_stopped(self):
+        """SIGTERM mid-run: the worker unwinds, closes its video properly, streams "stopped" and prints its record."""
+        import os
+        import signal
+        import subprocess
+        import sys
+        import textwrap
+
+        import livefeed
+        import recording
+
+        folder = tempfile.mkdtemp()
+        script = os.path.join(folder, "worker.py")
+        video = os.path.join(folder, "run.mp4")
+        with open(script, "w") as handle:
+            handle.write(
+                textwrap.dedent(
+                    f"""
+                    import json, os, sys, time
+                    sys.path.insert(0, {os.getcwd()!r})
+                    import numpy as np
+                    import parallel_bench
+
+                    home = np.r_[np.zeros(6), 1.0]
+
+                    def runner(argv, shared_env=None, stop_event=None, **kw):
+                        while True:  # a run that never ends on its own
+                            shared_env.step(home, home)
+                            shared_env.images()
+                            time.sleep(0.01)
+
+                    parallel_bench.stop_on_sigterm()
+                    try:
+                        record = parallel_bench.run_worker(
+                            "put apple into the bowl", 60, 48, 1, runner=runner, goal=("apple", "bowl"),
+                            video={video!r}, live=os.fdopen(int(sys.argv[1]), "wb", buffering=0),
+                        )
+                    except parallel_bench.StopRequested:
+                        record = {{"stopped": True, "early": True}}
+                    print("RESULT " + json.dumps(record), flush=True)
+                    """
+                )
+            )
+        read_fd, write_fd = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, script, str(write_fd)],
+            stdout=subprocess.PIPE,
+            text=True,
+            pass_fds=(write_fd,),
+            env={**os.environ, "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl")},
+        )
+        os.close(write_fd)
+        messages = []
+
+        def read():
+            with os.fdopen(read_fd, "rb") as stream:
+                messages.extend(livefeed.read_messages(stream))
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        for _ in range(100):  # wait until it is really running: frames are arriving
+            if any(kind != livefeed.STATUS for kind, _ in messages):
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=15)
+        reader.join(timeout=5)
+        self.assertEqual(proc.returncode, 0)
+        record = json.loads([line for line in out.splitlines() if line.startswith("RESULT ")][-1][7:])
+        self.assertEqual((record.get("stopped"), record.get("error"), record.get("early")), (True, "stopped", None))
+        final = json.loads([payload for kind, payload in messages if kind == livefeed.STATUS][-1])
+        self.assertEqual(final["state"], "stopped")
+        self.assertGreater(len(recording.read_frames(video)), 5, "the video was closed properly and plays")
 
     def test_the_last_line_is_the_record(self):
         """A worker's record is parsed from its last RESULT line, whatever the model printed before it."""

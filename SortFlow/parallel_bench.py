@@ -12,6 +12,7 @@ Each attempt calls the API, so the cost is about trials x tries x seconds / 120 
 import argparse
 import json
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -19,6 +20,25 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+
+class StopRequested(BaseException):
+    """Raised in a worker when the process that started it asks it to stop (SIGTERM).
+
+    A BaseException, so the `except Exception` that records a failed attempt does not swallow it: the run unwinds
+    through its `finally` blocks, which close the video properly and send the final "stopped" status.
+    """
+
+
+def stop_on_sigterm():
+    """In a worker, turn the first SIGTERM into StopRequested; later ones are ignored while it cleans up."""
+
+    def handler(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise StopRequested()
+
+    signal.signal(signal.SIGTERM, handler)
+
 
 RESULT = "RESULT "  # a worker's last stdout line starts with this, followed by its JSON record
 MAX_WORKERS = 16
@@ -99,6 +119,7 @@ def run_worker(
     record = {"task": task, "success": False, "success_try": None, "tries_used": 0, "sim_seconds": None, "error": None}
     closest = float("inf")
     started = time.monotonic()
+    watcher = None
     try:
         for attempt in range(1, tries + 1):
             reset()
@@ -131,9 +152,21 @@ def run_worker(
                 break
             if record["success"] or record["error"]:
                 break
+    except StopRequested:  # the backend stopped this run: end cleanly, keep the video, report it as stopped
+        record.update(error="stopped", stopped=True)
+        if watcher is not None:
+            closest = min(closest, watcher.min_distance)
     finally:
         if feed:
-            state = "succeeded" if record["success"] else "error" if record["error"] else "failed"
+            state = (
+                "stopped"
+                if record.get("stopped")
+                else "succeeded"
+                if record["success"]
+                else "error"
+                if record["error"]
+                else "failed"
+            )
             feed.status(
                 state,
                 sim_seconds=record["sim_seconds"],
@@ -153,6 +186,7 @@ def worker_main(args):
     scene = (args.scene_model, args.scene_state) if args.scene_model and args.scene_state else None
     goal = (args.goal_object, args.goal_target) if args.goal_object and args.goal_target else None
     live = os.fdopen(args.live_fd, "wb", buffering=0) if args.live_fd is not None else None
+    stop_on_sigterm()
     try:
         record = run_worker(
             args.task,
@@ -165,6 +199,8 @@ def worker_main(args):
             goal=goal,
             live=live,
         )
+    except StopRequested:  # stopped before the run began
+        record = {"task": args.task, "success": False, "error": "stopped", "stopped": True}
     except Exception as exc:
         record = {"task": args.task, "success": False, "error": f"{type(exc).__name__}: {exc}"}
     print(RESULT + json.dumps(record), flush=True)

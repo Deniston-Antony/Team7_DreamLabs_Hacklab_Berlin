@@ -64,7 +64,8 @@ class OutcomeTest(unittest.TestCase):
         outcome.VIDEOS, main.dc.main, outcome.SORTFLOW = cls.keep
 
     def setUp(self):
-        """Every task starts from the default scene."""
+        """Every task starts from the default scene, with no saved layout."""
+        main.saved_layout = None
         self.client.post("/api/scene/reset")
 
     def tearDown(self):
@@ -310,6 +311,105 @@ class OutcomeTest(unittest.TestCase):
             self.assertEqual(outcome.worker_frame(5, "top"), (None, None))
         finally:
             outcome.current = keep
+
+    def endless_workers(self):
+        """A folder holding a stand-in parallel_bench.py that runs the real worker code on a run that never ends."""
+        folder = Path(tempfile.mkdtemp())
+        (folder / "parallel_bench.py").write_text(
+            textwrap.dedent(
+                f"""
+                import json, os, sys, time
+                sys.path.insert(0, {str(self.keep[2])!r})
+                import numpy as np
+                import parallel_bench as real
+
+                arg = lambda name: sys.argv[sys.argv.index(name) + 1]
+                home = np.r_[np.zeros(6), 1.0]
+
+                def runner(argv, shared_env=None, stop_event=None, **kw):
+                    while True:
+                        shared_env.step(home, home)
+                        shared_env.images()
+                        time.sleep(0.02)
+
+                real.stop_on_sigterm()
+                try:
+                    record = real.run_worker(
+                        arg("--task"), 60, 48, 1, runner=runner, video=arg("--record"),
+                        scene=(arg("--scene-model"), arg("--scene-state")),
+                        goal=(arg("--goal-object"), arg("--goal-target")),
+                        live=os.fdopen(int(arg("--live-fd")), "wb", buffering=0),
+                    )
+                except real.StopRequested:
+                    record = {{"success": False, "error": "stopped", "stopped": True}}
+                print("RESULT " + json.dumps(record), flush=True)
+                """
+            )
+        )
+        return folder
+
+    def objects(self):
+        """The scene's objects by name, as the backend reports them."""
+        return {o["object_id"]: o for o in main.feed.objects}
+
+    def test_reset_during_a_run_stops_every_run_keeps_their_videos_and_resets(self):
+        """Reset scene mid-run: the live run and the parallel runs stop cleanly, then the scene is reset."""
+        outcome.SORTFLOW = self.endless_workers()
+        try:
+            self.client.post("/api/objects/move", json={"object_id": "apple", "position": {"x": 0.2, "y": 0.18, "z": 0.8}})
+            main.dc.main = model(steps=100000)
+            task_id = self.client.post(
+                "/api/tasks/execute",
+                json={"tasks": [{"instruction": "put apple into the bowl"}, {"instruction": "put orange into the bowl"}]},
+            ).json()["task_id"]
+            for _ in range(200):  # until the parallel run streams frames
+                if [w["state"] for w in outcome.attempt_states()] == ["running", "running"]:
+                    break
+                time.sleep(0.1)
+            reply = self.client.post("/api/scene/reset")
+            self.assertEqual(reply.status_code, 200, reply.text)
+            self.assertTrue(reply.json()["stopped_task"])
+            task = self.client.get(f"/api/tasks/{task_id}/status").json()
+            self.assertEqual(task["status"], "CANCELLED")
+            hidden = task["attempt_results"][1]
+            self.assertEqual((hidden["stopped"], hidden["error"]), (True, "stopped"))
+            self.assertEqual(outcome.attempt_states()[1]["state"], "stopped")
+            self.assertTrue(all(proc.poll() is not None for proc in outcome.current.workers.procs), "no run left")
+            self.assertIn("attempt-2", task["videos"])
+            video = self.client.get(f"/api/tasks/{task_id}/video/attempt-2")
+            self.assertEqual(video.status_code, 200)
+            apple = self.objects()["apple"]["position"]
+            self.assertLess(abs(apple[0] - 0.15) + abs(apple[1] - 0.105), 0.02, "the apple is back where it starts")
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+
+    def test_reset_returns_to_a_saved_layout_until_it_is_forgotten(self):
+        """Save layout keeps moved, removed and added objects; Reset puts them back; forgetting returns to default."""
+        move = lambda x, y: self.client.post(  # noqa: E731
+            "/api/objects/move", json={"object_id": "apple", "position": {"x": x, "y": y, "z": 0.8}}
+        )
+        move(0.05, 0.18)
+        self.client.post("/api/objects/remove", json={"object_id": "banana"})
+        block = self.client.post("/api/objects/add", json={"type": "block", "position": {"x": -0.1, "y": 0.15, "z": 0.8}})
+        self.assertEqual(self.client.post("/api/scene/layout").status_code, 200)
+        move(0.25, -0.1)
+        self.assertTrue(self.client.post("/api/scene/reset").json()["layout"])
+        objects = self.objects()
+        self.assertLess(abs(objects["apple"]["position"][0] - 0.05) + abs(objects["apple"]["position"][1] - 0.18), 0.02)
+        self.assertNotIn("banana", objects)
+        self.assertIn(block.json()["object_id"], objects)
+        self.assertEqual(self.client.delete("/api/scene/layout").status_code, 200)
+        self.assertFalse(self.client.post("/api/scene/reset").json()["layout"])
+        objects = self.objects()
+        self.assertIn("banana", objects)
+        self.assertLess(abs(objects["apple"]["position"][0] - 0.15) + abs(objects["apple"]["position"][1] - 0.105), 0.02)
+
+    def test_a_layout_cannot_be_saved_while_a_task_runs(self):
+        """Saving reads the scene, which is moving during a run, so it waits for the task to end."""
+        main.dc.main = model(steps=4000)
+        self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20})
+        time.sleep(0.3)
+        self.assertEqual(self.client.post("/api/scene/layout").status_code, 409)
 
     def test_success_keeps_the_backends_verdict_and_saves_a_video(self):
         """The apple settling in the bowl is COMPLETED / SUCCESS as before, now with a video the API serves."""

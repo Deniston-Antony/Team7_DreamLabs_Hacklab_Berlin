@@ -118,7 +118,7 @@ Open **http://127.0.0.1:5173**. Press `Ctrl+C` in each terminal to stop.
 
 ### Run a task several times at once
 
-Set **Runs for this task** to more than 1, for example 4. The first run is the live one in the picture; the others are parallel runs in the background. Each parallel run starts from a copy of the scene as it is when you press **Run task**, including objects you moved, added or removed, and is judged by the same success check. Parallel runs exist only while a task runs, so **Reset scene** before **Run task** gives every run, live and parallel, the same clean start. At the end the result reads, for example, **3 of 4 runs succeeded**, with each run's time or how close it got.
+Set **Runs for this task** to more than 1, for example 4. The first run is the live one in the picture; the others are parallel runs in the background. Each parallel run starts from a copy of the scene as it is when you press **Run task**, including objects you moved, added or removed, and is judged by the same success check. Parallel runs exist only while a task runs, so **Reset scene** before **Run task** gives every run, live and parallel, the same clean start. A stopped parallel run still keeps its video and shows **Stopped**. At the end the result reads, for example, **3 of 4 runs succeeded**, with each run's time or how close it got.
 
 ### Run several different tasks at once
 
@@ -129,6 +129,12 @@ At most 8 runs can run at once, counting every task. The line under **Add task**
 ### Watch every run
 
 The **Runs** tabs on the left of the picture list **Live run**, **Parallel run 2**, and so on, each with its goal (such as `Orange → Bowl`) and its state: Starting, Running, Succeeded, Failed or Stopped. Click a tab to watch that run live. Parallel runs show their camera view only (Overhead, Left wrist and Right wrist); the **Scene objects** table always shows the live run. Editing the scene is turned off while a parallel run is shown.
+
+### Reset, save a layout, restart
+
+- **Reset scene** puts every object and both arms back where they started. It also works while a task runs: after you confirm, it stops the live run and every parallel run, keeps their videos, then resets.
+- **Save layout** remembers the scene as it is now, including objects you moved, added, removed or set to Fixed. From then on, **Reset scene** puts that layout back instead of the default table. **Use default instead** forgets it.
+- **Restart** stops whatever is running, resets the scene and runs the last tasks again with the same runs and time limit. It uses credits again.
 
 ### Videos
 
@@ -146,7 +152,8 @@ Before the first run on a new computer, a person should check what the model rec
 - One request runs at a time, with up to 8 runs in it. **Add simulation** is a placeholder.
 - Parallel runs show the camera view only, not the 3D view, the object table or the joint values.
 - STL uploads are limited to 60 MB and 1.5 million triangles, are simplified to 60,000 triangles when larger, and are scaled to the size you enter. MuJoCo uses a convex collision shape, so hollow objects such as cups behave as solid.
-- Objects and arms stay where a task leaves them until you press **Reset**.
+- Objects and arms stay where a task leaves them until you press **Reset scene**.
+- The saved layout is kept only while the backend runs; restarting the backend forgets it.
 - The website only accepts connections from the same computer.
 - Simulation results do not prove real-robot safety or reliability.
 
