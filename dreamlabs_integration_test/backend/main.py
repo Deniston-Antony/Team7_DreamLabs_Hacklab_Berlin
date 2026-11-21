@@ -749,10 +749,17 @@ class ViewPoint(BaseModel):
     v: float = Field(ge=0, le=RENDER_HEIGHT - 2 * RENDER_CROP_TOP)
 
 
-class ExecuteTask(BaseModel):
+class SubTask(BaseModel):
     instruction: str = Field(min_length=1, max_length=500)
+    attempts: int = Field(default=1, ge=1, le=outcome.MAX_ATTEMPTS)
+
+
+class ExecuteTask(BaseModel):
+    # One task as `instruction` (with `attempts`), or several at once as `tasks`, each with its own attempts.
+    instruction: str | None = Field(default=None, min_length=1, max_length=500)
     max_seconds: int = Field(default=MAX_TASK_SECONDS, ge=5, le=MAX_TASK_SECONDS)
     attempts: int = Field(default=1, ge=1, le=outcome.MAX_ATTEMPTS)
+    tasks: list[SubTask] | None = Field(default=None, min_length=1, max_length=outcome.MAX_ATTEMPTS)
 
 
 # MuJoCo rendering contexts are thread-bound, so all simulator work stays on one thread.
@@ -788,17 +795,29 @@ def unsupported(capability, reason):
     )
 
 
+def plan_goals(plan):
+    """The goal of each task in a plan, or None for one the checker cannot judge.
+    @param plan List of {"instruction", "attempts"}.
+    @return One goal per entry: {"object", "target"} or None.
+    """
+    movable = list(sim._joint_by_body())
+    goals = []
+    for entry in plan:
+        goal = parse_goal(entry["instruction"], movable)
+        goals.append(goal if goal and goal["target"] in sim.managed() else None)
+    return goals
+
+
 def run_task(task, stop):
     global active_task, active_stop
     result = {}
-    goal = parse_goal(task["instruction"], list(sim._joint_by_body()))
-    if goal and goal["target"] not in sim.managed():
-        goal = None
+    goals = plan_goals(task["plan"])
+    goal = goals[0]
     if goal:
         sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
     session = None
     try:
-        session = outcome.Session(task, sim.env, goal)
+        session = outcome.Session(task, sim.env, goals)
         dc.main(
             [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
             shared_env=sim.env,
@@ -1025,14 +1044,29 @@ async def frame(camera: str):
 @app.post("/api/tasks/execute", status_code=202)
 async def execute_task(body: ExecuteTask):
     global active_task, active_stop
-    instruction = body.instruction.strip()
-    if not instruction:
-        raise HTTPException(422, "The instruction cannot be empty.")
+    if body.tasks and body.instruction is not None:
+        raise HTTPException(422, "Send either an instruction or a list of tasks, not both.")
+    if body.tasks:
+        plan = [{"instruction": t.instruction.strip(), "attempts": t.attempts} for t in body.tasks]
+    else:
+        plan = [{"instruction": (body.instruction or "").strip(), "attempts": body.attempts}]
+    for number, entry in enumerate(plan, 1):
+        if not entry["instruction"]:
+            raise HTTPException(422, f"Task {number} is empty." if len(plan) > 1 else "The instruction cannot be empty.")
+    total = sum(entry["attempts"] for entry in plan)
+    if total > outcome.MAX_ATTEMPTS:
+        raise HTTPException(422, f"{total} attempts in all; the limit is {outcome.MAX_ATTEMPTS}.")
     if active_task is not None:
         raise HTTPException(409, "A task is already running.")
+    if len(plan) > 1:  # a suite judges every task, so each must be one the checker understands
+        unchecked = [n for n, goal in enumerate(await on_sim(plan_goals, plan), 1) if goal is None]
+        if unchecked:
+            lines = "; ".join(f"task {n}: {plan[n - 1]['instruction']!r}" for n in unchecked)
+            raise HTTPException(422, f"Cannot check {lines}. Use the form: put <object> into/on the <bowl or plate>.")
     task = {
         "task_id": uuid.uuid4().hex[:12],
-        "instruction": instruction,
+        "instruction": plan[0]["instruction"],
+        "plan": plan,
         "max_seconds": body.max_seconds,
         "status": "RUNNING",
         "started_at": time.time(),
@@ -1040,7 +1074,7 @@ async def execute_task(body: ExecuteTask):
         "error": None,
         "outcome": None,
         "result_message": None,
-        "attempts": body.attempts,
+        "attempts": total,
         "videos": [],
     }
     tasks[task["task_id"]] = task

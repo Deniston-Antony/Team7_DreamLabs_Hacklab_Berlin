@@ -23,8 +23,18 @@ type Task = {
   attempt_results?: AttemptResult[];
   attempts_succeeded?: number;
   attempts_note?: string;
+  task_results?: TaskResult[];
+  tasks_succeeded?: number;
   attempts_error?: string;
   waiting_for_attempts?: boolean;
+};
+type TaskResult = {
+  task: number;
+  instruction: string;
+  attempts: number;
+  succeeded: number;
+  passed: boolean;
+  results: AttemptResult[];
 };
 type AttemptResult = {
   attempt: number;
@@ -54,6 +64,7 @@ const CAMERAS = ["top", "left", "right", "free"];
 const CAMERA_LABEL: Record<string, string> = { top: "top", left: "left", right: "right", free: "3D view" };
 const MAX_TASK_SECONDS = 200;
 const MAX_ATTEMPTS = 8;
+const CREDITS_PER_ATTEMPT_120S = 0.06;
 const FRAME_WIDTH = 640;
 const FRAME_HEIGHT = 360;
 
@@ -95,7 +106,7 @@ function clock(seconds: number) {
 
 function AttemptsPanel({ task }: { task: Task }) {
   if (task.waiting_for_attempts) {
-    return <div className="attempts">Live attempt finished. Waiting for the {task.attempts - 1} hidden attempts...</div>;
+    return <div className="attempts">Live attempt finished. Waiting for the other {task.attempts - 1} attempt{task.attempts > 2 ? "s" : ""}...</div>;
   }
   if (task.status === "RUNNING") return null;
   const results = task.attempt_results ?? [];
@@ -103,7 +114,20 @@ function AttemptsPanel({ task }: { task: Task }) {
   if (!results.length && !play && !task.attempts_note && !task.attempts_error) return null;
   return (
     <div className="attempts" aria-label="Attempts">
-      {results.length > 0 && (
+      {task.task_results && task.task_results.length > 1 && (
+        <>
+          <strong>{task.tasks_succeeded} of {task.task_results.length} tasks succeeded</strong>
+          <ul>
+            {task.task_results.map((t) => (
+              <li key={t.task}>
+                {t.passed ? "✓" : "✗"} {t.instruction}: {t.succeeded} of {t.attempts} attempt{t.attempts > 1 ? "s" : ""}
+                {t.results.some((r) => r.error) && <span> ({t.results.find((r) => r.error)?.error})</span>}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {results.length > 0 && !(task.task_results && task.task_results.length > 1) && (
         <>
           <strong>{task.attempts_succeeded} of {task.attempts} attempts succeeded</strong>
           <ul>
@@ -148,6 +172,7 @@ export default function App() {
   const [instruction, setInstruction] = useState("put apple into the bowl");
   const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
   const [attempts, setAttempts] = useState(1);
+  const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
@@ -270,6 +295,8 @@ export default function App() {
   const selectedPosition = selectedObject?.position.join(",");
   const task = live?.task ?? null;
   const running = task?.status === "RUNNING";
+  const totalAttempts = attempts + extras.reduce((sum, extra) => sum + extra.attempts, 0);
+  const suiteReady = extras.every((extra) => extra.text.trim()) && totalAttempts <= MAX_ATTEMPTS;
   const locked = busy || running || dragging;
   const position = { x: pose.x, y: pose.y, z: pose.z };
   const canDrag = (camera === "top" || camera === "free") && !running && !busy;
@@ -597,6 +624,19 @@ export default function App() {
             <label style={{ marginTop: 8 }}>Attempts at once (each uses credits)
               <input aria-label="Attempts" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
             </label>
+            {extras.map((extra, index) => (
+              <div className="extra-task" key={index}>
+                <input aria-label={`Task ${index + 2}`} placeholder="put <object> into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
+                <input aria-label={`Attempts for task ${index + 2}`} type="number" min={1} max={MAX_ATTEMPTS} value={extra.attempts} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, attempts: Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)) } : e)))} />
+                <button disabled={running} onClick={() => setExtras(extras.filter((_, i) => i !== index))} aria-label={`Remove task ${index + 2}`}>x</button>
+              </div>
+            ))}
+            <div className="row" style={{ marginTop: 8 }}>
+              <button disabled={running || totalAttempts >= MAX_ATTEMPTS} onClick={() => setExtras([...extras, { text: "", attempts: 1 }])}>+ add task</button>
+            </div>
+            <div className="hint">
+              {extras.length + 1} task{extras.length ? "s" : ""}, {totalAttempts} attempt{totalAttempts > 1 ? "s" : ""} at once (the most is {MAX_ATTEMPTS}), at most about ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)}.
+            </div>
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
@@ -604,8 +644,8 @@ export default function App() {
               {running ? (
                 <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop task</button>
               ) : (
-                <button className="primary" disabled={locked || !connected || !instruction.trim()} onClick={() => run("Task started", () => api("/api/tasks/execute", { instruction, max_seconds: maxSeconds, attempts }))}>
-                  Execute task (uses credits)
+                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady} onClick={() => run("Task started", () => api("/api/tasks/execute", extras.length ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds } : { instruction, max_seconds: maxSeconds, attempts }))}>
+                  Execute {extras.length ? `${extras.length + 1} tasks` : "task"} (uses credits)
                 </button>
               )}
             </div>

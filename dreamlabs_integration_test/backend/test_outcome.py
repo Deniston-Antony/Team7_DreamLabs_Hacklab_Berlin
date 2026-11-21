@@ -6,6 +6,7 @@ endpoints are the real ones. Run from this folder with the backend's dependencie
     MUJOCO_GL=egl PYTHONPATH=.deps python -m unittest test_outcome
 """
 
+import os
 import tempfile
 import textwrap
 import time
@@ -65,7 +66,10 @@ class OutcomeTest(unittest.TestCase):
     def submit(self, instruction, runner, **body):
         """Start a task with a stand-in model and wait for its final state."""
         main.dc.main = runner
-        reply = self.client.post("/api/tasks/execute", json={"instruction": instruction, "max_seconds": 20, **body})
+        payload = {"max_seconds": 20, **body}
+        if instruction is not None:
+            payload["instruction"] = instruction
+        reply = self.client.post("/api/tasks/execute", json=payload)
         self.assertEqual(reply.status_code, 202, reply.text)
         return self.wait(reply.json()["task_id"])
 
@@ -90,7 +94,7 @@ class OutcomeTest(unittest.TestCase):
                 import recording
                 from yam_env import YamEnv
                 arg = lambda name: sys.argv[sys.argv.index(name) + 1]
-                assert arg("--goal-object") == "apple" and arg("--goal-target") == "bowl", sys.argv
+                obj, tgt, said = arg("--goal-object"), arg("--goal-target"), arg("--task")
                 env = YamEnv()
                 env.model = mujoco.MjModel.from_binary_path(arg("--scene-model"))
                 env.data = mujoco.MjData(env.model)
@@ -104,11 +108,91 @@ class OutcomeTest(unittest.TestCase):
                     env.images()
                 clip.close()
                 x_cm = round(float(env.data.body("apple").xpos[0]) * 100)
-                {body}
+{textwrap.indent(body, " " * 16)}
                 """
             )
         )
         return folder
+
+    def test_a_suite_runs_different_tasks_from_one_scene_copy(self):
+        """Three tasks, four attempts in all: every worker gets its own task and goal, and results are per task."""
+        outcome.SORTFLOW = self.fake_workers(
+            'idx = ["apple", "orange", "banana"].index(obj)\n'
+            'print("RESULT " + json.dumps({"success": obj == "orange", "sim_seconds": 5.0, "closest_cm": idx * 10}))'
+        )
+        try:
+            task = self.submit(
+                None,
+                model(steps=20),
+                tasks=[
+                    {"instruction": "put apple on the plate", "attempts": 2},
+                    {"instruction": "put orange into the bowl"},
+                    {"instruction": "put banana on the plate"},
+                ],
+            )
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+        self.assertEqual(task["attempts"], 4)
+        hidden = [r for r in task["attempt_results"] if r["where"] == "hidden"]
+        self.assertEqual([(r["task"], r["closest_cm"]) for r in hidden], [(1, 0), (2, 10), (3, 20)])
+        self.assertEqual([r["success"] for r in hidden], [False, True, False])
+        groups = task["task_results"]
+        self.assertEqual([g["instruction"] for g in groups], [t["instruction"] for t in task["plan"]])
+        self.assertEqual([g["passed"] for g in groups], [False, True, False])
+        self.assertEqual(task["tasks_succeeded"], 1)
+        self.assertEqual(task["videos"], ["attempt-1", "attempt-2", "attempt-3", "attempt-4", "grid"])
+        self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/video/grid").status_code, 200)
+
+    def test_a_suite_with_a_line_the_checker_cannot_judge_is_refused_before_anything_runs(self):
+        """The 422 names the line, and the backend is free afterwards."""
+        reply = self.client.post(
+            "/api/tasks/execute",
+            json={"tasks": [{"instruction": "put apple on the plate"}, {"instruction": "wave hello"}]},
+        )
+        self.assertEqual(reply.status_code, 422)
+        self.assertIn("task 2", reply.text)
+        self.assertIn("wave hello", reply.text)
+        self.assertEqual(self.client.post("/api/scene/reset").status_code, 200, "no task was started")
+
+    def test_a_suite_is_capped_and_must_be_unambiguous(self):
+        """More than 8 attempts in all, both forms at once, and an empty request are refused."""
+        too_many = {"tasks": [{"instruction": "put apple on the plate", "attempts": 5}] * 2}
+        self.assertEqual(self.client.post("/api/tasks/execute", json=too_many).status_code, 422)
+        both = {"instruction": "put apple on the plate", "tasks": [{"instruction": "put apple on the plate"}]}
+        self.assertEqual(self.client.post("/api/tasks/execute", json=both).status_code, 422)
+        self.assertEqual(self.client.post("/api/tasks/execute", json={}).status_code, 422)
+
+    def test_cancelling_a_suite_ends_its_workers(self):
+        """Stop task ends the hidden workers too, not only the live attempt."""
+        pidfile = Path(tempfile.mkdtemp()) / "pid"
+        outcome.SORTFLOW = self.fake_workers(
+            f"import os, time\nopen({str(pidfile)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)"
+        )
+        try:
+            main.dc.main = model(steps=40)
+            task_id = self.client.post(
+                "/api/tasks/execute",
+                json={
+                    "tasks": [{"instruction": "put apple on the plate"}, {"instruction": "put orange into the bowl"}],
+                    "max_seconds": 20,
+                },
+            ).json()["task_id"]
+            for _ in range(200):  # the live attempt ends, then the task waits for the worker
+                if self.client.get(f"/api/tasks/{task_id}/status").json().get("waiting_for_attempts"):
+                    break
+                time.sleep(0.05)
+            for _ in range(100):
+                if pidfile.exists():
+                    break
+                time.sleep(0.1)
+            pid = int(pidfile.read_text())
+            self.client.post(f"/api/tasks/{task_id}/cancel", json={})
+            self.assertEqual(self.wait(task_id)["status"], "CANCELLED")
+            time.sleep(1)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            outcome.SORTFLOW = self.keep[2]
 
     def test_success_keeps_the_backends_verdict_and_saves_a_video(self):
         """The apple settling in the bowl is COMPLETED / SUCCESS as before, now with a video the API serves."""
@@ -129,6 +213,7 @@ class OutcomeTest(unittest.TestCase):
     def test_attempts_run_from_a_copy_of_the_edited_scene(self):
         """Three attempts: the live one plus two workers that start where the user left the apple, and a grid."""
         outcome.SORTFLOW = self.fake_workers(
+            'assert (obj, tgt) == ("apple", "bowl") and said == "put apple into the bowl"\n'
             'print("RESULT " + json.dumps({"success": x_cm == 12, "sim_seconds": 4.0, "closest_cm": x_cm}))'
         )
         try:
@@ -160,7 +245,7 @@ class OutcomeTest(unittest.TestCase):
         """With no goal to judge, hidden attempts are skipped and the task says so."""
         task = self.submit("wave hello", model(), attempts=3)
         self.assertEqual(task["outcome"], "NOT_EVALUATED")
-        self.assertIn("one attempt", task["attempts_note"])
+        self.assertIn("cannot be checked", task["attempts_note"])
         self.assertNotIn("attempt_results", task)
 
     def test_cancel_ends_the_task(self):
