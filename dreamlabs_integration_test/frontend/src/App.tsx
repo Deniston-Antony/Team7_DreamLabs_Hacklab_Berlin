@@ -44,7 +44,16 @@ type AttemptResult = {
   closest_cm?: number | null;
   error?: string | null;
 };
+type WorkerState = {
+  attempt: number;
+  task: number;
+  where: "live" | "hidden";
+  label: string;
+  state: "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended";
+};
 type Live = {
+  attempt?: number;
+  workers?: WorkerState[];
   phase: "idle" | "running" | "waiting_for_dream";
   scene_id: string;
   selected: string | null;
@@ -162,6 +171,7 @@ export default function App() {
   const [frameUrl, setFrameUrl] = useState("");
   const [fps, setFps] = useState(0);
   const [camera, setCamera] = useState("top");
+  const [viewAttempt, setViewAttempt] = useState(1);
   const [dragging, setDragging] = useState(false);
   const [pose, setPose] = useState({ x: 0.05, y: 0, z: 0.8, yaw: 45 });
   const [uploadStatus, setUploadStatus] = useState<Status | null>(null);
@@ -177,6 +187,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
+  const attemptRef = useRef(1);
   const drag = useRef<{ active: boolean; sending: boolean; next: Point | null }>({ active: false, sending: false, next: null });
   const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
   const zoom = useRef({ sending: false, delta: 0 });
@@ -199,7 +210,7 @@ export default function App() {
       socket.current = ws;
       ws.onopen = () => {
         setConnected(true);
-        ws.send(JSON.stringify({ camera: cameraRef.current }));
+        ws.send(JSON.stringify({ camera: cameraRef.current, attempt: attemptRef.current }));
       };
       ws.onmessage = (event) => {
         if (typeof event.data === "string") {
@@ -252,6 +263,18 @@ export default function App() {
     });
   }, [run]);
 
+  const chooseAttempt = (attempt: number) => {
+    attemptRef.current = attempt;
+    setViewAttempt(attempt);
+    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ attempt }));
+  };
+
+  const workers = live?.workers ?? [];
+  useEffect(() => {
+    // the dropdown's list changed (a new task, or none): go back to the live simulation if the choice is gone
+    if (viewAttempt > 1 && !workers.some((worker) => worker.attempt === viewAttempt)) chooseAttempt(1);
+  }, [workers.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const chooseCamera = (name: string) => {
     cameraRef.current = name;
     setCamera(name);
@@ -278,7 +301,7 @@ export default function App() {
       }
     };
     const onWheel = (event: WheelEvent) => {
-      if (cameraRef.current !== "free") return;
+      if (cameraRef.current !== "free" || attemptRef.current !== 1) return;
       event.preventDefault();
       const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
       zoom.current.delta += event.deltaY * unit * (event.ctrlKey ? 4 : 1);
@@ -487,6 +510,17 @@ export default function App() {
         <section>
           <div className="panel">
             <div className="stream-bar">
+              {workers.length > 1 && (
+                <label className="attempt-pick">View
+                  <select aria-label="View attempt" value={viewAttempt} onChange={(event) => chooseAttempt(Number(event.target.value))}>
+                    {workers.map((worker) => (
+                      <option key={worker.attempt} value={worker.attempt}>
+                        {worker.attempt} · {worker.where} · {worker.label} · {worker.state}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <div className="cameras">
                 {CAMERAS.map((name) => (
                   <button key={name} className={camera === name ? "active" : ""} onClick={() => chooseCamera(name)}>
@@ -508,17 +542,19 @@ export default function App() {
                 src={frameUrl}
                 draggable={false}
                 onContextMenu={(event) => event.preventDefault()}
-                onPointerDown={startDrag}
-                onPointerMove={moveDrag}
-                onPointerUp={endDrag}
-                onPointerCancel={endDrag}
+                onPointerDown={viewAttempt === 1 ? startDrag : undefined}
+                onPointerMove={viewAttempt === 1 ? moveDrag : undefined}
+                onPointerUp={viewAttempt === 1 ? endDrag : undefined}
+                onPointerCancel={viewAttempt === 1 ? endDrag : undefined}
               />
             ) : (
               <div className="main-view" />
             )}
             </div>
             <p className="hint">
-              {camera === "free"
+              {viewAttempt > 1
+                ? `Showing attempt ${viewAttempt} (a hidden worker): its picture only, with the top, left and right cameras. The objects and robot below are the live simulation's.`
+                : camera === "free"
                 ? "Click to select, drag to move. Ctrl + drag rotates the view. Two-finger scroll zooms."
                 : camera === "top"
                   ? "Click to select, drag to move. Ctrl + drag opens the rotating 3D view."

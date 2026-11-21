@@ -1116,11 +1116,13 @@ async def live(socket: WebSocket):
         await socket.close(code=1008)
         return
     await socket.accept()
-    selected = {"camera": "top"}
+    selected = {"camera": "top", "attempt": 1}
 
     async def receive():
         while True:
             message = await socket.receive_json()
+            if isinstance(message, dict) and message.get("attempt") in range(1, outcome.MAX_ATTEMPTS + 1):
+                selected["attempt"] = message["attempt"]  # 1 is the live simulation; more are hidden workers
             if isinstance(message, dict) and message.get("camera") in VIEWS:
                 selected["camera"] = message["camera"]
                 sim.watched_view = message["camera"]
@@ -1128,11 +1130,13 @@ async def live(socket: WebSocket):
                     await on_sim(sim.publish)
 
     receiver = asyncio.create_task(receive())
-    sent = (None, None)
+    sent = (None, None, None)
     latest = None
     try:
         while not receiver.done():
-            current = (feed.sequence, selected["camera"])
+            attempt = selected["attempt"]
+            seq, frame = outcome.worker_frame(attempt, selected["camera"]) if attempt > 1 else (None, None)
+            current = (seq if attempt > 1 else feed.sequence, selected["camera"], attempt)
             task = active_task or latest
             latest = task
             await socket.send_json(
@@ -1140,6 +1144,8 @@ async def live(socket: WebSocket):
                     "type": "state",
                     "sequence": feed.sequence,
                     "camera": selected["camera"],
+                    "attempt": attempt,
+                    "workers": outcome.attempt_states(),
                     "scene_id": sim.scene_id,
                     "selected": sim.selected,
                     "phase": live_phase(),
@@ -1149,7 +1155,11 @@ async def live(socket: WebSocket):
                     "contacts": feed.contacts,
                 }
             )
-            if current != sent:
+            if current != sent and attempt > 1:
+                if frame is not None:  # a hidden worker's newest picture; nothing is sent before its first frame
+                    await socket.send_bytes(frame)
+                    sent = current
+            elif current != sent:
                 await socket.send_bytes(await asyncio.to_thread(feed.jpeg, current[1]))
                 sent = current
             await asyncio.sleep(STREAM_PERIOD_S)

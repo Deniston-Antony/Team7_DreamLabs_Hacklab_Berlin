@@ -44,3 +44,5 @@ button.danger { background: #b23b32; border-color: #b23b32; color: #fff; }
 .attempts { margin-top: 8px; padding: 8px; border-radius: 6px; border: 1px solid #c9d1d9; font-size: 13px; }
 .attempts ul { margin: 6px 0; padding-left: 18px; }
 .extra-task { display: grid; grid-template-columns: minmax(0, 1fr) 64px 28px; gap: 6px; margin-top: 6px; }
+.attempt-pick { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.attempt-pick select { max-width: 280px; }

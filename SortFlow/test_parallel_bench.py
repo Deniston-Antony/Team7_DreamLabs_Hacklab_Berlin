@@ -148,6 +148,45 @@ class ParallelBenchTest(unittest.TestCase):
         self.assertTrue(record["success"])
         self.assertEqual(record["success_try"], 1)
 
+    def test_a_worker_streams_frames_and_a_final_status(self):
+        """With a pipe given, the worker streams its cameras while it runs and ends with its outcome."""
+        import os
+        import threading
+
+        import livefeed
+
+        home = np.r_[np.zeros(6), 1.0]
+
+        def runner(argv, shared_env=None, stop_event=None, **kw):
+            shared_env.data.joint("apple_free").qpos[:3] = [0.0, -0.04, 0.86]
+            mujoco.mj_forward(shared_env.model, shared_env.data)
+            for _ in range(200):
+                if stop_event.is_set():
+                    return
+                shared_env.step(home, home)
+                shared_env.images()
+                time.sleep(0.003)
+
+        read_fd, write_fd = os.pipe()
+        messages = []
+
+        def read():
+            with os.fdopen(read_fd, "rb") as stream:
+                messages.extend(livefeed.read_messages(stream))
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        record = parallel_bench.run_worker(
+            "anything", 20, 48, 1, runner=runner, goal=("apple", "bowl"), live=os.fdopen(write_fd, "wb", buffering=0)
+        )
+        reader.join(timeout=5)
+        self.assertTrue(record["success"])
+        kinds = {livefeed.kind_name(kind) for kind, _ in messages}
+        self.assertEqual(kinds, {"status", "top", "left", "right"})
+        final = json.loads([payload for kind, payload in messages if kind == livefeed.STATUS][-1])
+        self.assertEqual(final["state"], "succeeded")
+        self.assertEqual(final["sim_seconds"], record["sim_seconds"])
+
     def test_the_last_line_is_the_record(self):
         """A worker's record is parsed from its last RESULT line, whatever the model printed before it."""
         line = "RESULT " + json.dumps({"success": True})

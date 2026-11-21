@@ -24,6 +24,7 @@ SORTFLOW = Path(__file__).resolve().parents[2] / "SortFlow"
 # Appended, so `dream_control` and `yam_env` stay the ones main.py already imported from the installed example.
 if str(SORTFLOW) not in sys.path:
     sys.path.append(str(SORTFLOW))
+import livefeed  # noqa: E402
 import recording  # noqa: E402
 
 VIDEOS = Path(__file__).resolve().parent / "task_videos"
@@ -34,9 +35,42 @@ POLL_S = 0.5
 WAIT_AFTER_LIVE_S = 90  # how long past the time limit a worker may take to report
 
 
+current = None  # the newest request's Session: its workers' latest frames stay readable after the run ends
+
+
 def describe(goal):
     """A short name for a goal, for video labels: "apple>plate"."""
     return f"{goal['object']}>{goal['target']}"
+
+
+class Watching:
+    """What the backend knows about one hidden attempt while it runs: its newest frames and its status."""
+
+    def __init__(self, job):
+        """Start with nothing received.
+        @param job The job dict: attempt, instruction, goal, index.
+        """
+        self.job = job
+        self.frames = {}  # camera name -> newest JPEG bytes
+        self.status = {}  # the newest status message from the worker
+        self.seq = 0  # counts frames received, so a reader can tell when something new has arrived
+        self.lock = threading.Lock()
+
+    def read(self, stream):
+        """Read the worker's pipe until it closes; runs on its own thread.
+        @param stream Binary file object for the read end of the worker's pipe.
+        """
+        with stream:
+            for kind, payload in livefeed.read_messages(stream):
+                with self.lock:
+                    if kind == livefeed.STATUS:
+                        try:
+                            self.status = json.loads(payload)
+                        except ValueError:
+                            continue
+                    else:
+                        self.frames[livefeed.kind_name(kind)] = payload
+                        self.seq += 1
 
 
 class Workers:
@@ -51,6 +85,7 @@ class Workers:
         @param folder Folder for the scene copy and the workers' videos.
         """
         self.folder, self.jobs, self.procs = folder, jobs, []
+        self.watching = {job["attempt"]: Watching(job) for job in jobs}
         self.model_path, self.state_path = folder / "scene.mjb", folder / "scene.npz"
         mujoco.mj_saveModel(env.model, str(self.model_path))
         np.savez(self.state_path, qpos=env.data.qpos, qvel=env.data.qvel, ctrl=env.data.ctrl)
@@ -89,17 +124,25 @@ class Workers:
 
     def _launch(self):
         for job in self.jobs:
-            self.procs.append(
-                subprocess.Popen(
-                    self.command(job),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=self.env,
-                    cwd=SORTFLOW,
-                    start_new_session=True,
+            read_fd, write_fd = os.pipe()  # the worker streams its frames and status into this
+            try:
+                self.procs.append(
+                    subprocess.Popen(
+                        self.command(job) + ["--live-fd", str(write_fd)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=self.env,
+                        cwd=SORTFLOW,
+                        start_new_session=True,
+                        pass_fds=(write_fd,),
+                    )
                 )
-            )
+            finally:
+                os.close(write_fd)  # the worker holds its own copy; ours would keep the pipe open after it exits
+            threading.Thread(
+                target=self.watching[job["attempt"]].read, args=(os.fdopen(read_fd, "rb"),), daemon=True
+            ).start()
             time.sleep(STAGGER_S)
 
     def stop(self):
@@ -155,7 +198,8 @@ class Session:
         @param goals One goal per plan entry ({"object", "target"} from main.parse_goal, or None when the
             instruction cannot be checked), in the same order.
         """
-        self.task, self.env = task, env
+        global current
+        self.task, self.env, self.finished, self.workers = task, env, False, None
         self.plan = [
             {"instruction": p["instruction"], "attempts": int(p.get("attempts", 1)), "goal": g}
             for p, g in zip(task["plan"], goals)
@@ -180,6 +224,7 @@ class Session:
         self.workers = Workers(task, env, self.jobs, self.folder) if self.jobs else None
         self.recorder = recording.attach(env, self.folder / "attempt-1.mp4")
         self.started = env.data.time
+        current = self  # last, so the page never sees a half-built session
 
     def finish(self, result):
         """Close the video, collect the hidden attempts and add `videos` and the attempt results to the result.
@@ -187,6 +232,7 @@ class Session:
             describe the live attempt and are left as they are.
         """
         self.recorder.close()
+        self.finished = True
         live_ok = result.get("outcome") == "SUCCESS"
         results = [
             {
@@ -253,3 +299,55 @@ class Session:
                 )
             result["task_results"] = groups
             result["tasks_succeeded"] = sum(1 for g in groups if g["passed"])
+
+    def states(self):
+        """Every attempt's status, for the page's dropdown.
+        @return List of dicts: attempt, task, where, label and state. The state is `starting`, `running`,
+            `succeeded`, `failed`, `error` or `ended` (a worker that stopped without reporting).
+        """
+        label = lambda entry: describe(entry["goal"]) if entry["goal"] else entry["instruction"][:30]  # noqa: E731
+        out = [
+            {
+                "attempt": 1,
+                "task": 1,
+                "where": "live",
+                "label": label(self.plan[0]),
+                "state": "finished" if self.finished else "running",
+            }
+        ]
+        for position, job in enumerate(self.jobs):
+            watching = self.workers.watching[job["attempt"]]
+            with watching.lock:
+                state = watching.status.get("state") or ("running" if watching.frames else "starting")
+            proc = self.workers.procs[position] if position < len(self.workers.procs) else None
+            if proc is not None and proc.poll() is not None and state in ("starting", "running"):
+                state = "ended"
+            out.append(
+                {
+                    "attempt": job["attempt"],
+                    "task": job["index"] + 1,
+                    "where": "hidden",
+                    "label": label(self.plan[job["index"]]),
+                    "state": state,
+                }
+            )
+        return out
+
+
+def attempt_states():
+    """The newest request's attempts, for the dropdown; empty when there are no hidden attempts."""
+    return current.states() if current is not None and current.workers is not None else []
+
+
+def worker_frame(attempt, camera):
+    """The newest picture of a hidden attempt.
+    @param attempt The attempt's number in the request, 2 or more.
+    @param camera `top`, `left` or `right`; any other (such as the free 3D view) shows the top camera.
+    @return (sequence, JPEG bytes), or (None, None) until the worker has sent its first frame.
+    """
+    if current is None or current.workers is None or attempt not in current.workers.watching:
+        return None, None
+    watching = current.workers.watching[attempt]
+    with watching.lock:
+        frame = watching.frames.get(camera) or watching.frames.get("top")
+        return watching.seq, frame

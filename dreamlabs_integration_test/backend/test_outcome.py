@@ -13,11 +13,15 @@ import time
 import unittest
 from pathlib import Path
 
+import io
+import json
+
 import main
 import mujoco
 import numpy as np
 import outcome
 from fastapi.testclient import TestClient
+from PIL import Image
 
 HOME = np.r_[np.zeros(6), 1.0]
 
@@ -62,6 +66,12 @@ class OutcomeTest(unittest.TestCase):
     def setUp(self):
         """Every task starts from the default scene."""
         self.client.post("/api/scene/reset")
+
+    def tearDown(self):
+        """A failed test must not leave a task running for the next one."""
+        if main.active_task is not None:
+            main.active_stop.set()
+            self.wait(main.active_task["task_id"])
 
     def submit(self, instruction, runner, **body):
         """Start a task with a stand-in model and wait for its final state."""
@@ -193,6 +203,113 @@ class OutcomeTest(unittest.TestCase):
                 os.kill(pid, 0)
         finally:
             outcome.SORTFLOW = self.keep[2]
+
+    def streaming_workers(self, steps=120, state="succeeded"):
+        """A folder holding a stand-in parallel_bench.py that streams its cameras over --live-fd, as a worker does."""
+        folder = Path(tempfile.mkdtemp())
+        (folder / "parallel_bench.py").write_text(
+            textwrap.dedent(
+                f"""
+                import json, os, sys, time
+                sys.path.insert(0, {str(self.keep[2])!r})
+                import numpy as np
+                import livefeed
+                from yam_env import YamEnv
+                arg = lambda name: sys.argv[sys.argv.index(name) + 1]
+                env = YamEnv()
+                feed = livefeed.attach(env, os.fdopen(int(arg("--live-fd")), "wb", buffering=0), every=2)
+                home = np.r_[np.zeros(6), 1.0]
+                for _ in range({steps}):
+                    env.step(home, home)
+                    env.images()
+                    time.sleep(0.02)
+                feed.status({state!r}, sim_seconds=3.0)
+                feed.close()
+                print("RESULT " + json.dumps({{"success": {state!r} == "succeeded", "sim_seconds": 3.0}}))
+                """
+            )
+        )
+        return folder
+
+    @staticmethod
+    def receive(ws, want, tries=400):
+        """The next websocket message of a kind: `text` (parsed as JSON) or `bytes`."""
+        for _ in range(tries):
+            message = ws.receive()
+            if message.get(want) is not None:
+                return json.loads(message["text"]) if want == "text" else message["bytes"]
+        raise AssertionError(f"no {want} message arrived")
+
+    def test_a_hidden_worker_can_be_watched_live_and_the_live_view_comes_back(self):
+        """The page asks for attempt 2 and gets that worker's pictures; asking for attempt 1 gets the simulator."""
+        outcome.SORTFLOW = self.streaming_workers(steps=150)
+        self.client.post("/api/scene/reset")
+        main.dc.main = model(steps=20)
+        reply = self.client.post(
+            "/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20, "attempts": 2}
+        )
+        task_id = reply.json()["task_id"]
+        try:
+            with self.client.websocket_connect("/ws/live", headers={"origin": "http://127.0.0.1:5173"}) as ws:
+                ws.send_json({"attempt": 2})
+                frame = self.receive(ws, "bytes")
+                self.assertEqual(frame[:2], b"\xff\xd8", "a JPEG")
+                self.assertEqual(Image.open(io.BytesIO(frame)).size, (640, 360))
+                state = self.receive(ws, "text")
+                while state["attempt"] != 2 or len(state["workers"]) < 2 or state["workers"][1]["state"] != "running":
+                    state = self.receive(ws, "text")  # the first states can predate the worker's first frame
+                self.assertEqual([w["where"] for w in state["workers"]], ["live", "hidden"])
+                self.assertEqual(state["workers"][1]["label"], "apple>bowl")
+                ws.send_json({"camera": "free"})  # a worker has no free 3D camera: it shows the top one instead
+                self.assertEqual(self.receive(ws, "bytes")[:2], b"\xff\xd8")
+                ws.send_json({"attempt": 1, "camera": "top"})
+                state = self.receive(ws, "text")
+                while state["attempt"] != 1:
+                    state = self.receive(ws, "text")
+                self.assertEqual(self.receive(ws, "bytes")[:2], b"\xff\xd8")
+            task = self.wait(task_id)
+            self.assertEqual(task["attempt_results"][1]["success"], True)
+            states = outcome.attempt_states()
+            self.assertEqual([w["state"] for w in states], ["finished", "succeeded"])
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+
+    def test_a_worker_that_stops_without_reporting_is_shown_as_ended(self):
+        """No final status and no frames from a worker that dies at once: its dropdown entry says ended."""
+        outcome.SORTFLOW = self.fake_workers("raise SystemExit(3)")
+        try:
+            self.submit("put apple into the bowl", model(steps=20), attempts=2)
+            self.assertEqual([w["state"] for w in outcome.attempt_states()], ["finished", "ended"])
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+
+    def test_watching_reads_whole_messages_and_falls_back_to_the_top_camera(self):
+        """The reader keeps the newest frame per camera and the latest status, and any other camera shows top."""
+        import livefeed
+
+        watching = outcome.Watching({"attempt": 2})
+        stream = io.BytesIO(
+            livefeed.pack(livefeed.STATUS, b'{"state": "running"}')
+            + livefeed.pack(1, b"top-1")
+            + livefeed.pack(1, b"top-2")
+            + livefeed.pack(2, b"left-1")
+            + livefeed.pack(livefeed.STATUS, b"not json")
+        )
+        watching.read(stream)
+        self.assertEqual(watching.frames, {"top": b"top-2", "left": b"left-1"})
+        self.assertEqual(watching.status, {"state": "running"})
+        self.assertEqual(watching.seq, 3)
+
+        class Fake:
+            workers = type("W", (), {"watching": {2: watching}})()
+
+        keep, outcome.current = outcome.current, Fake()
+        try:
+            self.assertEqual(outcome.worker_frame(2, "left"), (3, b"left-1"))
+            self.assertEqual(outcome.worker_frame(2, "free"), (3, b"top-2"))
+            self.assertEqual(outcome.worker_frame(5, "top"), (None, None))
+        finally:
+            outcome.current = keep
 
     def test_success_keeps_the_backends_verdict_and_saves_a_video(self):
         """The apple settling in the bowl is COMPLETED / SUCCESS as before, now with a video the API serves."""
