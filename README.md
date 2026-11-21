@@ -105,9 +105,9 @@ Open **http://127.0.0.1:5173**. Press `Ctrl+C` in each terminal to stop.
 ## Use it
 
 1. Press **Reset** for a clean scene.
-2. Select an object in the table to move, rotate or remove it, or add a block.
+2. Choose a scene. Select an object in the table to move, rotate or remove it, add a block, or press **Shuffel** to randomize the objects.
 3. Enter a task, such as `put apple into the bowl`.
-4. Set a time limit from 5 to 120 seconds.
+4. Set a time limit from 5 to 200 seconds.
 5. Press **Execute task** and watch the live view. Use **Stop task** to end early.
 
 **Execute task uses Dream Labs credits.** Check current prices on the [Billing page](https://platform.dreamlabs.ai/billing).
@@ -116,7 +116,8 @@ Before the first run on a new computer, a person should check what the model rec
 
 ## Current limitations
 
-- One tabletop scene and the YAM robot only.
+- Six local tabletop scene styles. They change colors, lighting and walls, and are not the hosted Playground rooms.
+- Only the YAM robot can run. Other arms are listed as setup required until each has simulator actuators, cameras and a person-measured tool center point.
 - The website does not judge task success yet, so a run ends at its time limit or when stopped.
 - One task runs at a time.
 - Objects and arms stay where a task leaves them until you press **Reset**.

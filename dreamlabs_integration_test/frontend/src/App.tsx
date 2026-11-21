@@ -6,7 +6,7 @@ type SceneObject = {
   position: [number, number, number];
   orientation_wxyz: number[];
 };
-type Option = { id: string; name: string };
+type Option = { id: string; name: string; executable?: boolean };
 type Status = { text: string; error: boolean };
 type Task = {
   task_id: string;
@@ -18,11 +18,15 @@ type Task = {
 };
 type Live = {
   phase: "idle" | "running" | "waiting_for_dream";
+  scene_id: string;
   task: Task | null;
   objects: SceneObject[];
   robot: Record<string, number[]>;
   contacts: number;
 };
+
+const CAMERAS = ["top", "left", "right"] as const;
+const MAX_TASK_SECONDS = 200;
 
 const PHASE_LABEL: Record<Live["phase"], string> = {
   idle: "Idle",
@@ -56,22 +60,20 @@ export default function App() {
   const [robots, setRobots] = useState<Option[]>([]);
   const [live, setLive] = useState<Live | null>(null);
   const [connected, setConnected] = useState(false);
-  const [frameUrl, setFrameUrl] = useState("");
+  const [frameUrls, setFrameUrls] = useState<string[]>(["", "", ""]);
   const [fps, setFps] = useState(0);
   const [selected, setSelected] = useState("");
-  const [camera, setCamera] = useState("top");
   const [pose, setPose] = useState({ x: 0.05, y: 0, z: 0.8, yaw: 45 });
   const [instruction, setInstruction] = useState("put apple into the bowl");
-  const [maxSeconds, setMaxSeconds] = useState(60);
+  const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
-  const cameraRef = useRef(camera);
 
   useEffect(() => {
     let closed = false;
     let retry = 0;
-    let url = "";
+    const urls = ["", "", ""];
     let frames = 0;
     const meter = window.setInterval(() => {
       setFps(frames);
@@ -81,22 +83,21 @@ export default function App() {
     const connect = () => {
       const protocol = location.protocol === "https:" ? "wss" : "ws";
       const ws = new WebSocket(`${protocol}://${location.host}/ws/live`);
-      ws.binaryType = "blob";
+      ws.binaryType = "arraybuffer";
       socket.current = ws;
-      ws.onopen = () => {
-        setConnected(true);
-        ws.send(JSON.stringify({ camera: cameraRef.current }));
-      };
+      ws.onopen = () => setConnected(true);
       ws.onmessage = (event) => {
         if (typeof event.data === "string") {
           setLive(JSON.parse(event.data));
           return;
         }
-        frames += 1;
-        const next = URL.createObjectURL(event.data);
-        if (url) URL.revokeObjectURL(url);
-        url = next;
-        setFrameUrl(next);
+        const bytes = new Uint8Array(event.data);
+        const index = bytes[0];
+        if (index === 0) frames += 1;
+        const next = URL.createObjectURL(new Blob([bytes.subarray(1)], { type: "image/jpeg" }));
+        if (urls[index]) URL.revokeObjectURL(urls[index]);
+        urls[index] = next;
+        setFrameUrls([...urls]);
       };
       ws.onclose = () => {
         setConnected(false);
@@ -109,7 +110,7 @@ export default function App() {
       window.clearTimeout(retry);
       window.clearInterval(meter);
       socket.current?.close();
-      if (url) URL.revokeObjectURL(url);
+      urls.forEach((url) => url && URL.revokeObjectURL(url));
     };
   }, []);
 
@@ -129,18 +130,12 @@ export default function App() {
     run("Connected to the real local MuJoCo simulator", async () => {
       const [sceneList, robotList] = await Promise.all([
         api<{ scene_id: string; name: string }[]>("/api/scenes"),
-        api<{ robot_id: string; name: string }[]>("/api/robots"),
+        api<{ robot_id: string; name: string; executable: boolean }[]>("/api/robots"),
       ]);
       setScenes(sceneList.map((scene) => ({ id: scene.scene_id, name: scene.name })));
-      setRobots(robotList.map((robot) => ({ id: robot.robot_id, name: robot.name })));
+      setRobots(robotList.map((robot) => ({ id: robot.robot_id, name: robot.name, executable: robot.executable })));
     });
   }, [run]);
-
-  const chooseCamera = (name: string) => {
-    cameraRef.current = name;
-    setCamera(name);
-    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ camera: name }));
-  };
 
   const objects = live?.objects ?? [];
   const task = live?.task ?? null;
@@ -170,29 +165,30 @@ export default function App() {
     <main>
       <h1>Dream Labs Integration Test</h1>
       <p className="note">Live view of the real local Dream YAM Sim. The hosted Playground is not embedded or controlled.</p>
+      <div className="panel">
+        <div className="stream-bar">
+          <h2>Live cameras</h2>
+          <div className="live-status" role="status">
+            <span className={`dot ${connected ? "on" : ""}`} />
+            {connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting"}
+            <span className="muted">{connected ? `${fps} FPS` : ""}</span>
+          </div>
+        </div>
+        <div className="camera-grid">
+          {CAMERAS.map((name, index) => (
+            <figure key={name}>
+              {frameUrls[index] ? (
+                <img className="camera-view" alt={`Live ${name} simulator camera`} src={frameUrls[index]} />
+              ) : (
+                <div className="camera-view" />
+              )}
+              <figcaption>{name}</figcaption>
+            </figure>
+          ))}
+        </div>
+      </div>
       <div className="layout">
         <section>
-          <div className="panel">
-            <div className="stream-bar">
-              <div className="cameras">
-                {["top", "left", "right"].map((name) => (
-                  <button key={name} className={camera === name ? "active" : ""} onClick={() => chooseCamera(name)}>
-                    {name}
-                  </button>
-                ))}
-              </div>
-              <div className="live-status" role="status">
-                <span className={`dot ${connected ? "on" : ""}`} />
-                {connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting"}
-                <span className="muted">{connected ? `${fps} FPS` : ""}</span>
-              </div>
-            </div>
-            {frameUrl ? (
-              <img className="main-view" alt={`Live ${camera} simulator camera`} src={frameUrl} />
-            ) : (
-              <div className="main-view" />
-            )}
-          </div>
           <div className="panel">
             <h2>Live scene state from simulator <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
             <table>
@@ -222,10 +218,18 @@ export default function App() {
             <h2>Setup</h2>
             <div className="row">
               <label style={{ width: "100%" }}>Scene
-                <select>{scenes.map((scene) => <option key={scene.id}>{scene.name}</option>)}</select>
+                <select aria-label="Scene" value={live?.scene_id ?? ""} disabled={locked} onChange={(event) => { const scene_id = event.target.value; run("Scene changed", () => api("/api/scene/select", { scene_id })); }}>
+                  {scenes.map((scene) => <option key={scene.id} value={scene.id}>{scene.name}</option>)}
+                </select>
               </label>
               <label style={{ width: "100%" }}>Robot
-                <select>{robots.map((robot) => <option key={robot.id}>{robot.name}</option>)}</select>
+                <select aria-label="Robot" value="yam" disabled={locked} onChange={() => undefined}>
+                  {robots.map((robot) => (
+                    <option key={robot.id} value={robot.id} disabled={!robot.executable}>
+                      {robot.name}{robot.executable ? "" : " (setup required)"}
+                    </option>
+                  ))}
+                </select>
               </label>
             </div>
           </div>
@@ -237,6 +241,7 @@ export default function App() {
               <button disabled={locked || !selected} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
               <button disabled={locked || !selected} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
               <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, async () => { await api("/api/objects/remove", { object_id: selected }); setSelected(""); })}>Remove</button>
+              <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffel</button>
               <button disabled={locked} onClick={() => run("Scene reset", async () => { await api("/api/scene/reset", {}); setSelected(""); })}>Reset</button>
             </div>
           </div>
@@ -244,7 +249,7 @@ export default function App() {
             <h2>Task</h2>
             <textarea aria-label="Task instruction" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
             <label style={{ marginTop: 8 }}>Time limit (seconds)
-              <input aria-label="Time limit" type="number" min={5} max={120} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
+              <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
             </label>
             <div className="row" style={{ marginTop: 8 }}>
               {running ? (

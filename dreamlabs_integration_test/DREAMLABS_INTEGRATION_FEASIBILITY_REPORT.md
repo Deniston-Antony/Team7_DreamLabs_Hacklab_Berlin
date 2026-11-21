@@ -58,14 +58,14 @@ No browser security or authentication protection was bypassed.
 
 | Operation | Available interface | Can control externally? | Evidence | Limitation |
 | --- | --- | --- | --- | --- |
-| Select scene | Local sim has one scene | Local only | `/api/scenes` | Hosted rooms return 501 |
-| Select robot | Local sim has YAM | Local only | `/api/robots` | Other Playground robots are unavailable here |
+| Select scene | Six local MuJoCo styles | Local only | All six selected and rendered | Styles are not the hosted rooms |
+| Select robot | YAM runs; 8 other arms listed | YAM only | `/api/robots`; others return 501 | Others need actuators, cameras and a measured tool center point |
 | List objects | MuJoCo model | Yes, local | 6 objects listed | Smaller catalog than Playground |
 | Add object | `MjSpec` rebuild | Yes, local | `block_1` added | Proof of concept adds blocks only |
 | Remove object | `MjSpec` rebuild | Yes, local | Block and apple removed | Rebuild resets arm state |
 | Move object | MuJoCo free joint | Yes, local | Pose read back exactly | Bowl and plate are fixed |
 | Rotate object | MuJoCo free joint | Yes, local | 90° quaternion read back | Fixed objects cannot rotate |
-| Shuffle objects | Compose from move | Feasible, not built | Move verified | Needs collision-free placement |
+| Shuffle objects | Random collision-checked layout | Yes, local | 25 of 25 runs succeeded | Fixed bowl and plate stay in place |
 | Clear table | Compose from remove | Feasible, not built | Remove verified | Fixed objects need a rebuild rule |
 | Reset scene | `YamEnv.reset` plus rebuild | Yes, local | Removed apple restored | None found |
 | Read object positions | `MjData` | Yes, local | World position and wxyz orientation | Simulator ground truth only |
@@ -175,7 +175,7 @@ Evidence store --> Umar's evaluator --> reports --> dashboard
 | 1. Reuse the existing simulator? | **Yes**, the official local Dream YAM Sim |
 | 2. Display it inside our website? | **Yes** for local camera views; **no** for the hosted platform Playground |
 | 3. Manipulate objects externally? | **Yes locally**; no hosted API |
-| 4. Select scenes and robots externally? | **Limited**: one local scene and YAM |
+| 4. Select scenes and robots externally? | **Limited**: six local scene styles; only YAM can run |
 | 5. Trigger robot tasks from our backend? | **Yes**, verified by a backend script; the website button is wired but tested only with a stand-in model |
 | 6. Monitor robot execution? | **Yes** for actions, state and poses; live website streaming tested with a stand-in model |
 | 7. Enough evidence for evaluation? | **Yes for simulator state**; it correctly identified a failed task |

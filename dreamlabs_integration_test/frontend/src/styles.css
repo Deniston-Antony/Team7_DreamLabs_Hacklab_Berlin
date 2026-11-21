@@ -29,4 +29,9 @@ tr[data-movable="true"] { cursor: pointer; }
 .dot.on { background: #2e9b57; }
 .muted { color: #6b747c; font-weight: 400; }
 button.danger { background: #b23b32; border-color: #b23b32; color: #fff; }
+.stream-bar h2 { margin: 0; }
+.camera-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+figure { margin: 0; }
+figcaption { margin-top: 4px; color: #555d66; font-size: 12px; text-align: center; text-transform: capitalize; }
+.camera-view { width: 100%; aspect-ratio: 16 / 9; display: block; border-radius: 6px; background: #ddd; object-fit: cover; }
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
