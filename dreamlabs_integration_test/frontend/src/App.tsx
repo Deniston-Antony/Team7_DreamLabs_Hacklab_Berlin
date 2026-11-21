@@ -70,7 +70,16 @@ type Sessions = {
 type Point = { camera: string; u: number; v: number };
 
 const CAMERAS = ["top", "left", "right", "free"];
-const CAMERA_LABEL: Record<string, string> = { top: "top", left: "left", right: "right", free: "3D view" };
+const CAMERA_LABEL: Record<string, string> = { top: "Overhead", left: "Left wrist", right: "Right wrist", free: "3D view" };
+const RUN_STATE_LABEL: Record<WorkerState["state"], string> = {
+  starting: "Starting",
+  running: "Running",
+  finished: "Finished",
+  succeeded: "Succeeded",
+  failed: "Failed",
+  error: "Error",
+  ended: "Stopped",
+};
 const MAX_TASK_SECONDS = 200;
 const MAX_ATTEMPTS = 8;
 const CREDITS_PER_ATTEMPT_120S = 0.06;
@@ -79,13 +88,13 @@ const FRAME_HEIGHT = 360;
 
 const PHASE_LABEL: Record<Live["phase"], string> = {
   idle: "Idle",
-  running: "Robot moving",
-  waiting_for_dream: "Dream-1 thinking",
+  running: "Executing",
+  waiting_for_dream: "Waiting for Dream-1",
 };
 const TASK_LABEL: Record<Task["status"], string> = {
   RUNNING: "Running",
-  COMPLETED: "Success",
-  FAILED: "Failed",
+  COMPLETED: "Succeeded",
+  FAILED: "Error",
   TIMED_OUT: "Time limit reached",
   CANCELLED: "Stopped",
 };
@@ -113,9 +122,22 @@ function clock(seconds: number) {
   return `${String(Math.floor(whole / 60)).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}`;
 }
 
+// "apple>bowl" or "stl_coffee_cup>plate" -> "Apple → Bowl", "Coffee cup → Plate"
+function goalName(label: string) {
+  const nice = (part: string) => {
+    const words = part.replace(/^stl_/, "").replace(/_/g, " ").trim();
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  };
+  return label.includes(">") ? label.split(">").map(nice).join(" → ") : label;
+}
+
+function runName(attempt: number) {
+  return attempt === 1 ? "Live run" : `Parallel run ${attempt}`;
+}
+
 function AttemptsPanel({ task }: { task: Task }) {
   if (task.waiting_for_attempts) {
-    return <div className="attempts">Live attempt finished. Waiting for the other {task.attempts - 1} attempt{task.attempts > 2 ? "s" : ""}...</div>;
+    return <div className="attempts">Live run finished. Waiting for {task.attempts - 1} parallel run{task.attempts > 2 ? "s" : ""} to complete…</div>;
   }
   if (task.status === "RUNNING") return null;
   const results = task.attempt_results ?? [];
@@ -129,7 +151,7 @@ function AttemptsPanel({ task }: { task: Task }) {
           <ul>
             {task.task_results.map((t) => (
               <li key={t.task}>
-                {t.passed ? "✓" : "✗"} {t.instruction}: {t.succeeded} of {t.attempts} attempt{t.attempts > 1 ? "s" : ""}
+                {t.passed ? "✓" : "✗"} {t.instruction}: {t.succeeded} of {t.attempts} run{t.attempts > 1 ? "s" : ""} succeeded
                 {t.results.some((r) => r.error) && <span> ({t.results.find((r) => r.error)?.error})</span>}
               </li>
             ))}
@@ -138,23 +160,25 @@ function AttemptsPanel({ task }: { task: Task }) {
       )}
       {results.length > 0 && !(task.task_results && task.task_results.length > 1) && (
         <>
-          <strong>{task.attempts_succeeded} of {task.attempts} attempts succeeded</strong>
+          <strong>{task.attempts_succeeded} of {task.attempts} runs succeeded</strong>
           <ul>
             {results.map((r) => (
               <li key={r.attempt}>
-                Attempt {r.attempt} ({r.where}): {r.success ? `✓ ${r.sim_seconds ?? "?"} s` : r.error ? `✗ ${r.error}` : r.closest_cm != null ? `✗ closest ${r.closest_cm} cm` : "✗"}
+                {runName(r.attempt)}: {r.success ? `✓ succeeded in ${r.sim_seconds ?? "?"} s` : r.error ? `✗ ${r.error}` : r.closest_cm != null ? `✗ not reached (closest ${r.closest_cm} cm)` : "✗ not reached"}
               </li>
             ))}
           </ul>
         </>
       )}
       {task.attempts_note && <div>{task.attempts_note}</div>}
-      {task.attempts_error && <div>Videos or attempts failed: {task.attempts_error}</div>}
+      {task.attempts_error && <div>Recording or parallel runs failed: {task.attempts_error}</div>}
       {play && <video controls loop src={`/api/tasks/${task.task_id}/video/${play}`} style={{ width: "100%" }} />}
       {task.videos.length > 0 && (
         <div>
           {task.videos.map((name) => (
-            <a key={name} href={`/api/tasks/${task.task_id}/video/${name}`} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>{name}</a>
+            <a key={name} href={`/api/tasks/${task.task_id}/video/${name}`} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>
+              {name === "grid" ? "All runs" : runName(Number(name.replace("attempt-", "")))}
+            </a>
           ))}
         </div>
       )}
@@ -183,7 +207,7 @@ export default function App() {
   const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
   const [attempts, setAttempts] = useState(1);
   const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
-  const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator", error: false });
+  const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator…", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
@@ -251,7 +275,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    run("Connected to the real local MuJoCo simulator", async () => {
+    run("Connected to the local simulator", async () => {
       const [sceneList, robotList, sessionList] = await Promise.all([
         api<{ scene_id: string; name: string }[]>("/api/scenes"),
         api<{ robot_id: string; name: string; executable: boolean }[]>("/api/robots"),
@@ -504,23 +528,30 @@ export default function App() {
 
   return (
     <main>
-      <h1>Dream Labs Integration Test</h1>
-      <p className="note">Live view of the real local Dream YAM Sim. The hosted Playground is not embedded or controlled.</p>
+      <h1>Dream-1 Simulation Console</h1>
+      <p className="note">Plan, run and evaluate Dream-1 tasks in the local YAM simulator.</p>
       <div className="layout">
         <section>
-          <div className="panel">
+          <div className="panel viewer">
+            <nav className="run-tabs" aria-label="Runs">
+              <div className="run-tabs-title">Runs</div>
+              {(workers.length > 1 ? workers : [{ attempt: 1, task: 1, where: "live", label: "", state: running ? "running" : "finished" } as WorkerState]).map((worker) => (
+                <button
+                  key={worker.attempt}
+                  className={`run-tab ${viewAttempt === worker.attempt ? "active" : ""}`}
+                  aria-pressed={viewAttempt === worker.attempt}
+                  onClick={() => chooseAttempt(worker.attempt)}
+                >
+                  <span className="run-tab-name">{runName(worker.attempt)}</span>
+                  {worker.label && <span className="run-tab-goal">{goalName(worker.label)}</span>}
+                  <span className={`run-tab-state ${worker.state}`}>
+                    {workers.length > 1 ? RUN_STATE_LABEL[worker.state] : connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Offline"}
+                  </span>
+                </button>
+              ))}
+            </nav>
+            <div className="viewer-main">
             <div className="stream-bar">
-              {workers.length > 1 && (
-                <label className="attempt-pick">View
-                  <select aria-label="View attempt" value={viewAttempt} onChange={(event) => chooseAttempt(Number(event.target.value))}>
-                    {workers.map((worker) => (
-                      <option key={worker.attempt} value={worker.attempt}>
-                        {worker.attempt} · {worker.where} · {worker.label} · {worker.state}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
               <div className="cameras">
                 {CAMERAS.map((name) => (
                   <button key={name} className={camera === name ? "active" : ""} onClick={() => chooseCamera(name)}>
@@ -530,7 +561,7 @@ export default function App() {
               </div>
               <div className="live-status" role="status">
                 <span className={`dot ${connected ? "on" : ""}`} />
-                {connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting"}
+                {connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting…"}
                 <span className="muted">{connected ? `${fps} FPS` : ""}</span>
               </div>
             </div>
@@ -538,7 +569,7 @@ export default function App() {
             {frameUrl ? (
               <img
                 className={`main-view ${canDrag ? "draggable" : ""} ${dragging || orbiting ? "dragging" : ""}`}
-                alt={`Live ${camera} simulator camera`}
+                alt={`${runName(viewAttempt)}, ${CAMERA_LABEL[camera]} camera`}
                 src={frameUrl}
                 draggable={false}
                 onContextMenu={(event) => event.preventDefault()}
@@ -553,16 +584,17 @@ export default function App() {
             </div>
             <p className="hint">
               {viewAttempt > 1
-                ? `Showing attempt ${viewAttempt} (a hidden worker): its picture only, with the top, left and right cameras. The objects and robot below are the live simulation's.`
+                ? `Viewing ${runName(viewAttempt).toLowerCase()}: camera view only (overhead and wrist cameras). The object table shows the live run.`
                 : camera === "free"
-                ? "Click to select, drag to move. Ctrl + drag rotates the view. Two-finger scroll zooms."
+                ? "Click an object to select it, drag to move it. Ctrl + drag to orbit, scroll to zoom."
                 : camera === "top"
-                  ? "Click to select, drag to move. Ctrl + drag opens the rotating 3D view."
-                  : "Ctrl + drag opens the 3D view. Use top or 3D view to select and move objects."}
+                  ? "Click an object to select it, drag to move it. Ctrl + drag to open the 3D view."
+                  : "Ctrl + drag to open the 3D view. Use the overhead or 3D view to select and move objects."}
             </p>
+            </div>
           </div>
           <div className="panel">
-            <h2>Live scene state from simulator <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
+            <h2>Scene objects <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
             <table>
               <thead>
                 <tr><th>Object</th><th>Position (m)</th><th>Orientation (wxyz)</th><th>Type</th></tr>
@@ -635,11 +667,11 @@ export default function App() {
               <button disabled={locked || !selectedMovable} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
               <button disabled={locked || !selectedMovable} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
               <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, () => api("/api/objects/remove", { object_id: selected }))}>Remove</button>
-              <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffel</button>
-              <button disabled={locked} onClick={() => run("Scene reset", () => api("/api/scene/reset", {}))}>Reset</button>
+              <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffle</button>
+              <button disabled={locked} onClick={() => run("Scene reset", () => api("/api/scene/reset", {}))}>Reset scene</button>
             </div>
             <div className="upload">
-              <label>STL file
+              <label>Mesh file (STL)
                 <input key={uploadKey} aria-label="STL file" type="file" accept=".stl" disabled={locked} onChange={(event) => setStlFile(event.target.files?.[0] ?? null)} />
               </label>
               <label>Size (cm)
@@ -647,41 +679,41 @@ export default function App() {
               </label>
             </div>
             <div className="row" style={{ marginTop: 8 }}>
-              <button disabled={locked || !stlFile} onClick={uploadStl}>Add STL object</button>
+              <button disabled={locked || !stlFile} onClick={uploadStl}>Import mesh</button>
             </div>
             {uploadStatus && <div className={`status ${uploadStatus.error ? "error" : ""}`}>{uploadStatus.text}</div>}
           </div>
           <div className="panel">
-            <h2>Task</h2>
-            <textarea aria-label="Task instruction" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
-            <label style={{ marginTop: 8 }}>Time limit (seconds)
+            <h2>Tasks</h2>
+            <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
+            <label style={{ marginTop: 8 }}>Time limit per run (seconds)
               <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
             </label>
-            <label style={{ marginTop: 8 }}>Attempts at once (each uses credits)
+            <label style={{ marginTop: 8 }}>Runs for this task
               <input aria-label="Attempts" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
             </label>
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
-                <input aria-label={`Task ${index + 2}`} placeholder="put <object> into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
-                <input aria-label={`Attempts for task ${index + 2}`} type="number" min={1} max={MAX_ATTEMPTS} value={extra.attempts} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, attempts: Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)) } : e)))} />
-                <button disabled={running} onClick={() => setExtras(extras.filter((_, i) => i !== index))} aria-label={`Remove task ${index + 2}`}>x</button>
+                <input aria-label={`Task ${index + 2}`} placeholder="e.g. put orange into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
+                <input aria-label={`Runs for task ${index + 2}`} title="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS} value={extra.attempts} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, attempts: Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)) } : e)))} />
+                <button disabled={running} onClick={() => setExtras(extras.filter((_, i) => i !== index))} aria-label={`Remove task ${index + 2}`} title="Remove task">×</button>
               </div>
             ))}
             <div className="row" style={{ marginTop: 8 }}>
-              <button disabled={running || totalAttempts >= MAX_ATTEMPTS} onClick={() => setExtras([...extras, { text: "", attempts: 1 }])}>+ add task</button>
+              <button disabled={running || totalAttempts >= MAX_ATTEMPTS} onClick={() => setExtras([...extras, { text: "", attempts: 1 }])}>Add task</button>
             </div>
             <div className="hint">
-              {extras.length + 1} task{extras.length ? "s" : ""}, {totalAttempts} attempt{totalAttempts > 1 ? "s" : ""} at once (the most is {MAX_ATTEMPTS}), at most about ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)}.
+              {extras.length + 1} task{extras.length ? "s" : ""} · {totalAttempts} parallel run{totalAttempts > 1 ? "s" : ""} (max {MAX_ATTEMPTS}) · up to ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)} in credits
             </div>
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
             <div className="row">
               {running ? (
-                <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop task</button>
+                <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop</button>
               ) : (
                 <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady} onClick={() => run("Task started", () => api("/api/tasks/execute", extras.length ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds } : { instruction, max_seconds: maxSeconds, attempts }))}>
-                  Execute {extras.length ? `${extras.length + 1} tasks` : "task"} (uses credits)
+                  {extras.length ? `Run ${extras.length + 1} tasks` : "Run task"}
                 </button>
               )}
             </div>
