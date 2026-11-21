@@ -29,9 +29,13 @@ tr[data-movable="true"] { cursor: pointer; }
 .dot.on { background: #2e9b57; }
 .muted { color: #6b747c; font-weight: 400; }
 button.danger { background: #b23b32; border-color: #b23b32; color: #fff; }
-.stream-bar h2 { margin: 0; }
-.camera-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
-figure { margin: 0; }
-figcaption { margin-top: 4px; color: #555d66; font-size: 12px; text-align: center; text-transform: capitalize; }
-.camera-view { width: 100%; aspect-ratio: 16 / 9; display: block; border-radius: 6px; background: #ddd; object-fit: cover; }
+.main-view.draggable { cursor: grab; touch-action: none; user-select: none; }
+.main-view.dragging { cursor: grabbing; }
+.hint { margin: 6px 0 0; color: #6b747c; font-size: 12px; }
+.timer { font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 700; margin: 8px 0; }
+.timer span { color: #6b747c; font-size: 13px; font-weight: 400; }
+.upload { display: grid; grid-template-columns: minmax(0, 1fr) 90px; gap: 6px; align-items: end; margin-top: 8px; }
+.upload input[type="file"] { width: 100%; }
+.upload input[type="number"] { width: 100%; }
+.session { display: flex; justify-content: space-between; padding: 6px; border-radius: 5px; background: #e8f0fc; margin-bottom: 8px; }
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }

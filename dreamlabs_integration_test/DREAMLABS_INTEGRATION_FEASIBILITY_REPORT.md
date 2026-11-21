@@ -61,9 +61,9 @@ No browser security or authentication protection was bypassed.
 | Select scene | Six local MuJoCo styles | Local only | All six selected and rendered | Styles are not the hosted rooms |
 | Select robot | YAM runs; 8 other arms listed | YAM only | `/api/robots`; others return 501 | Others need actuators, cameras and a measured tool center point |
 | List objects | MuJoCo model | Yes, local | 6 objects listed | Smaller catalog than Playground |
-| Add object | `MjSpec` rebuild | Yes, local | `block_1` added | Proof of concept adds blocks only |
+| Add object | `MjSpec` rebuild | Yes, local | Blocks plus binary and ASCII STL uploads | STL collisions use a convex shape |
 | Remove object | `MjSpec` rebuild | Yes, local | Block and apple removed | Rebuild resets arm state |
-| Move object | MuJoCo free joint | Yes, local | Pose read back exactly | Bowl and plate are fixed |
+| Move object | MuJoCo free joint and top-camera drag | Yes, local | Pose read back; browser mouse drag tested | Bowl and plate are fixed |
 | Rotate object | MuJoCo free joint | Yes, local | 90° quaternion read back | Fixed objects cannot rotate |
 | Shuffle objects | Random collision-checked layout | Yes, local | 25 of 25 runs succeeded | Fixed bowl and plate stay in place |
 | Clear table | Compose from remove | Feasible, not built | Remove verified | Fixed objects need a rebuild rule |
