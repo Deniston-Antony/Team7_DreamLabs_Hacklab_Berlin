@@ -447,5 +447,17 @@ def worker_frame(attempt, camera):
         for environment in previews["envs"]:
             if environment.attempt == attempt:
                 frame = environment.previews.get(camera) or environment.previews.get("top")
-                return ("preview", previews["version"], camera), frame
+                return ("preview", previews["version"], environment.version, camera), frame
     return None, None
+
+
+def viewed_objects(attempt):
+    """The object table of the parallel run the page is viewing, while its environment can be edited.
+    @return {"view_objects", "view_selected", "view_editable"} for a prepared environment before a run, else {}.
+    """
+    if attempt < 2 or not previews or (current is not None and current.workers is not None):
+        return {}
+    for environment in previews["envs"]:
+        if environment.attempt == attempt:
+            return {"view_objects": environment.snapshot, "view_selected": environment.selected, "view_editable": True}
+    return {}

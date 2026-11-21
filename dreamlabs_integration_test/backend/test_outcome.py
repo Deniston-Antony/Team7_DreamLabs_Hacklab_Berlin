@@ -19,6 +19,7 @@ from pathlib import Path
 import io
 import json
 
+import environments
 import main
 import mujoco
 import numpy as np
@@ -458,13 +459,130 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(frame[:2], b"\xff\xd8")
         self.assertEqual(Image.open(io.BytesIO(frame)).size, (640, 360))
 
-    def test_shuffle_only_keeps_the_live_style_and_same_clears(self):
-        """Shuffled positions keep the scene style; 'same' or a count of 0 removes the prepared environments."""
+    def test_shuffle_only_keeps_the_live_style_same_copies_and_zero_clears(self):
+        """Shuffled positions keep the scene style; 'same' gives editable copies of the live scene; 0 removes them."""
         reply = self.client.post("/api/environments", json={"count": 2, "mode": "shuffle", "seed": 3})
         self.assertEqual({e["style"] for e in reply.json()["environments"]}, {main.sim.scene_id})
-        self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "same"}).json()["environments"], [])
+        copies = self.client.post("/api/environments", json={"count": 2, "mode": "same"}).json()["environments"]
+        self.assertEqual([e["label"] for e in copies], ["Copy of the live scene"] * 2)
+        self.assertEqual([self.apple_xy(e) for e in outcome.previews["envs"]], [self.live_apple_xy()] * 2)
+        self.assertEqual(self.client.post("/api/environments", json={"count": 0, "mode": "same"}).json()["environments"], [])
         self.assertEqual(outcome.attempt_states(), [])
         self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "warp"}).status_code, 422)
+
+    def live_apple_xy(self):
+        return [round(v, 3) for v in self.objects()["apple"]["position"][:2]]
+
+    @staticmethod
+    def pixel(environment, name, camera="top"):
+        """Where an object's centre appears in a camera's cropped picture: the inverse of environments.camera_ray."""
+        m, d = environment.model, environment.data
+        camera_id = m.camera(camera).id
+        local = d.cam_xmat[camera_id].reshape(3, 3).T @ (d.body(name).xpos - d.cam_xpos[camera_id])
+        focal = (environments.RENDER_HEIGHT / 2) / np.tan(np.radians(m.cam_fovy[camera_id]) / 2)
+        u = environments.RENDER_WIDTH / 2 + focal * local[0] / -local[2]
+        v = environments.RENDER_HEIGHT / 2 - focal * local[1] / -local[2] - environments.RENDER_CROP_TOP
+        return {"camera": camera, "u": float(u), "v": float(v)}
+
+    def test_one_parallel_run_can_be_edited_without_touching_the_live_scene_or_the_others(self):
+        """Move and rotate the apple in run 2 only: the live scene and run 3 stay as they were."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "same"})
+        live_before = self.live_apple_xy()
+        version, frame = outcome.worker_frame(2, "top")
+        reply = self.client.post("/api/environments/2/move", json={"object_id": "apple", "position": {"x": -0.2, "y": 0.15, "z": 0.8}})
+        self.assertEqual(reply.status_code, 200, reply.text)
+        run2, run3 = outcome.previews["envs"]
+        self.assertEqual(self.apple_xy(run2), [-0.2, 0.15])
+        self.assertEqual(self.apple_xy(run3), live_before)
+        self.assertEqual(self.live_apple_xy(), live_before)
+        self.assertEqual(run2.label, "Default lab, edited")
+        new_version, new_frame = outcome.worker_frame(2, "top")
+        self.assertNotEqual(new_version, version, "the page is sent the new picture")
+        self.assertNotEqual(new_frame, frame)
+        self.assertEqual(self.client.post("/api/environments/2/rotate", json={"object_id": "apple", "yaw_deg": 90}).status_code, 200)
+        listed = {o["object_id"]: o for o in self.client.get("/api/environments/2/objects").json()["objects"]}
+        self.assertEqual([round(v, 2) for v in listed["apple"]["position"][:2]], [-0.2, 0.15])
+        self.assertEqual(self.client.post("/api/environments/2/move", json={"object_id": "bowl", "position": {"x": 0, "y": 0, "z": 0.8}}).status_code, 409)
+        self.assertEqual(self.client.post("/api/environments/5/shuffle").status_code, 404)
+
+    def test_an_object_can_be_dragged_in_a_parallel_run_overhead_view(self):
+        """Pick the apple where it appears in run 2's overhead picture, drag it, drop it: only run 2 changes."""
+        self.client.post("/api/environments", json={"count": 1, "mode": "same"})
+        run2 = outcome.previews["envs"][0]
+        start = self.pixel(run2, "apple")
+        picked = self.client.post("/api/environments/2/pick", json=start).json()
+        self.assertEqual(picked, {"object_id": "apple", "movable": True})
+        self.client.post("/api/environments/2/drag", json={**start, "u": start["u"] - 60})
+        dropped = self.client.post("/api/environments/2/drop").json()
+        self.assertEqual(dropped, {"object_id": "apple", "restored": False})
+        self.assertGreater(abs(self.apple_xy(run2)[0] - self.live_apple_xy()[0]), 0.05, "the apple moved in run 2")
+        self.assertEqual(self.live_apple_xy(), [0.15, 0.105], "and not in the live scene")
+        self.assertEqual(run2.selected, "apple")
+
+    def test_shuffle_one_parallel_run(self):
+        """Shuffle in run 3 gives run 3 a new layout and leaves run 2 alone."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "same"})
+        run2, run3 = outcome.previews["envs"]
+        before2, before3 = self.apple_xy(run2), self.apple_xy(run3)
+        reply = self.client.post("/api/environments/3/shuffle")
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["environment"]["label"], "Default lab, edited")
+        self.assertEqual(self.apple_xy(run2), before2)
+        self.assertNotEqual(self.apple_xy(run3), before3)
+
+    def test_edits_survive_live_changes_and_page_reconnects_but_not_reset(self):
+        """An edited run keeps its layout when the live scene changes or the page asks again; Reset scene clears it."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "same"})
+        self.client.post("/api/environments/2/move", json={"object_id": "apple", "position": {"x": -0.2, "y": 0.15, "z": 0.8}})
+        self.client.post("/api/objects/move", json={"object_id": "apple", "position": {"x": 0.2, "y": 0.0, "z": 0.8}})
+        run2, run3 = outcome.previews["envs"]
+        self.assertEqual(self.apple_xy(run2), [-0.2, 0.15], "the edited run kept its layout")
+        self.assertEqual(self.apple_xy(run3), [0.2, 0.0], "the untouched run follows the live scene")
+        self.client.post("/api/environments", json={"count": 2, "mode": "same"})
+        self.assertEqual(self.apple_xy(outcome.previews["envs"][0]), [-0.2, 0.15], "a reconnect keeps it")
+        self.client.post("/api/environments", json={"count": 3, "mode": "same"})
+        self.assertEqual(self.apple_xy(outcome.previews["envs"][0]), [-0.2, 0.15], "one more run keeps it")
+        self.client.post("/api/scene/reset")
+        self.assertEqual({tuple(self.apple_xy(e)) for e in outcome.previews["envs"]}, {tuple(self.live_apple_xy())})
+        self.assertFalse(any(e.edited for e in outcome.previews["envs"]))
+
+    def test_the_page_gets_the_viewed_runs_object_table(self):
+        """Viewing run 2 before a run sends run 2's objects, so the table and controls act on run 2."""
+        self.client.post("/api/environments", json={"count": 1, "mode": "same"})
+        self.client.post("/api/environments/2/move", json={"object_id": "apple", "position": {"x": -0.2, "y": 0.15, "z": 0.8}})
+        with self.client.websocket_connect("/ws/live", headers={"origin": "http://127.0.0.1:5173"}) as ws:
+            self.assertNotIn("view_objects", self.receive(ws, "text"))
+            ws.send_json({"attempt": 2})
+            for _ in range(50):
+                state = self.receive(ws, "text")
+                if state.get("view_objects"):
+                    break
+            apple = next(o for o in state["view_objects"] if o["object_id"] == "apple")
+            self.assertEqual([round(v, 2) for v in apple["position"][:2]], [-0.2, 0.15])
+            self.assertEqual((state["view_selected"], state["view_editable"]), ("apple", True))
+
+    def test_a_run_starts_each_parallel_run_from_its_edited_environment(self):
+        """Edit run 2, then run: worker 2 loads the edited scene, worker 3 the copy of the live scene."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "same"})
+        self.client.post("/api/environments/2/move", json={"object_id": "apple", "position": {"x": -0.2, "y": 0.15, "z": 0.8}})
+        live_x = self.live_apple_xy()[0]
+        outcome.SORTFLOW = self.fake_workers(
+            'print("RESULT " + json.dumps({"success": False, "sim_seconds": None, "closest_cm": x_cm}))'
+        )
+        try:
+            task = self.submit("put apple into the bowl", model(steps=20), attempts=3, environments="same", seed=1)
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+        hidden = sorted((r for r in task["attempt_results"] if r["where"] == "hidden"), key=lambda r: r["attempt"])
+        self.assertEqual([r["closest_cm"] for r in hidden], [-20, round(live_x * 100)])
+        self.assertEqual(hidden[0]["env"], "Default lab, edited")
+
+    def test_parallel_runs_cannot_be_edited_while_a_task_runs(self):
+        self.client.post("/api/environments", json={"count": 1, "mode": "same"})
+        main.dc.main = model(steps=4000)
+        self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20})
+        time.sleep(0.3)
+        self.assertEqual(self.client.post("/api/environments/2/shuffle").status_code, 409)
 
     def test_each_parallel_run_starts_from_its_own_environment(self):
         """A run with shuffled environments: every worker loads its own environment, matching its preview."""

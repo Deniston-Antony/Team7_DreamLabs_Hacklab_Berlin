@@ -68,6 +68,9 @@ type Live = {
   selected: string | null;
   task: Task | null;
   objects: SceneObject[];
+  view_objects?: SceneObject[];
+  view_selected?: string | null;
+  view_editable?: boolean;
   robot: Record<string, number[]>;
   contacts: number;
 };
@@ -255,7 +258,7 @@ export default function App() {
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
   const attemptRef = useRef(1);
-  const drag = useRef<{ active: boolean; sending: boolean; next: Point | null }>({ active: false, sending: false, next: null });
+  const drag = useRef<{ active: boolean; sending: boolean; next: Point | null; target: string }>({ active: false, sending: false, next: null, target: "" });
   const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
   const zoom = useRef({ sending: false, delta: 0 });
   const viewRef = useRef<HTMLDivElement | null>(null);
@@ -378,8 +381,11 @@ export default function App() {
     return () => element.removeEventListener("wheel", onWheel);
   }, []);
 
-  const objects = live?.objects ?? [];
-  const selected = live?.selected ?? "";
+  // Before a run, a parallel run's tab can be edited like the live scene: the table and controls act on that run.
+  const editingRun = viewAttempt > 1 && (live?.view_editable ?? false);
+  const target = editingRun ? `/api/environments/${viewAttempt}` : "";
+  const objects = (editingRun ? live?.view_objects : live?.objects) ?? [];
+  const selected = (editingRun ? live?.view_selected : live?.selected) ?? "";
   const selectedObject = objects.find((object) => object.object_id === selected);
   const selectedMovable = selectedObject?.movable ?? false;
   const selectedPosition = selectedObject?.position.join(",");
@@ -395,7 +401,7 @@ export default function App() {
   useEffect(() => {
     // Show the parallel runs' environments (shuffled positions, other styles) in the run tabs before the run.
     if (running || !connected) return;
-    const count = envMode === "same" ? 0 : totalAttempts - 1;
+    const count = totalAttempts - 1;
     const timer = window.setTimeout(() => {
       api("/api/environments", { count, mode: envMode, seed }).catch((error) =>
         setStatus({ text: error instanceof Error ? error.message : String(error), error: true }),
@@ -418,7 +424,8 @@ export default function App() {
   };
   const locked = busy || running || dragging;
   const position = { x: pose.x, y: pose.y, z: pose.z };
-  const canDrag = (camera === "top" || camera === "free") && !running && !busy;
+  const where = editingRun ? ` in ${runName(viewAttempt).toLowerCase()}` : "";
+  const canDrag = (viewAttempt === 1 ? camera === "top" || camera === "free" : editingRun && camera === "top") && !running && !busy;
 
   useEffect(() => {
     if (!selectedPosition) return;
@@ -428,7 +435,7 @@ export default function App() {
 
   const selectObject = (object: SceneObject) => {
     if (running || dragging) return;
-    api("/api/objects/select", { object_id: object.object_id }).catch((error) =>
+    api(editingRun ? `${target}/select` : "/api/objects/select", { object_id: object.object_id }).catch((error) =>
       setStatus({ text: error instanceof Error ? error.message : String(error), error: true }),
     );
   };
@@ -455,7 +462,7 @@ export default function App() {
       while (state.next) {
         const point = state.next;
         state.next = null;
-        await api("/api/view/drag", point);
+        await api(state.target ? `${state.target}/drag` : "/api/view/drag", point);
       }
     } catch (error) {
       setStatus({ text: error instanceof Error ? error.message : String(error), error: true });
@@ -483,7 +490,7 @@ export default function App() {
   };
 
   const startDrag = async (event: PointerEvent<HTMLImageElement>) => {
-    if (event.ctrlKey) {
+    if (event.ctrlKey && viewAttempt === 1) {
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
       Object.assign(orbit.current, { active: true, x: event.clientX, y: event.clientY });
@@ -492,12 +499,13 @@ export default function App() {
       return;
     }
     if (!canDrag || event.button !== 0) return;
-    const target = event.currentTarget;
+    const element = event.currentTarget;
     const pointerId = event.pointerId;
     const point = framePoint(event);
     event.preventDefault();
     try {
-      const picked = await api<{ object_id: string | null; movable: boolean }>("/api/view/pick", point);
+      drag.current.target = target; // the run being edited, fixed for this whole drag
+      const picked = await api<{ object_id: string | null; movable: boolean }>(target ? `${target}/pick` : "/api/view/pick", point);
       if (!picked.object_id) {
         setStatus({ text: "Selection cleared.", error: false });
         return;
@@ -506,7 +514,7 @@ export default function App() {
         setStatus({ text: `Selected ${picked.object_id}. It is fixed, so it cannot be dragged.`, error: false });
         return;
       }
-      target.setPointerCapture(pointerId);
+      element.setPointerCapture(pointerId);
       drag.current.active = true;
       setDragging(true);
       setStatus({ text: `Dragging ${picked.object_id}`, error: false });
@@ -542,7 +550,7 @@ export default function App() {
     while (state.sending) await new Promise((resolve) => window.setTimeout(resolve, 15));
     await sendDrag();
     try {
-      const result = await api<{ object_id: string; restored: boolean }>("/api/view/drop", {});
+      const result = await api<{ object_id: string; restored: boolean }>(state.target ? `${state.target}/drop` : "/api/view/drop", {});
       setStatus(
         result.restored
           ? { text: `${result.object_id} would collide there, so it went back.`, error: true }
@@ -607,6 +615,18 @@ export default function App() {
           <div className="panel viewer">
             <nav className="run-tabs" aria-label="Runs">
               <div className="run-tabs-title">Runs</div>
+              <label className="run-count">Runs for this task
+                <input aria-label="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS - (totalAttempts - attempts)} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS - (totalAttempts - attempts), Math.max(1, Number(event.target.value) || 1)))} />
+              </label>
+              {totalAttempts > 1 && (
+                <label className="run-count">Start scenes
+                  <select aria-label="Parallel run environments" value={envMode} disabled={running} onChange={(event) => setEnvMode(event.target.value as typeof envMode)}>
+                    <option value="same">Copies of the live scene</option>
+                    <option value="shuffle">Shuffled positions</option>
+                    <option value="shuffle_style">Shuffled + scene styles</option>
+                  </select>
+                </label>
+              )}
               {(workers.length > 1 ? workers : [{ attempt: 1, task: 1, where: "live", label: "", state: running ? "running" : "finished" } as WorkerState]).map((worker) => (
                 <button
                   key={worker.attempt}
@@ -646,17 +666,19 @@ export default function App() {
                 src={frameUrl}
                 draggable={false}
                 onContextMenu={(event) => event.preventDefault()}
-                onPointerDown={viewAttempt === 1 ? startDrag : undefined}
-                onPointerMove={viewAttempt === 1 ? moveDrag : undefined}
-                onPointerUp={viewAttempt === 1 ? endDrag : undefined}
-                onPointerCancel={viewAttempt === 1 ? endDrag : undefined}
+                onPointerDown={viewAttempt === 1 || editingRun ? startDrag : undefined}
+                onPointerMove={viewAttempt === 1 || editingRun ? moveDrag : undefined}
+                onPointerUp={viewAttempt === 1 || editingRun ? endDrag : undefined}
+                onPointerCancel={viewAttempt === 1 || editingRun ? endDrag : undefined}
               />
             ) : (
               <div className="main-view" />
             )}
             </div>
             <p className="hint">
-              {viewAttempt > 1
+              {editingRun
+                ? `Editing ${runName(viewAttempt).toLowerCase()}'s starting scene: drag objects in the overhead view, or use the object table and Move, Rotate, Shuffle. The live scene does not change.`
+                : viewAttempt > 1
                 ? `Viewing ${runName(viewAttempt).toLowerCase()}: camera view only (overhead and wrist cameras). The object table shows the live run.`
                 : camera === "free"
                 ? "Click an object to select it, drag to move it. Ctrl + drag to orbit, scroll to zoom."
@@ -669,7 +691,7 @@ export default function App() {
           {task && <AttemptsPanel key={task.task_id} task={task} />}
           <ReportsCenter latestRunId={task?.evaluation ? task.task_id : ""} error={task?.evaluation_error} locked={running} />
           <div className="panel">
-            <h2>Scene objects <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
+            <h2>Scene objects {editingRun ? <span className="muted">{runName(viewAttempt)}</span> : <span className="muted">{live?.contacts ?? 0} contacts</span>}</h2>
             <table>
               <thead>
                 <tr><th>Object</th><th>Position (m)</th><th>Orientation (wxyz)</th><th>Type</th></tr>
@@ -690,7 +712,8 @@ export default function App() {
                         aria-label={`${object.object_id} type`}
                         className="type-select"
                         value={object.movable ? "movable" : "fixed"}
-                        disabled={locked}
+                        disabled={locked || editingRun}
+                        title={editingRun ? "Movable or fixed is set in the live scene and applies to every run" : undefined}
                         onChange={(event) => changeType(object, event.target.value === "movable")}
                       >
                         <option value="movable">Movable</option>
@@ -735,14 +758,14 @@ export default function App() {
             </div>
           </div>
           <div className="panel">
-            <h2>Object controls {selected && `: ${selected}`}</h2>
+            <h2>Object controls{editingRun ? ` · ${runName(viewAttempt)}` : ""} {selected && `: ${selected}`}</h2>
             <div className="row">{field("x", "0.01")}{field("y", "0.01")}{field("z", "0.01")}{field("yaw", "5")}</div>
             <div className="row">
-              <button disabled={locked} onClick={() => run("Added a block", () => api("/api/objects/add", { type: "block", position }))}>Add block</button>
-              <button disabled={locked || !selectedMovable} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
-              <button disabled={locked || !selectedMovable} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
-              <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, () => api("/api/objects/remove", { object_id: selected }))}>Remove</button>
-              <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffle</button>
+              <button disabled={locked || editingRun} title={editingRun ? "Objects are added to the live scene; every run gets them" : undefined} onClick={() => run("Added a block", () => api("/api/objects/add", { type: "block", position }))}>Add block</button>
+              <button disabled={locked || !selectedMovable} onClick={() => run(`Moved ${selected}${where}`, () => api(editingRun ? `${target}/move` : "/api/objects/move", { object_id: selected, position }))}>Move</button>
+              <button disabled={locked || !selectedMovable} onClick={() => run(`Rotated ${selected}${where}`, () => api(editingRun ? `${target}/rotate` : "/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
+              <button disabled={locked || !selected || editingRun} title={editingRun ? "Objects are removed from the live scene; every run loses them" : undefined} onClick={() => run(`Removed ${selected}`, () => api("/api/objects/remove", { object_id: selected }))}>Remove</button>
+              <button disabled={locked} onClick={() => run(`Objects shuffled${where}`, () => api(editingRun ? `${target}/shuffle` : "/api/objects/shuffle", {}))}>{editingRun ? "Shuffle this run" : "Shuffle"}</button>
               <button
                 disabled={busy || dragging}
                 title={running ? "Stops the live run and every parallel run, then resets the scene" : layoutSaved ? "Puts back your saved layout, with both arms home" : "Puts every object and both arms back where they started"}
@@ -779,9 +802,7 @@ export default function App() {
             <label style={{ marginTop: 8 }}>Time limit per run (seconds)
               <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
             </label>
-            <label style={{ marginTop: 8 }}>Runs for this task
-              <input aria-label="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
-            </label>
+            <p className="hint">Set how many runs this task gets in the Runs list next to the camera view.</p>
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
                 <input aria-label={`Task ${index + 2}`} placeholder="e.g. put orange into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
@@ -797,13 +818,6 @@ export default function App() {
             </div>
             {totalAttempts > 1 && (
               <div className="env-controls">
-                <label>Parallel run environments
-                  <select aria-label="Parallel run environments" value={envMode} disabled={running} onChange={(event) => setEnvMode(event.target.value as typeof envMode)}>
-                    <option value="same">Same as the live scene</option>
-                    <option value="shuffle">Shuffled object positions</option>
-                    <option value="shuffle_style">Shuffled positions and scene styles</option>
-                  </select>
-                </label>
                 {envMode !== "same" && (
                   <div className="row">
                     <label>Layout seed
@@ -812,7 +826,7 @@ export default function App() {
                     <button disabled={running} onClick={() => setSeed(Math.floor(Math.random() * 100000))}>New layouts</button>
                   </div>
                 )}
-                {envMode !== "same" && <p className="hint">Each parallel run starts from its own environment; the Runs tabs show them. The live run keeps your scene.</p>}
+                <p className="hint">Each parallel run starts from its own scene, shown in its Runs tab. Open a tab to move objects or shuffle that run only; Reset scene puts every run back.</p>
               </div>
             )}
             <div className="timer" aria-label="Task timer">

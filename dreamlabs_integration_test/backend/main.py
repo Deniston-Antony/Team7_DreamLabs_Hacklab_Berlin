@@ -550,11 +550,7 @@ class SimAdapter:
                 + up * (RENDER_HEIGHT / 2 - v - RENDER_CROP_TOP) / focal
             )
             return lookat - distance * forward, direction / np.linalg.norm(direction)
-        camera_id = m.camera(camera).id
-        focal = (RENDER_HEIGHT / 2) / math.tan(math.radians(m.cam_fovy[camera_id]) / 2)
-        local = np.array([(u - RENDER_WIDTH / 2) / focal, -(v + RENDER_CROP_TOP - RENDER_HEIGHT / 2) / focal, -1.0])
-        direction = d.cam_xmat[camera_id].reshape(3, 3) @ local
-        return d.cam_xpos[camera_id].copy(), direction / np.linalg.norm(direction)
+        return environments.camera_ray(m, d, camera, u, v)
 
     @staticmethod
     def _at_height(origin, direction, z):
@@ -817,12 +813,30 @@ async def on_sim(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
 
 
-def prepare_environments(count, mode, seed, with_previews=False):
+def environment_rules(movable, present):
+    """What editing a parallel environment needs to know about the live scene's objects."""
+    return {
+        "movable": list(movable),
+        "managed": list(present),
+        "clearance": dict(FIXED_CLEARANCE_M),
+        "shuffle_x": SHUFFLE_X,
+        "shuffle_y": SHUFFLE_Y,
+        "spacing": SHUFFLE_SPACING_M,
+        "drag_x": X_RANGE,
+        "drag_y": Y_RANGE,
+        "table_z": TABLE_TOP_Z,
+    }
+
+
+def prepare_environments(count, mode, seed, with_previews=False, keep=None):
     """Build the starting scenes of `count` parallel runs from the live scene; runs on the simulator thread.
     @param count How many parallel runs.
-    @param mode `shuffle` (new object positions) or `shuffle_style` (new positions and another scene style each).
+    @param mode `same` (a copy of the live scene), `shuffle` (new object positions) or `shuffle_style` (new
+        positions and another scene style each).
     @param seed Seed for the layouts; the same scene, mode and seed give the same environments.
     @param with_previews Also render each environment's three cameras for the run tabs.
+    @param keep Environments to keep instead of building them again, by run number (environments the user edited).
+        One is only kept while it still has the live scene's objects.
     @return A list of environments.Environment for runs 2, 3, ...
     """
     movable = list(sim._joint_by_body())
@@ -831,8 +845,14 @@ def prepare_environments(count, mode, seed, with_previews=False):
     saved = {n: np.r_[sim.env.data.body(n).xpos, sim.env.data.body(n).xquat] for n in present}
     styles = list(SCENES)
     models = {sim.scene_id: sim.env.model}
+    rules = environment_rules(movable, present)
     envs = []
     for index in range(count):
+        kept = (keep or {}).get(index + 2)
+        if kept is not None and kept.model.nq == sim.env.model.nq and kept.rules.get("managed") == rules["managed"]:
+            kept.rules = {**rules, "restyled": kept.rules.get("restyled", True)}  # Movable/Fixed may have changed
+            envs.append(kept)
+            continue
         style = styles[(styles.index(sim.scene_id) + 1 + index) % len(styles)] if mode == "shuffle_style" else sim.scene_id
         if style not in models:
             models[style] = sim._compile(saved, style)
@@ -842,21 +862,79 @@ def prepare_environments(count, mode, seed, with_previews=False):
         data = mujoco.MjData(model)
         data.qpos[:], data.qvel[:], data.ctrl[:] = sim.env.data.qpos, sim.env.data.qvel, sim.env.data.ctrl
         mujoco.mj_forward(model, data)
-        shuffled = environments.shuffle_layout(
+        shuffled = mode != "same" and environments.shuffle_layout(
             model, data, movable, fixed, np.random.default_rng([seed, index]), SHUFFLE_X, SHUFFLE_Y, SHUFFLE_SPACING_M
         )
-        environment = environments.Environment(index + 2, model, data, style, SCENES[style]["name"], seed, shuffled)
+        environment = environments.Environment(
+            index + 2,
+            model,
+            data,
+            style,
+            SCENES[style]["name"],
+            seed,
+            shuffled,
+            {**rules, "restyled": style != sim.scene_id},
+        )
         if with_previews:
             environment.previews = environments.render_previews(model, data)
         envs.append(environment)
     return envs
 
 
-def refresh_previews():
-    """Rebuild the prepared environments from the scene as it is now; runs on the simulator thread."""
+def edited_environments():
+    """The prepared environments the user changed by hand, by run number."""
+    shown = outcome.previews
+    return {e.attempt: e for e in shown["envs"] if e.edited} if shown else {}
+
+
+def run_environments(task):
+    """The parallel runs' starting scenes: the prepared ones the run tabs show (with the user's edits) when they
+    match the request, otherwise new ones; None runs every parallel run from a copy of the live scene."""
+    needed = task["attempts"] - 1
+    if needed < 1:
+        return None
+    shown = outcome.previews
+    mode = task.get("environments", "same")
+    if shown and shown["count"] >= needed and (shown["mode"] == mode or any(e.edited for e in shown["envs"])):
+        return shown["envs"][:needed]
+    if mode == "same":
+        return None
+    return prepare_environments(needed, mode, task["seed"])
+
+
+def refresh_previews(keep_edits=True):
+    """Rebuild the prepared environments from the scene as it is now; runs on the simulator thread.
+    @param keep_edits Keep the environments the user edited by hand; False rebuilds every one (Reset scene).
+    """
     shown = outcome.previews
     if shown:
-        outcome.set_previews(prepare_environments(shown["count"], shown["mode"], shown["seed"], True), shown["mode"], shown["seed"])
+        keep = edited_environments() if keep_edits else None
+        envs = prepare_environments(shown["count"], shown["mode"], shown["seed"], True, keep)
+        outcome.set_previews(envs, shown["mode"], shown["seed"])
+
+
+def preview_environment(attempt):
+    """The prepared environment of a parallel run, for editing it; 404 when that run has none."""
+    for environment in (outcome.previews or {}).get("envs", []):
+        if environment.attempt == attempt:
+            return environment
+    raise HTTPException(404, f"Parallel run {attempt} has no environment to edit. Set Runs to {attempt} or more.")
+
+
+async def edit_environment(attempt, method, *args):
+    """Run one edit of a parallel run's environment on the simulator thread; refused while a task runs."""
+    if active_task is not None:
+        raise HTTPException(409, "Parallel runs cannot be changed while a task is running.")
+
+    def apply():
+        environment = preview_environment(attempt)
+        outcome.clear_runs()  # the run tabs show the environments being edited, not the last run's pictures
+        try:
+            return getattr(environment, method)(*args)
+        except environments.EditError as error:
+            raise HTTPException(error.status, str(error)) from error
+
+    return await on_sim(apply)
 
 
 async def change_scene(fn, *args, refresh=True):
@@ -984,9 +1062,7 @@ def run_task(task, stop):
     except Exception as error:  # scoring must never stop the robot run
         result["evaluation_error"] = f"Evaluation could not start: {type(error).__name__}: {error}"
     try:
-        envs = None
-        if task.get("environments", "same") != "same" and task["attempts"] > 1:
-            envs = prepare_environments(task["attempts"] - 1, task["environments"], task["seed"])
+        envs = run_environments(task)
         session = outcome.Session(task, sim.env, goals, envs, sim.managed())
         dc.main(
             [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
@@ -1144,9 +1220,10 @@ async def reset_scene():
     if not await stop_running_task():
         raise HTTPException(409, "The running task did not stop in time; press Reset scene again.")
     if saved_layout is not None:
-        await change_scene(restore_layout, saved_layout)
+        await change_scene(restore_layout, saved_layout, refresh=False)
     else:
-        await change_scene(sim.reset)
+        await change_scene(sim.reset, refresh=False)
+    await on_sim(refresh_previews, False)  # every parallel run goes back to the reset scene, edits too
     outcome.clear_runs()  # the finished parallel runs' last pictures no longer match the reset scene
     return {"placed": feed.objects, "stopped_task": stopped_task, "layout": saved_layout is not None}
 
@@ -1166,13 +1243,68 @@ async def prepare_parallel_environments(body: PrepareEnvironments):
     """Prepare and preview the parallel runs' environments; the run tabs show them until the next run."""
     if active_task is not None:
         raise HTTPException(409, "Environments cannot be prepared while a task is running.")
-    if body.count == 0 or body.mode == "same":
+    if body.count == 0:
         outcome.clear_previews()
         return {"environments": []}
-    envs = await on_sim(prepare_environments, body.count, body.mode, body.seed, True)
+    shown = outcome.previews
+    same = shown and shown["mode"] == body.mode and shown["seed"] == body.seed
+    if same and shown["count"] == body.count:  # nothing changed (the page reconnected, say): keep every edit
+        return {"environments": [e.describe() for e in shown["envs"]]}
+    keep = {e.attempt: e for e in shown["envs"]} if same else None  # more or fewer runs: keep the ones there were
+    envs = await on_sim(prepare_environments, body.count, body.mode, body.seed, True, keep)
     outcome.clear_runs()
     outcome.set_previews(envs, body.mode, body.seed)
     return {"environments": [e.describe() for e in envs]}
+
+
+@app.get("/api/environments/{attempt}/objects")
+def environment_objects(attempt: int):
+    environment = preview_environment(attempt)
+    return {"objects": environment.objects(), "selected": environment.selected}
+
+
+@app.post("/api/environments/{attempt}/pick")
+async def environment_pick(attempt: int, body: ViewPoint):
+    if body.camera not in environments.CAMERAS:
+        raise HTTPException(404, "Use the overhead or a wrist camera to pick objects in a parallel run.")
+    return await edit_environment(attempt, "pick", body.camera, body.u, body.v)
+
+
+@app.post("/api/environments/{attempt}/drag")
+async def environment_drag(attempt: int, body: ViewPoint):
+    if body.camera not in environments.CAMERAS:
+        raise HTTPException(404, "unknown camera")
+    await edit_environment(attempt, "drag", body.camera, body.u, body.v)
+    return {"ok": True}
+
+
+@app.post("/api/environments/{attempt}/drop")
+async def environment_drop(attempt: int):
+    return await edit_environment(attempt, "drop")
+
+
+@app.post("/api/environments/{attempt}/select")
+async def environment_select(attempt: int, body: SelectObject):
+    await edit_environment(attempt, "select", body.object_id)
+    return {"object_id": body.object_id}
+
+
+@app.post("/api/environments/{attempt}/move")
+async def environment_move(attempt: int, body: MoveObject):
+    await edit_environment(attempt, "move", body.object_id, body.position.array())
+    return {"object_id": body.object_id}
+
+
+@app.post("/api/environments/{attempt}/rotate")
+async def environment_rotate(attempt: int, body: RotateObject):
+    await edit_environment(attempt, "rotate", body.object_id, body.yaw_deg)
+    return {"object_id": body.object_id}
+
+
+@app.post("/api/environments/{attempt}/shuffle")
+async def environment_shuffle(attempt: int):
+    await edit_environment(attempt, "shuffle")
+    return {"environment": preview_environment(attempt).describe()}
 
 
 @app.delete("/api/scene/layout")
@@ -1422,6 +1554,7 @@ async def live(socket: WebSocket):
                     "phase": live_phase(),
                     "task": task_view(task),
                     "objects": feed.objects,
+                    **outcome.viewed_objects(attempt),
                     "robot": feed.robot,
                     "contacts": feed.contacts,
                 }
