@@ -176,8 +176,8 @@ Evidence store --> Umar's evaluator --> reports --> dashboard
 | 2. Display it inside our website? | **Yes** for local camera views; **no** for the hosted platform Playground |
 | 3. Manipulate objects externally? | **Yes locally**; no hosted API |
 | 4. Select scenes and robots externally? | **Limited**: one local scene and YAM |
-| 5. Trigger robot tasks from our backend? | **Yes**, verified by a backend script; not yet wired to the website button |
-| 6. Monitor robot execution? | **Yes** for actions, state and poses; live website streaming is not built |
+| 5. Trigger robot tasks from our backend? | **Yes**, verified by a backend script; the website button is wired but tested only with a stand-in model |
+| 6. Monitor robot execution? | **Yes** for actions, state and poses; live website streaming tested with a stand-in model |
 | 7. Enough evidence for evaluation? | **Yes for simulator state**; it correctly identified a failed task |
 | 8. Execute multiple tasks independently? | **Sequentially likely**: reset verified. Parallel isolation is unknown |
 | 9. Capabilities needing workarounds? | Scene variety, robot variety, shuffle, clear and non-block objects |
@@ -203,7 +203,9 @@ npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. The website's Execute button still returns an unsupported-capability message. Run the billed live test separately:
+Open `http://127.0.0.1:5173`. The website streams the simulator live over WebSocket. **Execute task uses Dream Labs credits.** The stream and task controls were tested with a stand-in model at 7.7 FPS and 0.73 Mbps; the button has not yet made a billed Dream-1 run.
+
+To run the billed command-line test instead:
 
 ```bash
 cd dreamlabs_integration_test/backend

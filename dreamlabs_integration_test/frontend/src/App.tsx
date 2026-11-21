@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type SceneObject = {
   object_id: string;
@@ -8,6 +8,34 @@ type SceneObject = {
 };
 type Option = { id: string; name: string };
 type Status = { text: string; error: boolean };
+type Task = {
+  task_id: string;
+  instruction: string;
+  status: "RUNNING" | "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED";
+  max_seconds: number;
+  started_at: number;
+  error: string | null;
+};
+type Live = {
+  phase: "idle" | "running" | "waiting_for_dream";
+  task: Task | null;
+  objects: SceneObject[];
+  robot: Record<string, number[]>;
+  contacts: number;
+};
+
+const PHASE_LABEL: Record<Live["phase"], string> = {
+  idle: "Idle",
+  running: "Robot moving",
+  waiting_for_dream: "Dream-1 thinking",
+};
+const TASK_LABEL: Record<Task["status"], string> = {
+  RUNNING: "Running",
+  COMPLETED: "Completed",
+  FAILED: "Failed",
+  TIMED_OUT: "Time limit reached. Outcome not evaluated.",
+  CANCELLED: "Stopped",
+};
 
 async function api<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
@@ -26,36 +54,76 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
 export default function App() {
   const [scenes, setScenes] = useState<Option[]>([]);
   const [robots, setRobots] = useState<Option[]>([]);
-  const [objects, setObjects] = useState<SceneObject[]>([]);
+  const [live, setLive] = useState<Live | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [frameUrl, setFrameUrl] = useState("");
+  const [fps, setFps] = useState(0);
   const [selected, setSelected] = useState("");
   const [camera, setCamera] = useState("top");
-  const [frame, setFrame] = useState(0);
   const [pose, setPose] = useState({ x: 0.05, y: 0, z: 0.8, yaw: 45 });
   const [instruction, setInstruction] = useState("put apple into the bowl");
+  const [maxSeconds, setMaxSeconds] = useState(60);
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator", error: false });
   const [busy, setBusy] = useState(false);
+  const socket = useRef<WebSocket | null>(null);
+  const cameraRef = useRef(camera);
 
-  const refresh = useCallback(async () => {
-    const data = await api<{ placed: SceneObject[] }>("/api/objects");
-    setObjects(data.placed);
-    setFrame((value) => value + 1);
+  useEffect(() => {
+    let closed = false;
+    let retry = 0;
+    let url = "";
+    let frames = 0;
+    const meter = window.setInterval(() => {
+      setFps(frames);
+      frames = 0;
+    }, 1000);
+
+    const connect = () => {
+      const protocol = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${protocol}://${location.host}/ws/live`);
+      ws.binaryType = "blob";
+      socket.current = ws;
+      ws.onopen = () => {
+        setConnected(true);
+        ws.send(JSON.stringify({ camera: cameraRef.current }));
+      };
+      ws.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          setLive(JSON.parse(event.data));
+          return;
+        }
+        frames += 1;
+        const next = URL.createObjectURL(event.data);
+        if (url) URL.revokeObjectURL(url);
+        url = next;
+        setFrameUrl(next);
+      };
+      ws.onclose = () => {
+        setConnected(false);
+        if (!closed) retry = window.setTimeout(connect, 1000);
+      };
+    };
+    connect();
+    return () => {
+      closed = true;
+      window.clearTimeout(retry);
+      window.clearInterval(meter);
+      socket.current?.close();
+      if (url) URL.revokeObjectURL(url);
+    };
   }, []);
 
-  const run = useCallback(
-    async (label: string, action: () => Promise<unknown>) => {
-      setBusy(true);
-      try {
-        await action();
-        await refresh();
-        setStatus({ text: label, error: false });
-      } catch (error) {
-        setStatus({ text: error instanceof Error ? error.message : String(error), error: true });
-      } finally {
-        setBusy(false);
-      }
-    },
-    [refresh],
-  );
+  const run = useCallback(async (label: string, action: () => Promise<unknown>) => {
+    setBusy(true);
+    try {
+      await action();
+      setStatus({ text: label, error: false });
+    } catch (error) {
+      setStatus({ text: error instanceof Error ? error.message : String(error), error: true });
+    } finally {
+      setBusy(false);
+    }
+  }, []);
 
   useEffect(() => {
     run("Connected to the real local MuJoCo simulator", async () => {
@@ -68,9 +136,19 @@ export default function App() {
     });
   }, [run]);
 
+  const chooseCamera = (name: string) => {
+    cameraRef.current = name;
+    setCamera(name);
+    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ camera: name }));
+  };
+
+  const objects = live?.objects ?? [];
+  const task = live?.task ?? null;
+  const running = task?.status === "RUNNING";
+  const locked = busy || running;
   const position = { x: pose.x, y: pose.y, z: pose.z };
   const selectObject = (object: SceneObject) => {
-    if (!object.movable) return;
+    if (!object.movable || running) return;
     setSelected(object.object_id);
     setPose((value) => ({ ...value, x: object.position[0], y: object.position[1], z: object.position[2] }));
   };
@@ -82,6 +160,7 @@ export default function App() {
         type="number"
         step={step}
         value={pose[key]}
+        disabled={running}
         onChange={(event) => setPose({ ...pose, [key]: Number(event.target.value) })}
       />
     </label>
@@ -90,21 +169,32 @@ export default function App() {
   return (
     <main>
       <h1>Dream Labs Integration Test</h1>
-      <p className="note">Real local Dream YAM Sim state. The hosted Playground is not embedded or controlled.</p>
+      <p className="note">Live view of the real local Dream YAM Sim. The hosted Playground is not embedded or controlled.</p>
       <div className="layout">
         <section>
           <div className="panel">
-            <div className="cameras">
-              {["top", "left", "right"].map((name) => (
-                <button key={name} className={camera === name ? "active" : ""} onClick={() => setCamera(name)}>
-                  {name}
-                </button>
-              ))}
+            <div className="stream-bar">
+              <div className="cameras">
+                {["top", "left", "right"].map((name) => (
+                  <button key={name} className={camera === name ? "active" : ""} onClick={() => chooseCamera(name)}>
+                    {name}
+                  </button>
+                ))}
+              </div>
+              <div className="live-status" role="status">
+                <span className={`dot ${connected ? "on" : ""}`} />
+                {connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting"}
+                <span className="muted">{connected ? `${fps} FPS` : ""}</span>
+              </div>
             </div>
-            <img className="main-view" alt={`${camera} simulator camera`} src={`/api/frame/${camera}?v=${frame}`} />
+            {frameUrl ? (
+              <img className="main-view" alt={`Live ${camera} simulator camera`} src={frameUrl} />
+            ) : (
+              <div className="main-view" />
+            )}
           </div>
           <div className="panel">
-            <h2>Scene state from simulator</h2>
+            <h2>Live scene state from simulator <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
             <table>
               <thead>
                 <tr><th>Object</th><th>Position (m)</th><th>Orientation (wxyz)</th><th>Type</th></tr>
@@ -143,20 +233,35 @@ export default function App() {
             <h2>Object controls {selected && `: ${selected}`}</h2>
             <div className="row">{field("x", "0.01")}{field("y", "0.01")}{field("z", "0.01")}{field("yaw", "5")}</div>
             <div className="row">
-              <button disabled={busy} onClick={() => run("Added a block", () => api("/api/objects/add", { type: "block", position }))}>Add block</button>
-              <button disabled={busy || !selected} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
-              <button disabled={busy || !selected} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
-              <button disabled={busy || !selected} onClick={() => run(`Removed ${selected}`, async () => { await api("/api/objects/remove", { object_id: selected }); setSelected(""); })}>Remove</button>
-              <button disabled={busy} onClick={() => run("Scene reset", async () => { await api("/api/scene/reset", {}); setSelected(""); })}>Reset</button>
+              <button disabled={locked} onClick={() => run("Added a block", () => api("/api/objects/add", { type: "block", position }))}>Add block</button>
+              <button disabled={locked || !selected} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
+              <button disabled={locked || !selected} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
+              <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, async () => { await api("/api/objects/remove", { object_id: selected }); setSelected(""); })}>Remove</button>
+              <button disabled={locked} onClick={() => run("Scene reset", async () => { await api("/api/scene/reset", {}); setSelected(""); })}>Reset</button>
             </div>
           </div>
           <div className="panel">
             <h2>Task</h2>
-            <textarea aria-label="Task instruction" rows={2} value={instruction} onChange={(event) => setInstruction(event.target.value)} />
+            <textarea aria-label="Task instruction" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
+            <label style={{ marginTop: 8 }}>Time limit (seconds)
+              <input aria-label="Time limit" type="number" min={5} max={120} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
+            </label>
             <div className="row" style={{ marginTop: 8 }}>
-              <button className="primary" disabled={busy || !instruction.trim()} onClick={() => run("Task started", () => api("/api/tasks/execute", { instruction }))}>Execute task</button>
+              {running ? (
+                <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop task</button>
+              ) : (
+                <button className="primary" disabled={busy || !connected || !instruction.trim()} onClick={() => run("Task started", () => api("/api/tasks/execute", { instruction, max_seconds: maxSeconds }))}>
+                  Execute task (uses credits)
+                </button>
+              )}
             </div>
-            <div role="status" className={`status ${status.error ? "error" : ""}`}>{status.text}</div>
+            {task && (
+              <div className={`status ${task.status === "FAILED" ? "error" : ""}`}>
+                <strong>{TASK_LABEL[task.status]}</strong>: {task.instruction}
+                {task.error && <div>{task.error}</div>}
+              </div>
+            )}
+            <div className={`status spaced ${status.error ? "error" : ""}`}>{status.text}</div>
           </div>
         </aside>
       </div>
