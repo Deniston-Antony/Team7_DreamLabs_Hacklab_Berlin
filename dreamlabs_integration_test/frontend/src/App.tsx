@@ -18,6 +18,21 @@ type Task = {
   error: string | null;
   outcome: "SUCCESS" | "FAILURE" | "NOT_EVALUATED" | null;
   result_message: string | null;
+  attempts: number;
+  videos: string[];
+  attempt_results?: AttemptResult[];
+  attempts_succeeded?: number;
+  attempts_note?: string;
+  attempts_error?: string;
+  waiting_for_attempts?: boolean;
+};
+type AttemptResult = {
+  attempt: number;
+  where: "live" | "hidden";
+  success: boolean;
+  sim_seconds: number | null;
+  closest_cm?: number | null;
+  error?: string | null;
 };
 type Live = {
   phase: "idle" | "running" | "waiting_for_dream";
@@ -38,6 +53,7 @@ type Point = { camera: string; u: number; v: number };
 const CAMERAS = ["top", "left", "right", "free"];
 const CAMERA_LABEL: Record<string, string> = { top: "top", left: "left", right: "right", free: "3D view" };
 const MAX_TASK_SECONDS = 200;
+const MAX_ATTEMPTS = 8;
 const FRAME_WIDTH = 640;
 const FRAME_HEIGHT = 360;
 
@@ -77,6 +93,42 @@ function clock(seconds: number) {
   return `${String(Math.floor(whole / 60)).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}`;
 }
 
+function AttemptsPanel({ task }: { task: Task }) {
+  if (task.waiting_for_attempts) {
+    return <div className="attempts">Live attempt finished. Waiting for the {task.attempts - 1} hidden attempts...</div>;
+  }
+  if (task.status === "RUNNING") return null;
+  const results = task.attempt_results ?? [];
+  const play = task.videos.includes("grid") ? "grid" : task.videos[0];
+  if (!results.length && !play && !task.attempts_note && !task.attempts_error) return null;
+  return (
+    <div className="attempts" aria-label="Attempts">
+      {results.length > 0 && (
+        <>
+          <strong>{task.attempts_succeeded} of {task.attempts} attempts succeeded</strong>
+          <ul>
+            {results.map((r) => (
+              <li key={r.attempt}>
+                Attempt {r.attempt} ({r.where}): {r.success ? `✓ ${r.sim_seconds ?? "?"} s` : r.error ? `✗ ${r.error}` : r.closest_cm != null ? `✗ closest ${r.closest_cm} cm` : "✗"}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {task.attempts_note && <div>{task.attempts_note}</div>}
+      {task.attempts_error && <div>Videos or attempts failed: {task.attempts_error}</div>}
+      {play && <video controls loop src={`/api/tasks/${task.task_id}/video/${play}`} style={{ width: "100%" }} />}
+      {task.videos.length > 0 && (
+        <div>
+          {task.videos.map((name) => (
+            <a key={name} href={`/api/tasks/${task.task_id}/video/${name}`} target="_blank" rel="noreferrer" style={{ marginRight: 8 }}>{name}</a>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [scenes, setScenes] = useState<Option[]>([]);
   const [robots, setRobots] = useState<Option[]>([]);
@@ -95,6 +147,7 @@ export default function App() {
   const [uploadKey, setUploadKey] = useState(0);
   const [instruction, setInstruction] = useState("put apple into the bowl");
   const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
+  const [attempts, setAttempts] = useState(1);
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
@@ -541,6 +594,9 @@ export default function App() {
             <label style={{ marginTop: 8 }}>Time limit (seconds)
               <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
             </label>
+            <label style={{ marginTop: 8 }}>Attempts at once (each uses credits)
+              <input aria-label="Attempts" type="number" min={1} max={MAX_ATTEMPTS} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)))} />
+            </label>
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
@@ -548,7 +604,7 @@ export default function App() {
               {running ? (
                 <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop task</button>
               ) : (
-                <button className="primary" disabled={locked || !connected || !instruction.trim()} onClick={() => run("Task started", () => api("/api/tasks/execute", { instruction, max_seconds: maxSeconds }))}>
+                <button className="primary" disabled={locked || !connected || !instruction.trim()} onClick={() => run("Task started", () => api("/api/tasks/execute", { instruction, max_seconds: maxSeconds, attempts }))}>
                   Execute task (uses credits)
                 </button>
               )}
@@ -559,6 +615,7 @@ export default function App() {
                 {task.error && <div>{task.error}</div>}
               </div>
             )}
+            {task && <AttemptsPanel task={task} />}
             <div className={`status spaced ${status.error ? "error" : ""}`}>{status.text}</div>
           </div>
         </aside>

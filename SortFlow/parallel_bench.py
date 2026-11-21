@@ -26,7 +26,7 @@ STAGGER_S = 1.0  # seconds between the first workers' starts, so they do not ope
 HERE = Path(__file__).resolve().parent
 
 
-def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, model=None, video=None):
+def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, model=None, video=None, scene=None, goal=None):
     """Run one trial in this process: up to `tries` attempts, each from a reset scene.
     @param task The prompt, such as "put orange into the bowl"; it must name an item and a bowl or plate.
     @param seconds Wall-clock limit per attempt.
@@ -36,21 +36,42 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
     @param retry_pause Seconds to wait before re-asking after a retryable refusal without a stated wait.
     @param model Model id for dream_control's --model; None uses its default.
     @param video Path of an MP4 to write the top camera to; None records nothing.
+    @param scene (model_path, state_path) of a scene to start every attempt from: a compiled MuJoCo model saved with
+        mujoco.mj_saveModel and an .npz of its qpos, qvel and ctrl. None uses the default Dream YAM scene.
+    @param goal (body_name, target) judged by the website's contact rule, for any body in the scene; None parses the
+        task text and uses SortFlow's zone rule for apple, orange, banana and bottle.
     @return The trial's record: success, the attempt it succeeded on, simulated seconds, wall seconds and any error.
     """
     import dream_control
-    from sortflow import SuccessWatcher, parse_task
+    from sortflow import GoalWatcher, SuccessWatcher, parse_task
     from yam_env import YamEnv
 
-    spec = parse_task(task)
+    spec = goal or parse_task(task)
     if spec is None:
         raise ValueError(f"The task must name an item and a bowl or plate: {task!r}")
     item, target = spec
+    Watcher = GoalWatcher if goal else SuccessWatcher
     runner = runner or dream_control.main
     argv = ["--task", task, "--headless", "--quiet", "--seconds", str(seconds), "--actions", str(actions)]
     if model:
         argv += ["--model", model]
     env = YamEnv()
+    reset = env.reset
+    if scene:
+        import mujoco
+        import numpy as np
+
+        env.model = mujoco.MjModel.from_binary_path(str(scene[0]))
+        env.data = mujoco.MjData(env.model)
+        start = np.load(scene[1])
+
+        def reset():
+            """Put the scene back exactly as it was when the task was submitted."""
+            env.data.qpos[:] = start["qpos"]
+            env.data.qvel[:] = start["qvel"]
+            env.data.ctrl[:] = start["ctrl"]
+            mujoco.mj_forward(env.model, env.data)
+
     recording = None
     if video:
         from recording import attach
@@ -61,11 +82,11 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
     started = time.monotonic()
     try:
         for attempt in range(1, tries + 1):
-            env.reset()
+            reset()
             record["tries_used"] = attempt
             for refusals in range(3):  # a retryable refusal (no capacity, say) is asked again, at most twice
                 done = threading.Event()
-                watcher = SuccessWatcher(env, item, target, done)
+                watcher = Watcher(env, item, target, done)
                 watcher.start()
                 error = None
                 try:
@@ -78,7 +99,7 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
                     if getattr(exc, "retryable", False) and refusals < 2:
                         watcher.stop.set()
                         watcher.join(timeout=2)
-                        env.reset()
+                        reset()
                         time.sleep(wait)
                         continue
                 finally:
@@ -102,8 +123,10 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
 
 def worker_main(args):
     """Entry point of a worker process: run one trial and print its record as the last line."""
+    scene = (args.scene_model, args.scene_state) if args.scene_model and args.scene_state else None
+    goal = (args.goal_object, args.goal_target) if args.goal_object and args.goal_target else None
     try:
-        record = run_worker(args.task, args.seconds, args.actions, args.tries, model=args.model, video=args.record)
+        record = run_worker(args.task, args.seconds, args.actions, args.tries, model=args.model, video=args.record, scene=scene, goal=goal)
     except Exception as exc:
         record = {"task": args.task, "success": False, "error": f"{type(exc).__name__}: {exc}"}
     print(RESULT + json.dumps(record), flush=True)
@@ -216,6 +239,10 @@ def main(argv=None):
     parser.add_argument("--out", default="sortflow_results")
     parser.add_argument("--model", default=None, help="model id for a worker; the default model when omitted")
     parser.add_argument("--record", default=None, help="MP4 path for a worker's top camera")
+    parser.add_argument("--scene-model", default=None, help="compiled MuJoCo model (.mjb) a worker starts from")
+    parser.add_argument("--scene-state", default=None, help=".npz with that scene's qpos, qvel and ctrl")
+    parser.add_argument("--goal-object", default=None, help="body name to judge with the website's contact rule")
+    parser.add_argument("--goal-target", default=None, choices=["bowl", "plate"], help="target for --goal-object")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not (

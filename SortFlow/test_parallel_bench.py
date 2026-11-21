@@ -107,6 +107,47 @@ class ParallelBenchTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(record["tries_used"], 1)
 
+    def test_a_worker_starts_from_a_saved_scene(self):
+        """With a scene given, every attempt starts from that model and state, not from the default scene."""
+        from yam_env import YamEnv
+
+        source = YamEnv()
+        try:
+            source.data.joint("apple_free").qpos[:3] = [0.12, 0.10, 0.80]
+            mujoco.mj_forward(source.model, source.data)
+            folder = tempfile.mkdtemp()
+            mujoco.mj_saveModel(source.model, f"{folder}/scene.mjb")
+            np.savez(f"{folder}/scene.npz", qpos=source.data.qpos, qvel=source.data.qvel, ctrl=source.data.ctrl)
+        finally:
+            source.close()
+        seen = []
+
+        def runner(argv, shared_env=None, stop_event=None, **kw):
+            seen.append(round(float(shared_env.data.body("apple").xpos[0]), 2))
+
+        parallel_bench.run_worker(
+            "put apple into the bowl", 5, 48, 1, runner=runner, scene=(f"{folder}/scene.mjb", f"{folder}/scene.npz")
+        )
+        self.assertEqual(seen, [0.12])
+
+    def test_a_worker_judges_by_the_websites_contact_rule_when_given_a_goal(self):
+        """With a goal body and target, the worker uses the contact rule, so any body in the scene can be judged."""
+        home = np.r_[np.zeros(6), 1.0]
+
+        def runner(argv, shared_env=None, stop_event=None, **kw):
+            shared_env.data.joint("apple_free").qpos[:3] = [0.0, -0.04, 0.86]
+            mujoco.mj_forward(shared_env.model, shared_env.data)
+            for _ in range(200):  # ten simulated seconds, ended early on success
+                if stop_event.is_set():
+                    return
+                shared_env.step(home, home)
+                shared_env.images()  # dream_control renders after every step, which is when the goal is checked
+                time.sleep(0.003)
+
+        record = parallel_bench.run_worker("anything", 20, 48, 1, runner=runner, goal=("apple", "bowl"))
+        self.assertTrue(record["success"])
+        self.assertEqual(record["success_try"], 1)
+
     def test_the_last_line_is_the_record(self):
         """A worker's record is parsed from its last RESULT line, whatever the model printed before it."""
         line = "RESULT " + json.dumps({"success": True})

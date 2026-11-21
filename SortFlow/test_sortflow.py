@@ -7,7 +7,7 @@ import unittest
 import mujoco
 import numpy as np
 
-from sortflow import BODIES, TARGETS, SuccessWatcher, is_inside, parse_task
+from sortflow import BODIES, TARGETS, GoalWatcher, SuccessWatcher, contact_goal_reached, is_inside, parse_task
 from yam_env import YamEnv
 
 
@@ -67,6 +67,50 @@ class SortflowTest(unittest.TestCase):
         finally:
             watcher.stop.set()
             watcher.join(timeout=2)
+
+    def test_the_contact_rule_needs_the_item_to_touch_the_target_and_settle(self):
+        """The website's rule: in the bowl and touching it counts; held in the air above it does not."""
+        self.env.data.joint("apple_free").qpos[:3] = [0.0, -0.04, 0.95]
+        mujoco.mj_forward(self.env.model, self.env.data)
+        self.assertFalse(contact_goal_reached(self.env, "apple", "bowl"))
+        self.drop("apple", 0.0, -0.04, 0.86)
+        for _ in range(80):  # let it settle
+            self.env.step(self.home, self.home)
+        self.assertTrue(contact_goal_reached(self.env, "apple", "bowl"))
+        self.assertFalse(contact_goal_reached(self.env, "apple", "plate"))
+        self.assertFalse(contact_goal_reached(self.env, "no_such_body", "bowl"))
+
+    def test_goal_watcher_fires_after_the_settled_frames(self):
+        """GoalWatcher sets done once the apple has rested in the bowl for 30 rendered frames, every time."""
+        for _ in range(3):  # a race in the first version made this pass only about half the time
+            env = YamEnv()
+            try:
+                done = threading.Event()
+                watcher = GoalWatcher(env, "apple", "bowl", done)
+                watcher.start()
+                env.data.joint("apple_free").qpos[:3] = [0.0, -0.04, 0.86]
+                mujoco.mj_forward(env.model, env.data)
+                for _ in range(120):
+                    env.step(self.home, self.home)
+                    env.images()
+                self.assertTrue(done.is_set())
+                self.assertIsNotNone(watcher.success_time)
+                watcher.join()
+                self.assertNotIn("images", env.__dict__, "the environment's own images() is back")
+            finally:
+                env.close()
+
+    def test_goal_watcher_stays_quiet_when_the_item_is_elsewhere(self):
+        """An untouched scene never counts as success, and the closest distance is recorded."""
+        done = threading.Event()
+        watcher = GoalWatcher(self.env, "orange", "bowl", done)
+        watcher.start()
+        for _ in range(60):
+            self.env.step(self.home, self.home)
+            self.env.images()
+        watcher.join()
+        self.assertFalse(done.is_set())
+        self.assertGreater(watcher.min_distance, 0.1)
 
     def test_task_wording(self):
         """Tasks name an item and a target in ordinary words, and anything else is left unchecked."""

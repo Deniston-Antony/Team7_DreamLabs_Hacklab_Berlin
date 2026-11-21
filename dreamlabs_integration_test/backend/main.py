@@ -14,12 +14,13 @@ import dream_ik
 import mujoco
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(list(dream_examples.__path__)[0]) / "yam_mujoco"))
 import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
+import outcome  # noqa: E402
 
 DEFAULT_SCENE = "yam_tabletop"
 ROBOT_ID = "yam"
@@ -751,6 +752,7 @@ class ViewPoint(BaseModel):
 class ExecuteTask(BaseModel):
     instruction: str = Field(min_length=1, max_length=500)
     max_seconds: int = Field(default=MAX_TASK_SECONDS, ge=5, le=MAX_TASK_SECONDS)
+    attempts: int = Field(default=1, ge=1, le=outcome.MAX_ATTEMPTS)
 
 
 # MuJoCo rendering contexts are thread-bound, so all simulator work stays on one thread.
@@ -794,7 +796,9 @@ def run_task(task, stop):
         goal = None
     if goal:
         sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
+    session = None
     try:
+        session = outcome.Session(task, sim.env, goal)
         dc.main(
             [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
             shared_env=sim.env,
@@ -820,6 +824,12 @@ def run_task(task, stop):
         result["error"] = f"{type(error).__name__}: {error}"
     finally:
         sim.goal = None
+        try:
+            if session is not None:
+                session.finish(result)
+        except Exception as error:  # a video or hidden-attempt problem must not leave the task stuck as running
+            result["attempts_error"] = f"{type(error).__name__}: {error}"
+        task["waiting_for_attempts"] = False
         finished_at = time.time()
         sim.publish()
         active_task = None
@@ -1030,6 +1040,8 @@ async def execute_task(body: ExecuteTask):
         "error": None,
         "outcome": None,
         "result_message": None,
+        "attempts": body.attempts,
+        "videos": [],
     }
     tasks[task["task_id"]] = task
     active_task = task
@@ -1051,8 +1063,17 @@ def cancel_task(task_id: str):
         raise HTTPException(404, "unknown task")
     if active_task is None or active_task["task_id"] != task_id:
         raise HTTPException(409, "This task is not running.")
+    tasks[task_id]["cancel_requested"] = True
     active_stop.set()
     return tasks[task_id]
+
+
+@app.get("/api/tasks/{task_id}/video/{clip}")
+def task_video(task_id: str, clip: str):
+    path = outcome.VIDEOS / task_id / f"{clip}.mp4"
+    if task_id not in tasks or not outcome.CLIP.match(clip) or not path.is_file():
+        raise HTTPException(404, "no such video")
+    return FileResponse(path, media_type="video/mp4")
 
 
 @app.websocket("/ws/live")

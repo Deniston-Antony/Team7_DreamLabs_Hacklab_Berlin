@@ -9,6 +9,7 @@ import re
 import threading
 import time
 
+import mujoco
 import numpy as np
 
 # Where an item must end up. Geometry comes from yam_env.py: bowl centre (0, -.04) with a 76 mm inner radius at
@@ -87,3 +88,97 @@ class SuccessWatcher(threading.Thread):
             else:
                 self._since = None
             time.sleep(0.1)
+
+
+# The website backend's rule (dreamlabs_integration_test/backend/main.py, SimAdapter.goal_reached), for any body: the
+# item's centre within GOAL_RADIUS_M of the target's centre, nearly still, touching the target and no gripper, for
+# GOAL_SETTLED_FRAMES rendered frames in a row (30 control steps, 1.5 simulated seconds). Hidden attempts use it so
+# they judge success as the live one does.
+GOAL_RADIUS_M = {"bowl": 0.08, "plate": 0.07}
+GOAL_SPEED_M_S = 0.03
+GOAL_SETTLED_FRAMES = 30
+
+
+def contact_goal_reached(env, name, target):
+    """Whether a body currently meets the website's goal rule for a target.
+    @param env Simulation environment.
+    @param name The item's body name, such as "apple" or "stl_cup".
+    @param target `bowl` or `plate`.
+    @return True when the item is within the target's radius, nearly still, touching the target and no gripper.
+    """
+    model, data = env.model, env.data
+    body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+    if body < 0 or model.body_dofnum[body] != 6 or model.body_jntnum[body] != 1:
+        return False
+    offset = np.linalg.norm(data.body(name).xpos[:2] - data.body(target).xpos[:2])
+    dof = model.body_dofadr[body]
+    if offset >= GOAL_RADIUS_M[target] or np.linalg.norm(data.qvel[dof : dof + 3]) >= GOAL_SPEED_M_S:
+        return False
+    touches_target = False
+    for contact in data.contact[: data.ncon]:
+        names = {model.body(model.geom_bodyid[contact.geom1]).name, model.body(model.geom_bodyid[contact.geom2]).name}
+        if name not in names:
+            continue
+        other = next(iter(names - {name}), "")
+        if other.startswith(("left_", "right_")):
+            return False
+        touches_target = touches_target or other == target
+    return touches_target
+
+
+class GoalWatcher:
+    """Like SuccessWatcher, but with the website's contact rule, for any body in the scene.
+
+    It checks inside the simulation's own render step (dream_control.capture calls env.images() after every control
+    step), as the website backend does, so it never reads the scene while another thread is stepping it.
+    """
+
+    def __init__(self, env, name, target, done):
+        """Create the watcher; call start() to begin and join() to finish.
+        @param env Simulation environment.
+        @param name The item's body name.
+        @param target `bowl` or `plate`.
+        @param done threading.Event set on success.
+        """
+        self.env, self.name, self.target, self.done = env, name, target, done
+        self.stop = threading.Event()  # kept so callers can treat it like SuccessWatcher; checking ends at join()
+        self.success_time = None  # simulated seconds from start(); None until it succeeds
+        self.min_distance = float("inf")  # closest the item's centre came to the target's, metres
+        self._frames = 0
+        self._start_time = 0.0
+        self._inner = None
+        self._wrapped_before = False
+
+    def start(self):
+        """Begin checking after every rendered frame."""
+        self._start_time = self.env.data.time
+        self._wrapped_before = "images" in self.env.__dict__  # another wrapper (a recording) may already be there
+        self._inner = self.env.images
+
+        def images():
+            result = self._inner()
+            self._check()
+            return result
+
+        self.env.images = images
+
+    def _check(self):
+        if self.success_time is not None:
+            return
+        data = self.env.data
+        self.min_distance = min(
+            self.min_distance, float(np.linalg.norm(data.body(self.name).xpos[:2] - data.body(self.target).xpos[:2]))
+        )
+        self._frames = self._frames + 1 if contact_goal_reached(self.env, self.name, self.target) else 0
+        if self._frames >= GOAL_SETTLED_FRAMES:
+            self.success_time = data.time - self._start_time
+            self.done.set()
+
+    def join(self, timeout=None):
+        """Stop checking and give the environment the images() it had before start()."""
+        if self._inner is not None:
+            if self._wrapped_before:
+                self.env.images = self._inner
+            else:
+                self.env.__dict__.pop("images", None)
+            self._inner = None
