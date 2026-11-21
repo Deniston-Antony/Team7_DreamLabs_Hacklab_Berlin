@@ -22,4 +22,11 @@ tr.selected { background: #e8f0fc; }
 tr[data-movable="true"] { cursor: pointer; }
 .status { padding: 8px; border-radius: 5px; background: #eef1f3; overflow-wrap: anywhere; }
 .status.error { background: #fdecea; color: #8a1f17; }
+.status.spaced { margin-top: 6px; }
+.stream-bar { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.live-status { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: #b23b32; }
+.dot.on { background: #2e9b57; }
+.muted { color: #6b747c; font-weight: 400; }
+button.danger { background: #b23b32; border-color: #b23b32; color: #fff; }
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
