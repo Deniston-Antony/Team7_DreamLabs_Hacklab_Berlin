@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent } from "react";
-import { BatchPanel, TaskReportPanel } from "./EvaluationPanels";
+import { ReportsCenter } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
 
 type SceneObject = {
@@ -525,10 +525,7 @@ export default function App() {
             </p>
           </div>
           {task && <AttemptsPanel key={task.task_id} task={task} />}
-          {task && task.status !== "RUNNING" && (
-            <TaskReportPanel key={`report-${task.task_id}`} taskId={task.task_id} evaluation={task.evaluation} error={task.evaluation_error} />
-          )}
-          <BatchPanel refresh={task?.evaluation ? task.task_id : ""} locked={running} />
+          <ReportsCenter latestRunId={task?.evaluation ? task.task_id : ""} error={task?.evaluation_error} locked={running} />
           <div className="panel">
             <h2>Live scene state from simulator <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
             <table>

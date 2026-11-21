@@ -27,7 +27,18 @@ STAGGER_S = 1.0  # seconds between the first workers' starts, so they do not ope
 HERE = Path(__file__).resolve().parent
 
 
-def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, model=None, video=None, scene=None, goal=None):
+def write_evidence(capture, path, record):
+    """Save a hidden attempt's simulator evidence for the website's evaluator; a failure here never ends the trial."""
+    error = str(record.get("error") or "")
+    status = "COMPLETED" if record["success"] else "CANCELLED" if error == "exit 143" else "FAILED" if error else "TIMED_OUT"
+    proof = capture.finish("pending", status, [error] if error and status == "FAILED" else [], [], [])
+    temporary = f"{path}.tmp"
+    with open(temporary, "w") as handle:
+        handle.write(proof.model_dump_json())
+    os.replace(temporary, path)
+
+
+def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, model=None, video=None, scene=None, goal=None, evidence=None):
     """Run one trial in this process: up to `tries` attempts, each from a reset scene.
     @param task The prompt, such as "put orange into the bowl"; it must name an item and a bowl or plate.
     @param seconds Wall-clock limit per attempt.
@@ -78,12 +89,37 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
         from recording import attach
 
         recording = attach(env, video)
+    capture = None
     record = {"task": task, "success": False, "success_try": None, "tries_used": 0, "sim_seconds": None, "error": None}
     closest = float("inf")
     started = time.monotonic()
     try:
         for attempt in range(1, tries + 1):
             reset()
+            if evidence and capture is None:
+                try:
+                    from evaluation.evidence import EvidenceCapture
+
+                    capture = EvidenceCapture(env, evidence[1], (dream_control.FRAMES - 1) * dream_control.FRAME_EVERY_STEPS + 1)
+                    rendered = env.images
+
+                    def images():
+                        result = rendered()
+                        capture.on_step()
+                        return result
+
+                    env.images = images
+                    opened = dream_control.open_policy
+
+                    def open_policy(config, key):
+                        client = opened(config, key)
+                        capture.watch_model_calls(client)
+                        return client
+
+                    dream_control.open_policy = open_policy
+                except Exception as exc:
+                    capture = None
+                    print(f"Evidence capture unavailable: {exc}", file=sys.stderr, flush=True)
             record["tries_used"] = attempt
             for refusals in range(3):  # a retryable refusal (no capacity, say) is asked again, at most twice
                 done = threading.Event()
@@ -114,6 +150,11 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
             if record["success"] or record["error"]:
                 break
     finally:
+        if capture:
+            try:
+                write_evidence(capture, evidence[0], record)
+            except Exception as exc:
+                print(f"Evidence could not be saved: {exc}", file=sys.stderr, flush=True)
         if recording:
             recording.close()
         env.close()
@@ -128,8 +169,9 @@ def worker_main(args):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     scene = (args.scene_model, args.scene_state) if args.scene_model and args.scene_state else None
     goal = (args.goal_object, args.goal_target) if args.goal_object and args.goal_target else None
+    evidence = (args.evidence, args.evidence_objects.split(",")) if args.evidence and args.evidence_objects else None
     try:
-        record = run_worker(args.task, args.seconds, args.actions, args.tries, model=args.model, video=args.record, scene=scene, goal=goal)
+        record = run_worker(args.task, args.seconds, args.actions, args.tries, model=args.model, video=args.record, scene=scene, goal=goal, evidence=evidence)
     except Exception as exc:
         record = {"task": args.task, "success": False, "error": f"{type(exc).__name__}: {exc}"}
     print(RESULT + json.dumps(record), flush=True)
@@ -246,6 +288,8 @@ def main(argv=None):
     parser.add_argument("--scene-state", default=None, help=".npz with that scene's qpos, qvel and ctrl")
     parser.add_argument("--goal-object", default=None, help="body name to judge with the website's contact rule")
     parser.add_argument("--goal-target", default=None, choices=["bowl", "plate"], help="target for --goal-object")
+    parser.add_argument("--evidence", default=None, help="JSON path for a worker's simulator evidence")
+    parser.add_argument("--evidence-objects", default=None, help="comma-separated scene objects to record")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not (

@@ -37,7 +37,7 @@ WORKER_EXIT_S = 10  # how long a stopped worker gets to finish its video
 class Workers:
     """Headless attempts of one task, started one after another and collected at the end."""
 
-    def __init__(self, task, env, goal, folder, count):
+    def __init__(self, task, env, goal, folder, count, objects=None):
         """Save the scene and start `count` workers in the background.
         @param task The task dictionary: instruction and max_seconds.
         @param env Simulation environment whose current scene the workers copy.
@@ -45,7 +45,7 @@ class Workers:
         @param folder Folder for the scene copy and the workers' videos.
         @param count How many workers; their videos are attempt-2.mp4, attempt-3.mp4, ...
         """
-        self.folder, self.count, self.procs = folder, count, []
+        self.folder, self.count, self.procs, self.objects = folder, count, [], objects
         model_path, state_path = folder / "scene.mjb", folder / "scene.npz"
         mujoco.mj_saveModel(env.model, str(model_path))
         np.savez(state_path, qpos=env.data.qpos, qvel=env.data.qvel, ctrl=env.data.ctrl)
@@ -73,12 +73,24 @@ class Workers:
         self.env = dict(os.environ)
         if sys.platform.startswith("linux"):
             self.env.setdefault("MUJOCO_GL", "egl")  # no window for a worker
+        if objects:
+            backend = Path(__file__).resolve().parent
+            paths = [str(backend), str(backend / ".deps")]
+            paths += [str(Path(item).resolve()) for item in self.env.get("PYTHONPATH", "").split(os.pathsep) if item]
+            self.env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(paths))
         self.thread = threading.Thread(target=self._launch, daemon=True)
         self.thread.start()
 
     def _launch(self):
         for index in range(self.count):
             video = ["--record", str(self.folder / f"attempt-{index + 2}.mp4")]
+            if self.objects:
+                video += [
+                    "--evidence",
+                    str(self.folder / f"attempt-{index + 2}.evidence.json"),
+                    "--evidence-objects",
+                    ",".join(self.objects),
+                ]
             self.procs.append(
                 subprocess.Popen(
                     self.command + video,
@@ -140,7 +152,7 @@ class Workers:
 class Session:
     """One task's recording and hidden attempts: start it before dc.main, call finish() after."""
 
-    def __init__(self, task, env, goal):
+    def __init__(self, task, env, goal, objects=None):
         """Start recording the live attempt and, when asked and possible, the hidden attempts.
         @param task The task dictionary (task_id, instruction, max_seconds, attempts).
         @param env The backend's simulation environment.
@@ -155,7 +167,7 @@ class Session:
             task["attempts_note"] = "Hidden attempts need an instruction the checker understands; ran one attempt."
             self.attempts = 1
         elif self.attempts > 1:
-            self.workers = Workers(task, env, goal, self.folder, self.attempts - 1)
+            self.workers = Workers(task, env, goal, self.folder, self.attempts - 1, objects)
         self.recorder = recording.attach(env, self.folder / "attempt-1.mp4")
         self.started = env.data.time
 

@@ -6,11 +6,11 @@ import time
 import uuid
 from pathlib import Path
 
-from .batch import aggregate
+from .batch import aggregate, summarize_run
 from .config import DEFAULT_CONFIG, ScoringConfig
 from .evaluator import evaluate_task
 from .models import Evidence, TaskDefinition, TaskResult
-from .reports import task_report
+from .reports import run_report, task_report
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -83,16 +83,47 @@ class EvaluationStore:
             self.current_batch = f"batch-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
             return self.current_batch
 
+    def _run_records(self, run_id: str):
+        return sorted(
+            (record for record in self.records.values() if record[0].run == run_id),
+            key=lambda record: record[0].attempt,
+        )
+
+    def has_run(self, run_id: str) -> bool:
+        with self.lock:
+            return any(record[0].run == run_id for record in self.records.values())
+
+    def run_report(self, run_id: str):
+        with self.lock:
+            records = self._run_records(run_id)
+        if not records:
+            return None
+        summary = summarize_run([(task, result, evidence.execution_status) for task, evidence, result in records])
+        grid = any("grid" in (evidence.run_videos or evidence.videos) for _, evidence, _ in records)
+        return run_report(summary, [task_report(*record) for record in records], f"/api/tasks/{run_id}/video/grid" if grid else None)
+
     def batches(self):
         with self.lock:
-            counts: dict[str, int] = {}
-            for task_id in self.order:
-                batch = self.records[task_id][0].batch_id
-                counts[batch] = counts.get(batch, 0) + 1
-            return {
-                "current_batch": self.current_batch,
-                "batches": [{"batch_id": name, "tasks": count} for name, count in counts.items()],
-            }
+            names = list(dict.fromkeys(self.records[task_id][0].batch_id for task_id in self.order))
+            if self.current_batch not in names:
+                names.append(self.current_batch)
+            output = []
+            for name in names:
+                report = self.batch_report(name)
+                output.append(
+                    {
+                        "batch_id": name,
+                        "is_current": name == self.current_batch,
+                        "first_started_at": report["first_started_at"],
+                        "last_started_at": report["last_started_at"],
+                        "runs": report["total_runs"],
+                        "attempts": report["total_tasks"],
+                        "successful": report["successful"],
+                        "batch_score": report["batch_score"],
+                    }
+                )
+            output.sort(key=lambda item: (item["is_current"], item["last_started_at"] or 0), reverse=True)
+            return {"current_batch": self.current_batch, "batches": output}
 
     def batch_report(self, batch_id: str):
         with self.lock:

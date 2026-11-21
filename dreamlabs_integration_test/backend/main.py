@@ -821,24 +821,53 @@ def task_definition(task):
         unresolved=parsed.unresolved,
         max_duration_seconds=task["max_seconds"],
         started_at=task["started_at"],
+        run_id=task["task_id"],
     )
+
+
+def hidden_evidence(task, number, record, folder):
+    path = folder / f"attempt-{number}.evidence.json"
+    attempt_id = f"{task['task_id']}-a{number}"
+    try:
+        proof = evaluation.Evidence.model_validate_json(path.read_text())
+        proof.task_id = attempt_id
+    except (OSError, ValueError):
+        status = "FAILED"
+        errors = [record["error"]] if record.get("error") else ["The hidden attempt did not return simulator evidence."]
+        proof = evaluation.Evidence(task_id=attempt_id, execution_status=status, errors=errors)
+    return proof
 
 
 def evaluate_run(task, definition, capture, result):
-    proof = capture.finish(
+    videos = result.get("videos", [])
+    clips = [name for name in videos if name != "grid"]
+    live = capture.finish(
         task["task_id"],
         result.get("status", "FAILED"),
         [result["error"]] if result.get("error") else [],
-        [name for name in result.get("videos", []) if name != "grid"],
+        [name for name in clips if name == "attempt-1"],
         result.get("attempt_results", []),
     )
-    scored = evaluations.submit(definition, proof)
+    live.run_videos = list(videos)
+    evaluations.submit(definition, live)
+    folder = outcome.VIDEOS / task["task_id"]
+    for record in result.get("attempt_results", []):
+        number = record["attempt"]
+        if number == 1:
+            continue
+        proof = hidden_evidence(task, number, record, folder)
+        proof.videos = [name for name in clips if name == f"attempt-{number}"]
+        proof.run_videos = list(videos)
+        attempt = definition.model_copy(update={"task_id": proof.task_id, "attempt": number, "where": "hidden"})
+        evaluations.submit(attempt, proof)
+    run = evaluations.run_report(task["task_id"])["run"]
     return {
-        "outcome": scored.outcome,
-        "score": scored.score,
-        "coverage": scored.coverage,
-        "batch_id": scored.batch_id,
-        "report_url": f"/api/reports/tasks/{scored.task_id}",
+        "outcome": run["outcome"],
+        "score": run["final_score"],
+        "coverage": 100 * run["attempts_scored"] / run["attempts_total"],
+        "batch_id": run["batch_id"],
+        "run_id": run["run_id"],
+        "report_url": f"/api/reports/runs/{run['run_id']}",
     }
 
 
@@ -862,7 +891,7 @@ def run_task(task, stop):
     except Exception as error:  # scoring must never stop the robot run
         result["evaluation_error"] = f"Evaluation could not start: {type(error).__name__}: {error}"
     try:
-        session = outcome.Session(task, sim.env, goal)
+        session = outcome.Session(task, sim.env, goal, sim.managed())
         dc.main(
             [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
             shared_env=sim.env,
@@ -1144,7 +1173,8 @@ def cancel_task(task_id: str):
 @app.get("/api/tasks/{task_id}/video/{clip}")
 def task_video(task_id: str, clip: str):
     path = outcome.VIDEOS / task_id / f"{clip}.mp4"
-    if task_id not in tasks or not outcome.CLIP.match(clip) or not path.is_file():
+    known = task_id in tasks or evaluations.has_run(task_id)
+    if not known or not outcome.CLIP.match(clip) or not path.is_file():
         raise HTTPException(404, "no such video")
     return FileResponse(path, media_type="video/mp4")
 

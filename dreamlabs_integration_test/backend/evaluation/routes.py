@@ -3,11 +3,15 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
-from .reports import batch_html, task_html
+from .reports import batch_html, run_html, task_html
 from .store import SAFE_ID, EvaluationStore
 
 SUMMARY_FIELDS = (
     "batch_id",
+    "first_started_at",
+    "last_started_at",
+    "total_runs",
+    "runs",
     "total_tasks",
     "successful",
     "partial",
@@ -65,6 +69,13 @@ def create_router(store: EvaluationStore) -> APIRouter:
         if report is None:
             raise HTTPException(404, "No report exists for this task.")
         return HTMLResponse(task_html(report)) if format == "html" else report
+
+    @router.get("/api/reports/runs/{run_id}")
+    def run(run_id: str, format: Literal["json", "html"] = Query(default="json")):
+        report = store.run_report(valid(run_id))
+        if report is None:
+            raise HTTPException(404, "No report exists for this run.")
+        return HTMLResponse(run_html(report)) if format == "html" else report
 
     @router.get("/api/reports/batches/{batch_id}")
     def batch(batch_id: str, format: Literal["json", "html"] = Query(default="json")):
