@@ -69,6 +69,7 @@ class OutcomeTest(unittest.TestCase):
     def setUp(self):
         """Every task starts from the default scene, with no saved layout."""
         main.saved_layout = None
+        outcome.clear_previews()
         self.client.post("/api/scene/reset")
 
     def tearDown(self):
@@ -369,15 +370,16 @@ class OutcomeTest(unittest.TestCase):
                 if [w["state"] for w in outcome.attempt_states()] == ["running", "running"]:
                     break
                 time.sleep(0.1)
+            workers = outcome.current.workers
             reply = self.client.post("/api/scene/reset")
             self.assertEqual(reply.status_code, 200, reply.text)
             self.assertTrue(reply.json()["stopped_task"])
+            self.assertTrue(all(proc.poll() is not None for proc in workers.procs), "no run left")
             task = self.client.get(f"/api/tasks/{task_id}/status").json()
             self.assertEqual(task["status"], "CANCELLED")
             hidden = task["attempt_results"][1]
             self.assertEqual((hidden["stopped"], hidden["error"]), (True, "stopped"))
-            self.assertEqual(outcome.attempt_states()[1]["state"], "stopped")
-            self.assertTrue(all(proc.poll() is not None for proc in outcome.current.workers.procs), "no run left")
+            self.assertEqual(outcome.attempt_states(), [], "the reset leaves only the live run in the tabs")
             self.assertIn("attempt-2", task["videos"])
             video = self.client.get(f"/api/tasks/{task_id}/video/attempt-2")
             self.assertEqual(video.status_code, 200)
@@ -413,6 +415,92 @@ class OutcomeTest(unittest.TestCase):
         self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20})
         time.sleep(0.3)
         self.assertEqual(self.client.post("/api/scene/layout").status_code, 409)
+
+    def test_reset_after_a_task_clears_the_finished_parallel_runs(self):
+        """After a task, Reset scene leaves only the live run: no tab keeps showing an old parallel run's picture."""
+        outcome.SORTFLOW = self.streaming_workers(steps=30)
+        try:
+            self.submit("put apple into the bowl", model(steps=20), attempts=2)
+            self.assertEqual(len(outcome.attempt_states()), 2, "the finished runs are listed after the task")
+            self.assertIsNotNone(outcome.worker_frame(2, "top")[1])
+            self.assertEqual(self.client.post("/api/scene/reset").status_code, 200)
+            self.assertEqual(outcome.attempt_states(), [])
+            self.assertEqual(outcome.worker_frame(2, "top"), (None, None))
+            with self.client.websocket_connect("/ws/live", headers={"origin": "http://127.0.0.1:5173"}) as ws:
+                self.assertEqual(self.receive(ws, "text")["workers"], [])
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+
+    def apple_xy(self, environment):
+        """Where the apple starts in a prepared environment."""
+        address = environment.model.jnt_qposadr[environment.model.joint("apple_free").id]
+        return np.round(environment.qpos[address : address + 2], 3).tolist()
+
+    def test_prepared_environments_shuffle_positions_and_styles_reproducibly(self):
+        """Three environments: other styles, new apple positions, the same again for the same seed, and previews."""
+        live_style = main.sim.scene_id
+        reply = self.client.post("/api/environments", json={"count": 3, "mode": "shuffle_style", "seed": 7})
+        self.assertEqual(reply.status_code, 200, reply.text)
+        described = reply.json()["environments"]
+        self.assertEqual([e["attempt"] for e in described], [2, 3, 4])
+        self.assertEqual(len({e["style"] for e in described}), 3)
+        self.assertNotIn(live_style, {e["style"] for e in described})
+        self.assertTrue(all(e["shuffled"] for e in described))
+        first = [self.apple_xy(e) for e in outcome.previews["envs"]]
+        self.assertEqual(len({tuple(xy) for xy in first}), 3, "every environment has its own layout")
+        self.assertNotIn([0.15, 0.105], first, "none is the untouched live layout")
+        self.client.post("/api/environments", json={"count": 3, "mode": "shuffle_style", "seed": 7})
+        self.assertEqual([self.apple_xy(e) for e in outcome.previews["envs"]], first, "same seed, same layouts")
+        self.client.post("/api/environments", json={"count": 3, "mode": "shuffle_style", "seed": 8})
+        self.assertNotEqual([self.apple_xy(e) for e in outcome.previews["envs"]], first)
+        self.assertEqual([s["state"] for s in outcome.attempt_states()], ["ready"] * 4)
+        sequence, frame = outcome.worker_frame(3, "left")
+        self.assertEqual(frame[:2], b"\xff\xd8")
+        self.assertEqual(Image.open(io.BytesIO(frame)).size, (640, 360))
+
+    def test_shuffle_only_keeps_the_live_style_and_same_clears(self):
+        """Shuffled positions keep the scene style; 'same' or a count of 0 removes the prepared environments."""
+        reply = self.client.post("/api/environments", json={"count": 2, "mode": "shuffle", "seed": 3})
+        self.assertEqual({e["style"] for e in reply.json()["environments"]}, {main.sim.scene_id})
+        self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "same"}).json()["environments"], [])
+        self.assertEqual(outcome.attempt_states(), [])
+        self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "warp"}).status_code, 422)
+
+    def test_each_parallel_run_starts_from_its_own_environment(self):
+        """A run with shuffled environments: every worker loads its own environment, matching its preview."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "shuffle_style", "seed": 11})
+        expected = [self.apple_xy(e)[0] * 100 for e in outcome.previews["envs"]]
+        outcome.SORTFLOW = self.fake_workers(
+            'print("RESULT " + json.dumps({"success": False, "sim_seconds": None, "closest_cm": x_cm}))'
+        )
+        try:
+            task = self.submit(
+                "put apple into the bowl", model(steps=20), attempts=3, environments="shuffle_style", seed=11
+            )
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+        hidden = [r for r in task["attempt_results"] if r["where"] == "hidden"]
+        self.assertEqual([r["closest_cm"] for r in hidden], [round(x) for x in expected])
+        self.assertTrue(all(r["env"] and r["env"].endswith("shuffled") for r in hidden))
+        self.assertEqual((task["environments"], task["seed"]), ("shuffle_style", 11))
+
+    def test_reset_rebuilds_the_prepared_environments_from_the_reset_scene(self):
+        """Reset scene resets the parallel environments too: they are prepared again from the reset scene."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "shuffle", "seed": 5})
+        before = [self.apple_xy(e) for e in outcome.previews["envs"]]
+        version = outcome.previews["version"]
+        self.client.post("/api/objects/move", json={"object_id": "orange", "position": {"x": -0.2, "y": 0.15, "z": 0.8}})
+        self.client.post("/api/scene/reset")
+        self.assertGreater(outcome.previews["version"], version)
+        self.assertEqual([self.apple_xy(e) for e in outcome.previews["envs"]], before, "same seed from the same scene")
+        self.assertEqual([s["state"] for s in outcome.attempt_states()], ["ready"] * 3)
+
+    def test_environments_cannot_be_prepared_while_a_task_runs(self):
+        """Preparing reads the scene, which moves during a run."""
+        main.dc.main = model(steps=4000)
+        self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20})
+        time.sleep(0.3)
+        self.assertEqual(self.client.post("/api/environments", json={"count": 2, "mode": "shuffle"}).status_code, 409)
 
     def test_success_keeps_the_backends_verdict_and_saves_a_video(self):
         """The apple settling in the bowl is COMPLETED / SUCCESS as before, now with a video the API serves."""
@@ -501,6 +589,27 @@ class OutcomeTest(unittest.TestCase):
         task = self.submit("put apple into the bowl", model(apple_into_bowl=True, steps=400))
         self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/video/..%2Fx").status_code, 404)
         self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/video/attempt-9").status_code, 404)
+
+
+class ScoringDefinitionTest(unittest.TestCase):
+    def test_each_hidden_run_of_a_suite_is_scored_against_its_own_task(self):
+        task = {
+            "task_id": "t1",
+            "batch_id": "b1",
+            "instruction": "put apple into the bowl",
+            "max_seconds": 30,
+            "started_at": 0.0,
+            "plan": [
+                {"instruction": "put apple into the bowl", "attempts": 2},
+                {"instruction": "put banana onto the plate", "attempts": 1},
+            ],
+        }
+        first = main.task_definition(task)
+        self.assertIs(main.definition_for(task, first, 1), first)
+        second = main.definition_for(task, first, 2)
+        self.assertEqual(second.instruction, "put banana onto the plate")
+        self.assertEqual(second.run, "t1")  # still reported under the same run
+        self.assertIs(main.definition_for(task, first, 9), first)
 
 
 if __name__ == "__main__":

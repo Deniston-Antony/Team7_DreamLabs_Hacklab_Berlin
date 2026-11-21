@@ -103,3 +103,7 @@ button.link:disabled { color: #9aa3ab; cursor: default; }
 tr.open-run { background: #e8f0fc; }
 tr.run-row { cursor: pointer; }
 .report-video { width: 100%; max-width: 640px; aspect-ratio: 16 / 9; display: block; margin: 8px 0; background: #111; border-radius: 5px; }
+.run-tab-env { font-size: 11px; color: #6b747c; }
+.run-tab-state.ready { color: #1f5fbf; }
+.env-controls { margin-top: 8px; padding: 8px; border: 1px dashed #c9d1d9; border-radius: 6px; }
+.env-controls .row { align-items: flex-end; gap: 8px; margin-top: 6px; }

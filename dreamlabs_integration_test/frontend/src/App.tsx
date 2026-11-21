@@ -49,13 +49,15 @@ type AttemptResult = {
   closest_cm?: number | null;
   error?: string | null;
   stopped?: boolean;
+  env?: string | null;
 };
 type WorkerState = {
   attempt: number;
   task: number;
   where: "live" | "hidden";
   label: string;
-  state: "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped";
+  env?: string;
+  state: "ready" | "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped";
 };
 type Live = {
   layout_saved?: boolean;
@@ -79,6 +81,7 @@ type Point = { camera: string; u: number; v: number };
 const CAMERAS = ["top", "left", "right", "free"];
 const CAMERA_LABEL: Record<string, string> = { top: "Overhead", left: "Left wrist", right: "Right wrist", free: "3D view" };
 const RUN_STATE_LABEL: Record<WorkerState["state"], string> = {
+  ready: "Ready",
   starting: "Starting",
   running: "Running",
   finished: "Finished",
@@ -206,6 +209,7 @@ function AttemptsPanel({ task }: { task: Task }) {
               <figcaption>
                 <strong>{runName(number)}</strong>
                 {result && goalOf(result) ? ` · ${goalOf(result)}` : ""}
+                {result?.env ? ` · ${result.env}` : ""}
                 {result ? `: ${summary(result)}` : ""}
               </figcaption>
             </figure>
@@ -244,6 +248,8 @@ export default function App() {
   const [attempts, setAttempts] = useState(1);
   const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
   const [lastRequest, setLastRequest] = useState<Record<string, unknown> | null>(null);
+  const [envMode, setEnvMode] = useState<"same" | "shuffle" | "shuffle_style">("same");
+  const [seed, setSeed] = useState(() => Math.floor(Math.random() * 100000));
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator…", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
@@ -381,10 +387,23 @@ export default function App() {
   const running = task?.status === "RUNNING";
   const totalAttempts = attempts + extras.reduce((sum, extra) => sum + extra.attempts, 0);
   const suiteReady = extras.every((extra) => extra.text.trim()) && totalAttempts <= MAX_ATTEMPTS;
+  const variation = totalAttempts > 1 ? { environments: envMode, seed } : {};
   const request: Record<string, unknown> = extras.length
-    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds }
-    : { instruction, max_seconds: maxSeconds, attempts };
+    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds, ...variation }
+    : { instruction, max_seconds: maxSeconds, attempts, ...variation };
   const layoutSaved = live?.layout_saved ?? false;
+  useEffect(() => {
+    // Show the parallel runs' environments (shuffled positions, other styles) in the run tabs before the run.
+    if (running || !connected) return;
+    const count = envMode === "same" ? 0 : totalAttempts - 1;
+    const timer = window.setTimeout(() => {
+      api("/api/environments", { count, mode: envMode, seed }).catch((error) =>
+        setStatus({ text: error instanceof Error ? error.message : String(error), error: true }),
+      );
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [envMode, seed, totalAttempts, connected]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const resetScene = () => {
     if (running && !window.confirm("Stop every run and reset the scene?")) return;
     void run(running ? "Stopped every run and reset the scene" : layoutSaved ? "Saved layout restored" : "Scene reset", () => api("/api/scene/reset", {}));
@@ -597,6 +616,7 @@ export default function App() {
                 >
                   <span className="run-tab-name">{runName(worker.attempt)}</span>
                   {worker.label && <span className="run-tab-goal">{goalName(worker.label)}</span>}
+                  {worker.env && <span className="run-tab-env">{worker.env}</span>}
                   <span className={`run-tab-state ${worker.state}`}>
                     {workers.length > 1 ? RUN_STATE_LABEL[worker.state] : connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Offline"}
                   </span>
@@ -775,6 +795,26 @@ export default function App() {
             <div className="hint">
               {extras.length + 1} task{extras.length ? "s" : ""} · {totalAttempts} parallel run{totalAttempts > 1 ? "s" : ""} (max {MAX_ATTEMPTS}) · up to ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)} in credits
             </div>
+            {totalAttempts > 1 && (
+              <div className="env-controls">
+                <label>Parallel run environments
+                  <select aria-label="Parallel run environments" value={envMode} disabled={running} onChange={(event) => setEnvMode(event.target.value as typeof envMode)}>
+                    <option value="same">Same as the live scene</option>
+                    <option value="shuffle">Shuffled object positions</option>
+                    <option value="shuffle_style">Shuffled positions and scene styles</option>
+                  </select>
+                </label>
+                {envMode !== "same" && (
+                  <div className="row">
+                    <label>Layout seed
+                      <input aria-label="Layout seed" type="number" min={0} value={seed} disabled={running} onChange={(event) => setSeed(Math.max(0, Math.floor(Number(event.target.value) || 0)))} />
+                    </label>
+                    <button disabled={running} onClick={() => setSeed(Math.floor(Math.random() * 100000))}>New layouts</button>
+                  </div>
+                )}
+                {envMode !== "same" && <p className="hint">Each parallel run starts from its own environment; the Runs tabs show them. The live run keeps your scene.</p>}
+              </div>
+            )}
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
