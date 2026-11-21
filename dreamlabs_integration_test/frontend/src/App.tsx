@@ -22,6 +22,7 @@ type Task = {
 type Live = {
   phase: "idle" | "running" | "waiting_for_dream";
   scene_id: string;
+  selected: string | null;
   task: Task | null;
   objects: SceneObject[];
   robot: Record<string, number[]>;
@@ -84,7 +85,6 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [frameUrl, setFrameUrl] = useState("");
   const [fps, setFps] = useState(0);
-  const [selected, setSelected] = useState("");
   const [camera, setCamera] = useState("top");
   const [dragging, setDragging] = useState(false);
   const [pose, setPose] = useState({ x: 0.05, y: 0, z: 0.8, yaw: 45 });
@@ -101,6 +101,8 @@ export default function App() {
   const cameraRef = useRef(camera);
   const drag = useRef<{ active: boolean; sending: boolean; next: Point | null }>({ active: false, sending: false, next: null });
   const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
+  const zoom = useRef({ sending: false, delta: 0 });
+  const viewRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let closed = false;
@@ -178,18 +180,64 @@ export default function App() {
     if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ camera: name }));
   };
 
+  useEffect(() => {
+    const element = viewRef.current;
+    if (!element) return;
+    const sendZoom = async () => {
+      const state = zoom.current;
+      if (state.sending) return;
+      state.sending = true;
+      try {
+        while (state.delta !== 0) {
+          const delta = Math.max(-2000, Math.min(2000, state.delta));
+          state.delta = 0;
+          await api("/api/view/zoom", { delta });
+        }
+      } catch (error) {
+        setStatus({ text: error instanceof Error ? error.message : String(error), error: true });
+      } finally {
+        state.sending = false;
+      }
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (cameraRef.current !== "free") return;
+      event.preventDefault();
+      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
+      zoom.current.delta += event.deltaY * unit * (event.ctrlKey ? 4 : 1);
+      void sendZoom();
+    };
+    element.addEventListener("wheel", onWheel, { passive: false });
+    return () => element.removeEventListener("wheel", onWheel);
+  }, []);
+
   const objects = live?.objects ?? [];
+  const selected = live?.selected ?? "";
+  const selectedObject = objects.find((object) => object.object_id === selected);
+  const selectedMovable = selectedObject?.movable ?? false;
+  const selectedPosition = selectedObject?.position.join(",");
   const task = live?.task ?? null;
   const running = task?.status === "RUNNING";
   const locked = busy || running || dragging;
   const position = { x: pose.x, y: pose.y, z: pose.z };
-  const canDrag = camera === "top" && !running && !busy;
+  const canDrag = (camera === "top" || camera === "free") && !running && !busy;
+
+  useEffect(() => {
+    if (!selectedPosition) return;
+    const [x, y, z] = selectedPosition.split(",").map(Number);
+    setPose((value) => ({ ...value, x, y, z }));
+  }, [selected, selectedPosition]);
 
   const selectObject = (object: SceneObject) => {
-    if (!object.movable || running) return;
-    setSelected(object.object_id);
-    setPose((value) => ({ ...value, x: object.position[0], y: object.position[1], z: object.position[2] }));
+    if (running || dragging) return;
+    api("/api/objects/select", { object_id: object.object_id }).catch((error) =>
+      setStatus({ text: error instanceof Error ? error.message : String(error), error: true }),
+    );
   };
+
+  const changeType = (object: SceneObject, movable: boolean) =>
+    run(`${object.object_id} is now ${movable ? "movable" : "fixed"}`, () =>
+      api("/api/objects/type", { object_id: object.object_id, movable }),
+    );
 
   const framePoint = (event: PointerEvent<HTMLImageElement>): Point => {
     const box = event.currentTarget.getBoundingClientRect();
@@ -250,15 +298,18 @@ export default function App() {
     const point = framePoint(event);
     event.preventDefault();
     try {
-      const picked = await api<{ object_id: string | null }>("/api/view/pick", point);
+      const picked = await api<{ object_id: string | null; movable: boolean }>("/api/view/pick", point);
       if (!picked.object_id) {
-        setStatus({ text: "Click directly on a movable object to drag it.", error: false });
+        setStatus({ text: "Selection cleared.", error: false });
+        return;
+      }
+      if (!picked.movable) {
+        setStatus({ text: `Selected ${picked.object_id}. It is fixed, so it cannot be dragged.`, error: false });
         return;
       }
       target.setPointerCapture(pointerId);
       drag.current.active = true;
       setDragging(true);
-      setSelected(picked.object_id);
       setStatus({ text: `Dragging ${picked.object_id}`, error: false });
     } catch (error) {
       setStatus({ text: error instanceof Error ? error.message : String(error), error: true });
@@ -329,7 +380,6 @@ export default function App() {
         ? ` Simplified from ${result.original_triangles.toLocaleString()} to ${result.triangles.toLocaleString()} triangles.`
         : "";
       setUploadStatus({ text: `Added ${result.object_id}.${simplified}`, error: false });
-      setSelected(result.object_id);
       setStlFile(null);
       setUploadKey((value) => value + 1);
     });
@@ -337,7 +387,7 @@ export default function App() {
 
   const field = (key: "x" | "y" | "z" | "yaw", step: string) => (
     <label>
-      {key === "yaw" ? "yaw (deg)" : `${key} (m)`}
+      {key === "yaw" ? "rotate by (deg)" : `${key} (m)`}
       <input
         aria-label={key}
         type="number"
@@ -370,6 +420,7 @@ export default function App() {
                 <span className="muted">{connected ? `${fps} FPS` : ""}</span>
               </div>
             </div>
+            <div ref={viewRef}>
             {frameUrl ? (
               <img
                 className={`main-view ${canDrag ? "draggable" : ""} ${dragging || orbiting ? "dragging" : ""}`}
@@ -385,8 +436,13 @@ export default function App() {
             ) : (
               <div className="main-view" />
             )}
+            </div>
             <p className="hint">
-              {camera === "top" ? "Drag an object to move it. Hold Ctrl and drag to rotate the 3D view." : "Hold Ctrl and drag to rotate the 3D view. Use the top camera to move objects."}
+              {camera === "free"
+                ? "Click to select, drag to move. Ctrl + drag rotates the view. Two-finger scroll zooms."
+                : camera === "top"
+                  ? "Click to select, drag to move. Ctrl + drag opens the rotating 3D view."
+                  : "Ctrl + drag opens the 3D view. Use top or 3D view to select and move objects."}
             </p>
           </div>
           <div className="panel">
@@ -399,14 +455,25 @@ export default function App() {
                 {objects.map((object) => (
                   <tr
                     key={object.object_id}
-                    data-movable={object.movable}
+                    data-selectable="true"
                     className={selected === object.object_id ? "selected" : ""}
                     onClick={() => selectObject(object)}
                   >
                     <td>{object.object_id}</td>
                     <td>{object.position.map((value) => value.toFixed(3)).join(", ")}</td>
                     <td>{object.orientation_wxyz.map((value) => value.toFixed(2)).join(", ")}</td>
-                    <td>{object.movable ? "movable" : "fixed"}</td>
+                    <td onClick={(event) => event.stopPropagation()}>
+                      <select
+                        aria-label={`${object.object_id} type`}
+                        className="type-select"
+                        value={object.movable ? "movable" : "fixed"}
+                        disabled={locked}
+                        onChange={(event) => changeType(object, event.target.value === "movable")}
+                      >
+                        <option value="movable">Movable</option>
+                        <option value="fixed">Fixed</option>
+                      </select>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -449,11 +516,11 @@ export default function App() {
             <div className="row">{field("x", "0.01")}{field("y", "0.01")}{field("z", "0.01")}{field("yaw", "5")}</div>
             <div className="row">
               <button disabled={locked} onClick={() => run("Added a block", () => api("/api/objects/add", { type: "block", position }))}>Add block</button>
-              <button disabled={locked || !selected} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
-              <button disabled={locked || !selected} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
-              <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, async () => { await api("/api/objects/remove", { object_id: selected }); setSelected(""); })}>Remove</button>
+              <button disabled={locked || !selectedMovable} onClick={() => run(`Moved ${selected}`, () => api("/api/objects/move", { object_id: selected, position }))}>Move</button>
+              <button disabled={locked || !selectedMovable} onClick={() => run(`Rotated ${selected}`, () => api("/api/objects/rotate", { object_id: selected, yaw_deg: pose.yaw }))}>Rotate</button>
+              <button disabled={locked || !selected} onClick={() => run(`Removed ${selected}`, () => api("/api/objects/remove", { object_id: selected }))}>Remove</button>
               <button disabled={locked} onClick={() => run("Objects shuffled", () => api("/api/objects/shuffle", {}))}>Shuffel</button>
-              <button disabled={locked} onClick={() => run("Scene reset", async () => { await api("/api/scene/reset", {}); setSelected(""); })}>Reset</button>
+              <button disabled={locked} onClick={() => run("Scene reset", () => api("/api/scene/reset", {}))}>Reset</button>
             </div>
             <div className="upload">
               <label>STL file

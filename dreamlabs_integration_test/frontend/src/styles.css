@@ -18,8 +18,9 @@ button.active, button.primary { background: #1f5fbf; border-color: #1f5fbf; colo
 button:disabled { opacity: .55; cursor: default; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { text-align: left; padding: 4px; border-bottom: 1px solid #edf0f2; }
-tr.selected { background: #e8f0fc; }
-tr[data-movable="true"] { cursor: pointer; }
+tr.selected { background: #fff0e2; box-shadow: inset 3px 0 #ff7800; }
+tr[data-selectable="true"] { cursor: pointer; }
+.type-select { width: 96px; padding: 3px 4px; font-size: 12px; }
 .status { padding: 8px; border-radius: 5px; background: #eef1f3; overflow-wrap: anywhere; }
 .status.error { background: #fdecea; color: #8a1f17; }
 .status.spaced { margin-top: 6px; }

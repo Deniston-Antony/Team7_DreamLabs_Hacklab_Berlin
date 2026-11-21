@@ -105,7 +105,7 @@ Open **http://127.0.0.1:5173**. Press `Ctrl+C` in each terminal to stop.
 ## Use it
 
 1. Press **Reset** for a clean scene.
-2. Choose a scene. Drag objects in the **top** camera view, use the object controls, add a block, upload a `.stl` file, or press **Shuffel**. Hold **Ctrl** and drag on the view to rotate the 3D camera.
+2. Choose a scene. Click an object in the **top** or **3D view** to select and outline it, then drag it, rotate it, or set it to **Movable** or **Fixed** in the table. You can also add a block, upload a `.stl` file, or press **Shuffel**. In 3D view, hold **Ctrl** and drag to rotate the camera, and scroll with two fingers to zoom.
 3. Enter a task, such as `put apple into the bowl`.
 4. Set a time limit from 5 to 200 seconds.
 5. Press **Execute task** and watch the live view and timer. Tasks like `put orange into the bowl` stop with a success message once the simulator confirms the object has settled there. Use **Stop task** to end early.

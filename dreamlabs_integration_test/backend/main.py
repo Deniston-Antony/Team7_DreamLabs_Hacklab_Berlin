@@ -39,6 +39,10 @@ MAX_STL_TRIANGLES = 1_500_000
 SIM_MESH_TRIANGLES = 60_000
 COLLISION_HULL_VERTICES = 64
 ORBIT_DEG_PER_PIXEL = 0.35
+ZOOM_RATE = 0.0025
+ZOOM_RANGE = (0.35, 3.0)
+SCENE_OBJECTS = ("apple", "banana", "orange", "water_bottle", "bowl", "plate")
+HIGHLIGHT_RGB = (255, 120, 0)
 GOAL_SETTLED_FRAMES = 30
 GOAL_SPEED_M_S = 0.03
 GOAL_TARGETS = {"bowl": 0.08, "plate": 0.07}
@@ -221,6 +225,9 @@ class SimAdapter:
         self.removed = set()
         self.scene_id = DEFAULT_SCENE
         self.grab = None
+        self.selected = None
+        self.watched_view = "top"
+        self.type_overrides = {}
         self.goal = None
         self.view_lock = threading.Lock()
         self.free_camera = mujoco.MjvCamera()
@@ -244,12 +251,53 @@ class SimAdapter:
         with self.view_lock:
             self.env.renderer.update_scene(self.env.data, camera=self.free_camera)
         free = self.env.renderer.render()[RENDER_CROP_TOP : RENDER_HEIGHT - RENDER_CROP_TOP].copy()
+        views = {**images, FREE_VIEW: free}
+        if self.selected is not None and active_task is None:
+            view = self.watched_view
+            views[view] = self._outline(views[view], self.free_camera if view == FREE_VIEW else view)
         self.feed.publish(
-            {**images, FREE_VIEW: free},
+            views,
             self.objects(),
             {side: np.round(values, 4).tolist() for side, values in state.items()},
             int(self.env.data.ncon),
         )
+
+    def _outline(self, image, camera):
+        m, d = self.env.model, self.env.data
+        renderer = self.env.renderer
+        root = m.body(self.selected).id
+        geoms = np.flatnonzero(m.body_rootid[m.geom_bodyid] == root)
+        renderer.enable_segmentation_rendering()
+        try:
+            renderer.update_scene(d, camera=camera)
+            segmentation = renderer.render()[RENDER_CROP_TOP : RENDER_HEIGHT - RENDER_CROP_TOP]
+        finally:
+            renderer.disable_segmentation_rendering()
+        mask = (segmentation[..., 1] == mujoco.mjtObj.mjOBJ_GEOM) & np.isin(segmentation[..., 0], geoms)
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        outlined = image.copy()
+        cv2.drawContours(outlined, contours, -1, HIGHLIGHT_RGB, 2, cv2.LINE_AA)
+        return outlined
+
+    def managed(self):
+        return [name for name in SCENE_OBJECTS if name not in self.removed] + list(self.added)
+
+    def select(self, name):
+        if name is not None and name not in self.managed():
+            raise HTTPException(404, f"no object named {name!r}")
+        self.selected = name
+
+    def set_movable(self, name, movable):
+        if name not in self.managed():
+            raise HTTPException(404, f"no object named {name!r}")
+        self.type_overrides[name] = movable
+        self.grab = None
+        self._rebuild()
+
+    def zoom(self, delta):
+        with self.view_lock:
+            distance = self.free_camera.distance * math.exp(delta * ZOOM_RATE)
+            self.free_camera.distance = float(np.clip(distance, *ZOOM_RANGE))
 
     def orbit(self, dx, dy):
         with self.view_lock:
@@ -300,7 +348,9 @@ class SimAdapter:
     def _qpos(self, body):
         joint = self._joint_by_body().get(body)
         if joint is None:
-            raise HTTPException(404, f"no movable object named {body!r}")
+            if body in self.managed():
+                raise HTTPException(409, f"{body} is fixed. Set its type to Movable first.")
+            raise HTTPException(404, f"no object named {body!r}")
         address = self.env.model.joint(joint).qposadr[0]
         return joint, address
 
@@ -345,9 +395,10 @@ class SimAdapter:
     def _rebuild(self, keep_poses=True):
         saved = {}
         if keep_poses:
-            for body in self._joint_by_body():
-                address = self._qpos(body)[1]
-                saved[body] = self.env.data.qpos[address : address + 7].copy()
+            for body in self.managed():
+                if mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_BODY, body) >= 0:
+                    data = self.env.data.body(body)
+                    saved[body] = np.r_[data.xpos, data.xquat]
         spec = mujoco.MjSpec.from_string(yam_env.build_xml())
         for name in self.removed:
             spec.delete(spec.body(name))
@@ -375,6 +426,19 @@ class SimAdapter:
                 mass=0.1,
                 rgba=item["rgba"],
             )
+        for name, movable in self.type_overrides.items():
+            body = spec.body(name)
+            if body is None:
+                continue
+            joints = list(body.joints)
+            if movable and not joints:
+                body.add_freejoint(name=f"{name}_free")
+            elif not movable:
+                for joint in joints:
+                    spec.delete(joint)
+                if name in saved:
+                    body.pos = saved[name][:3]
+                    body.quat = saved[name][3:]
         self._apply_scene(spec)
         model = spec.compile()
         self.env.close()
@@ -389,7 +453,7 @@ class SimAdapter:
     def objects(self):
         d = self.env.data
         movable = self._joint_by_body()
-        names = list(movable) + [n for n in ("bowl", "plate") if n not in movable]
+        names = self.managed()
         return [
             {
                 "object_id": name,
@@ -441,6 +505,7 @@ class SimAdapter:
                 hold = self.env.state()
                 for _ in range(10):
                     self.env.step(hold["left"], hold["right"])
+                self.selected = name
                 return name
         del self.added[name]
         self._rebuild()
@@ -448,6 +513,25 @@ class SimAdapter:
 
     def _ray(self, camera, u, v):
         m, d = self.env.model, self.env.data
+        if camera == FREE_VIEW:
+            with self.view_lock:
+                azimuth = math.radians(self.free_camera.azimuth)
+                elevation = math.radians(self.free_camera.elevation)
+                lookat = self.free_camera.lookat.copy()
+                distance = self.free_camera.distance
+            forward = np.array(
+                [math.cos(elevation) * math.cos(azimuth), math.cos(elevation) * math.sin(azimuth), math.sin(elevation)]
+            )
+            right = np.cross(forward, [0, 0, 1])
+            right /= np.linalg.norm(right)
+            up = np.cross(right, forward)
+            focal = (RENDER_HEIGHT / 2) / math.tan(math.radians(m.vis.global_.fovy) / 2)
+            direction = (
+                forward
+                + right * (u - RENDER_WIDTH / 2) / focal
+                + up * (RENDER_HEIGHT / 2 - v - RENDER_CROP_TOP) / focal
+            )
+            return lookat - distance * forward, direction / np.linalg.norm(direction)
         camera_id = m.camera(camera).id
         focal = (RENDER_HEIGHT / 2) / math.tan(math.radians(m.cam_fovy[camera_id]) / 2)
         local = np.array([(u - RENDER_WIDTH / 2) / focal, -(v + RENDER_CROP_TOP - RENDER_HEIGHT / 2) / focal, -1.0])
@@ -462,6 +546,7 @@ class SimAdapter:
 
     def pick(self, camera, u, v):
         m, d = self.env.model, self.env.data
+        managed = self.managed()
         movable = self._joint_by_body()
         origin, direction = self._ray(camera, u, v)
         hit = np.array([-1], dtype=np.int32)
@@ -469,28 +554,31 @@ class SimAdapter:
         name = None
         if hit[0] >= 0:
             root = m.body(m.body_rootid[m.geom_bodyid[hit[0]]]).name
-            name = root if root in movable else None
-        if name is None:
+            name = root if root in managed else None
+        if name is None and hit[0] >= 0 and m.body_rootid[m.geom_bodyid[hit[0]]] == 0:
             table_point = self._at_height(origin, direction, TABLE_TOP_Z)
-            if table_point is not None and movable:
-                nearest = min(movable, key=lambda n: np.linalg.norm(d.body(n).xpos[:2] - table_point[:2]))
-                if np.linalg.norm(d.body(nearest).xpos[:2] - table_point[:2]) < 0.05:
+            if table_point is not None and managed:
+                nearest = min(managed, key=lambda n: np.linalg.norm(d.body(n).xpos[:2] - table_point[:2]))
+                if np.linalg.norm(d.body(nearest).xpos[:2] - table_point[:2]) < 0.035:
                     name = nearest
+        self.grab = None
+        self.selected = name
         if name is None:
-            self.grab = None
-            return None
+            return {"object_id": None, "movable": False}
+        if name not in movable:
+            return {"object_id": name, "movable": False}
         address = self._qpos(name)[1]
         z = float(d.qpos[address + 2])
         point = self._at_height(origin, direction, z)
         if point is None:
-            raise HTTPException(409, "Use the top camera to drag objects.")
+            raise HTTPException(409, "Raise the camera angle to drag this object.")
         self.grab = {
             "object_id": name,
             "offset": d.qpos[address : address + 2] - point[:2],
             "start": d.qpos[address : address + 7].copy(),
             "z": z,
         }
-        return name
+        return {"object_id": name, "movable": True}
 
     def drag(self, camera, u, v):
         if self.grab is None:
@@ -513,24 +601,34 @@ class SimAdapter:
         if restored:
             self._set_pose(grab["object_id"], grab["start"][:3], grab["start"][3:])
         hold = self.env.state()
-        for _ in range(15):
+        for _ in range(4):
             self.env.step(hold["left"], hold["right"])
         return {"object_id": grab["object_id"], "restored": restored}
 
     def remove(self, name):
-        self._qpos(name)
+        if name not in self.managed():
+            raise HTTPException(404, f"no object named {name!r}")
         if name in self.added:
             del self.added[name]
         else:
             self.removed.add(name)
+        self.type_overrides.pop(name, None)
+        self.grab = None
+        if self.selected == name:
+            self.selected = None
         self._rebuild()
 
     def move(self, name, position):
         self._set_pose(name, position)
 
     def rotate(self, name, yaw_deg):
+        address = self._qpos(name)[1]
         half = math.radians(yaw_deg) / 2
-        self._set_pose(name, quat=[math.cos(half), 0, 0, math.sin(half)])
+        turn = np.array([math.cos(half), 0, 0, math.sin(half)])
+        rotated = np.zeros(4)
+        mujoco.mju_mulQuat(rotated, turn, self.env.data.qpos[address + 3 : address + 7].copy())
+        mujoco.mju_normalize4(rotated)
+        self._set_pose(name, quat=rotated)
 
     def select_scene(self, scene_id):
         self.scene_id = scene_id
@@ -552,7 +650,9 @@ class SimAdapter:
             raise HTTPException(409, "There are no movable objects to shuffle.")
         rng = np.random.default_rng()
         saved_qpos, saved_qvel = d.qpos.copy(), d.qvel.copy()
-        fixed = [(d.body(n).xpos[:2].copy(), r) for n, r in FIXED_CLEARANCE_M.items()]
+        fixed = [
+            (d.body(n).xpos[:2].copy(), FIXED_CLEARANCE_M.get(n, 0.09)) for n in self.managed() if n not in bodies
+        ]
         for _ in range(200):
             placed = []
             for _ in bodies:
@@ -585,6 +685,9 @@ class SimAdapter:
     def reset(self):
         self.added.clear()
         self.removed.clear()
+        self.type_overrides.clear()
+        self.grab = None
+        self.selected = None
         self._rebuild(keep_poses=False)
 
 
@@ -620,6 +723,18 @@ class MoveObject(ObjectRef):
 
 class RotateObject(ObjectRef):
     yaw_deg: float = Field(ge=-360, le=360)
+
+
+class ObjectType(ObjectRef):
+    movable: bool
+
+
+class SelectObject(BaseModel):
+    object_id: str | None = None
+
+
+class ZoomView(BaseModel):
+    delta: float = Field(ge=-2000, le=2000)
 
 
 class OrbitView(BaseModel):
@@ -675,6 +790,8 @@ def run_task(task, stop):
     global active_task, active_stop
     result = {}
     goal = parse_goal(task["instruction"], list(sim._joint_by_body()))
+    if goal and goal["target"] not in sim.managed():
+        goal = None
     if goal:
         sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
     try:
@@ -807,16 +924,36 @@ async def view_orbit(body: OrbitView):
     return {"ok": True}
 
 
+@app.post("/api/view/zoom")
+async def view_zoom(body: ZoomView):
+    sim.zoom(body.delta)
+    if active_task is None:
+        await on_sim(sim.publish)
+    return {"ok": True}
+
+
 @app.post("/api/view/pick")
 async def view_pick(body: ViewPoint):
-    if body.camera not in CAMERAS:
+    if body.camera not in VIEWS:
         raise HTTPException(404, "unknown camera")
-    return {"object_id": await change_scene(sim.pick, body.camera, body.u, body.v)}
+    return await change_scene(sim.pick, body.camera, body.u, body.v)
+
+
+@app.post("/api/objects/select")
+async def select_object(body: SelectObject):
+    await change_scene(sim.select, body.object_id)
+    return {"object_id": body.object_id}
+
+
+@app.post("/api/objects/type")
+async def set_object_type(body: ObjectType):
+    await change_scene(sim.set_movable, body.object_id, body.movable)
+    return {"object_id": body.object_id, "movable": body.movable}
 
 
 @app.post("/api/view/drag")
 async def view_drag(body: ViewPoint):
-    if body.camera not in CAMERAS:
+    if body.camera not in VIEWS:
         raise HTTPException(404, "unknown camera")
     await change_scene(sim.drag, body.camera, body.u, body.v)
     return {"ok": True}
@@ -931,6 +1068,9 @@ async def live(socket: WebSocket):
             message = await socket.receive_json()
             if isinstance(message, dict) and message.get("camera") in VIEWS:
                 selected["camera"] = message["camera"]
+                sim.watched_view = message["camera"]
+                if active_task is None:
+                    await on_sim(sim.publish)
 
     receiver = asyncio.create_task(receive())
     sent = (None, None)
@@ -946,6 +1086,7 @@ async def live(socket: WebSocket):
                     "sequence": feed.sequence,
                     "camera": selected["camera"],
                     "scene_id": sim.scene_id,
+                    "selected": sim.selected,
                     "phase": live_phase(),
                     "task": task_view(task),
                     "objects": feed.objects,
