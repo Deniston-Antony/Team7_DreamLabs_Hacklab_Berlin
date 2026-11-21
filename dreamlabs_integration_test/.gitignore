@@ -1,6 +1,0 @@
-backend/.deps/
-__pycache__/
-frontend/node_modules/
-frontend/dist/
-*.tsbuildinfo
-.env
