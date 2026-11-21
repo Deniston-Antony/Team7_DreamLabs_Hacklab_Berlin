@@ -4,7 +4,7 @@
 **Audience:** Deniston, Umar and Ashiq
 **Tested on:** macOS arm64, Python 3.12.13, `dreamlabs` 1.0.42, `dreamlabs-client` 1.1.7, MuJoCo 4.0.1
 **Official repository inspected:** `dreamlabs-co/dreamlabs` at `ba8ad98`
-**Dream Labs credits used:** none
+**Dream Labs usage:** 39 model calls, about $0.05 at the Playground's displayed $0.0014 per call
 
 ## Section 1: Executive summary
 
@@ -12,7 +12,8 @@
 
 - **Build on the local Dream YAM Sim, not the hosted Playground.** The local simulator gives our backend real object poses, scene edits, resets, contacts and camera frames.
 - **The hosted Playground cannot be our control surface.** Its platform pages forbid iframe embedding, and we found no documented API for its rooms, robots or objects.
-- **One gate remains.** A real Dream-1 task has not been run, because it bills credits and the Dream Labs docs require a person to check the model's inputs before the arms first move.
+- **The live pipeline works.** A real Dream-1 run drove the simulated arms from a backend script for 1,824 actions.
+- **The first task failed physically.** The apple did not reach the bowl, and the simulator evidence detected that correctly.
 
 Status labels used below:
 
@@ -87,7 +88,7 @@ No browser security or authentication protection was bypassed.
 
 | Signal | Classification | Source |
 | --- | --- | --- |
-| Robot actions | Not verified | `get_action` response |
+| Robot actions | Directly available, verified | `get_action` response |
 | Camera observations | Directly available, verified | `YamEnv.images` |
 | Robot status | Directly available, verified | `YamEnv.state` |
 | Task execution status | Available with additional processing | Our loop must report it |
@@ -115,7 +116,11 @@ No browser security or authentication protection was bypassed.
 | Website render | PASS | Headless Chrome showed camera and live state |
 | Frontend type check and build | PASS | `npm run build` |
 | Website button clicks | NOT RUN | Same endpoints tested directly |
-| Real Dream-1 task | NOT RUN | Awaiting approval |
+| One-call dry run with arms held | PASS | 48 valid rows per arm in 2.09 s; a person confirmed the inputs |
+| Real Dream-1 pipeline, "put apple into the bowl" | PASS | 38 calls, 1,824 actions executed, arms moved up to 1.649 rad |
+| Physical task outcome | **FAIL** | Apple ended 0.27 m from the bowl centre, after moving 0.0755 m |
+
+The integration worked, but Dream-1 did not complete this task in this single zero-shot trial. One trial does not measure its success rate. Other objects moved 0.0042 to 0.0157 m.
 
 No mock adapter was needed. Every displayed pose and frame comes from the local simulator.
 
@@ -156,7 +161,7 @@ Evidence store --> Umar's evaluator --> reports --> dashboard
 
 ## Section 10: Development recommendations
 
-1. Approve and run one real Dream-1 task in the local simulator.
+1. Run a small repeated baseline of the demo tasks to measure how often Dream-1 succeeds.
 2. Freeze the shared scene, task, event and result contracts around the verified fields.
 3. Ashiq turns the control loop into a one-task backend executor.
 4. Umar scores simulator snapshots and contact data.
@@ -171,14 +176,14 @@ Evidence store --> Umar's evaluator --> reports --> dashboard
 | 2. Display it inside our website? | **Yes** for local camera views; **no** for the hosted platform Playground |
 | 3. Manipulate objects externally? | **Yes locally**; no hosted API |
 | 4. Select scenes and robots externally? | **Limited**: one local scene and YAM |
-| 5. Trigger robot tasks from our backend? | **Documented, not yet run** |
-| 6. Monitor robot execution? | **Likely**: state, cameras and contacts verified; live run pending |
-| 7. Enough evidence for evaluation? | **Yes for simulator state**; full run pending |
+| 5. Trigger robot tasks from our backend? | **Yes**, verified by a backend script; not yet wired to the website button |
+| 6. Monitor robot execution? | **Yes** for actions, state and poses; live website streaming is not built |
+| 7. Enough evidence for evaluation? | **Yes for simulator state**; it correctly identified a failed task |
 | 8. Execute multiple tasks independently? | **Sequentially likely**: reset verified. Parallel isolation is unknown |
 | 9. Capabilities needing workarounds? | Scene variety, robot variety, shuffle, clear and non-block objects |
 | 10. Sensible to proceed? | **Yes, with Option C** |
 
-**Recommendation: CONDITIONAL GO.** Proceed once one real Dream-1 simulator task runs end to end.
+**Recommendation: GO for the benchmarking platform with Option C.** The pipeline and failure detection work. Task reliability remains unmeasured and needs repeated trials.
 
 ## Setup and execution
 
@@ -198,4 +203,9 @@ npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. The Execute button intentionally returns an unsupported-capability message until the live test is approved.
+Open `http://127.0.0.1:5173`. The website's Execute button still returns an unsupported-capability message. Run the billed live test separately:
+
+```bash
+cd dreamlabs_integration_test/backend
+~/dream-env/bin/python live_task_test.py /tmp/dream_live_run
+```
