@@ -27,6 +27,7 @@ import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
 import capacity  # noqa: E402
+import video_judge  # noqa: E402
 import evaluation  # noqa: E402
 import environments  # noqa: E402
 import suggestions  # noqa: E402
@@ -830,7 +831,6 @@ evaluations = evaluation.EvaluationStore(
     Path(os.environ.get("DREAM_EVALUATION_DATA", Path(__file__).resolve().parent / "evaluation_data"))
 )
 app.include_router(evaluation.create_router(evaluations))
-vision_checks = evaluation.VisionQueue(evaluations, Path(__file__).resolve().parent)
 _open_policy = dc.open_policy
 
 
@@ -1069,7 +1069,6 @@ def evaluate_run(task, definition, capture, result):
             }
         )
         evaluations.submit(attempt, proof)
-    vision_checks.submit(task["task_id"], folder)
     run = evaluations.run_report(task["task_id"])["run"]
     return {
         "outcome": run["outcome"],
@@ -1184,6 +1183,41 @@ def run_task(task, stop):
         active_stop = None
         active_clock = None
         task.update(result, finished_at=finished_at)
+        # Judge the saved videos in the background while the robot is free for the next task.
+        judge_videos(task)
+
+
+def judge_videos(task, only=None):
+    """Send a finished run's videos to the video judge and save each verdict in its attempt's report."""
+    try:
+        ids = {record[0].attempt: record[0].task_id for record in evaluations.run_records(task["task_id"])}
+        if only is not None:
+            ids = {number: value for number, value in ids.items() if number in only}
+        for task_id in ids.values():
+            evaluations.attach_video_judge(task_id, {"verdict": "RUNNING"})
+
+        def save(number, verdict):
+            if number in ids:
+                evaluations.attach_video_judge(ids[number], verdict)
+
+        def finish(state):
+            judged = {int(item["video"].split("-")[1]) for item in state.get("attempts", [])}
+            for number, task_id in ids.items():
+                if number not in judged:
+                    evaluations.attach_video_judge(task_id, {"verdict": "SKIPPED", "reason": state.get("reason") or "this attempt has no saved video"})
+
+        video_judge.submit(task, outcome.VIDEOS, on_attempt=save, on_done=finish, only=only)
+        if task["video_judge"]["status"] == "SKIPPED":
+            finish(task["video_judge"])
+    except Exception as error:  # a judging problem must never affect the robot run or its score
+        task["video_judge"] = {"status": "ERROR", "reason": f"{type(error).__name__}: {error}", "attempts": []}
+
+
+def video_judgements(limit=5):
+    """The newest finished tasks' video verdicts, so they stay on screen while the robot runs the next task."""
+    judged = [t for t in tasks.values() if t.get("video_judge")]
+    judged.sort(key=lambda t: t.get("finished_at") or 0, reverse=True)
+    return [{"task_id": t["task_id"], "instruction": t["instruction"], **t["video_judge"]} for t in judged[:limit]]
 
 
 def task_view(task):
@@ -1646,10 +1680,32 @@ def build_combined_video(run_id, path):
 
 @app.post("/api/reports/runs/{run_id}/analyze-videos")
 def analyze_run_videos(run_id: str):
-    """Analyse an older run's videos with the vision model."""
+    """Send a saved run's unjudged videos to the video judge."""
     if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
         raise HTTPException(404, "No report exists for this run.")
-    return {"queued": vision_checks.submit(run_id, outcome.VIDEOS / run_id, only_missing=True)}
+    records = evaluations.run_records(run_id)
+    if any((evidence.video_judge or {}).get("verdict") == "RUNNING" for _, evidence, _ in records):
+        return {"queued": 0}
+    waiting = {
+        item.attempt
+        for item, evidence, _ in records
+        if evidence.videos and (evidence.video_judge or {}).get("verdict") not in ("PASS", "FAIL", "UNSURE")
+    }
+    if not waiting:
+        return {"queued": 0}
+    saved = {
+        "task_id": run_id,
+        "instruction": records[0][0].instruction,
+        "status": "COMPLETED",
+        "finished_at": time.time(),
+        "plan": [{"instruction": item.instruction, "attempts": 1} for item, _, _ in records],
+        "attempt_results": [
+            {"attempt": item.attempt, "task": index, "success": None if result.outcome == "NOT_EVALUABLE" else result.outcome == "SUCCESS"}
+            for index, (item, _, result) in enumerate(records, 1)
+        ],
+    }
+    judge_videos(saved, waiting)
+    return {"queued": 0 if saved["video_judge"]["status"] == "SKIPPED" else len(waiting)}
 
 
 def suggestion_rules():
@@ -1694,6 +1750,8 @@ def run_suggestions(task, stop, tests):
         active_task = None
         active_stop = None
         task.update(result, finished_at=finished_at)
+        if result.get("status") == "COMPLETED":
+            judge_videos(task)
 
 
 def evaluate_suggestions(task, tests, result):
@@ -1726,7 +1784,6 @@ def evaluate_suggestions(task, tests, result):
             }
         )
         evaluations.submit(definition, proof)
-    vision_checks.submit(task["task_id"], folder)
     run = evaluations.run_report(task["task_id"])["run"]
     return {
         "outcome": run["outcome"],
@@ -1863,6 +1920,7 @@ async def live(socket: WebSocket):
                     "selected": sim.selected,
                     "phase": live_phase(),
                     "task": task_view(task),
+                    "video_judgements": video_judgements(),
                     "objects": feed.objects,
                     **outcome.viewed_objects(attempt),
                     "robot": feed.robot,

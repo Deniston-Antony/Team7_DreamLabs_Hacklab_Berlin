@@ -84,6 +84,7 @@ type Live = {
   scene_id: string;
   selected: string | null;
   task: Task | null;
+  video_judgements?: VideoJudgement[];
   objects: SceneObject[];
   view_objects?: SceneObject[];
   view_selected?: string | null;
@@ -782,6 +783,7 @@ export default function App() {
             </div>
           </div>
           {task && <AttemptsPanel key={task.task_id} task={task} />}
+          <VideoJudgePanel judgements={live?.video_judgements ?? []} />
           {task?.evaluation && (
             <div className="panel report-prompt">
               <span>This task's report is ready.</span>
@@ -943,5 +945,37 @@ export default function App() {
         </aside>
       </div>
     </main>
+  );
+}
+
+type VideoJudgement = {
+  task_id: string;
+  instruction: string;
+  status: "QUEUED" | "RUNNING" | "DONE" | "SKIPPED" | "ERROR";
+  reason?: string;
+  attempts: { video: string; verdict: string; confidence?: number; reason: string; agrees_with_sim?: boolean }[];
+};
+
+function VideoJudgePanel({ judgements }: { judgements: VideoJudgement[] }) {
+  if (!judgements.length) return null;
+  return (
+    <div className="status spaced video-judge">
+      <strong>Video judge</strong>
+      {judgements.map((j) => (
+        <div key={j.task_id}>
+          <div>
+            {j.instruction}: {j.status.toLowerCase()}
+            {j.reason && ` (${j.reason})`}
+          </div>
+          {j.attempts.map((a) => (
+            <div key={a.video} className={a.agrees_with_sim === false ? "error" : undefined}>
+              {a.video}: {a.verdict}
+              {a.confidence !== undefined && ` (${Math.round(a.confidence * 100)}%)`}
+              {a.agrees_with_sim === false && ", disagrees with the simulator"}: {a.reason}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
   );
 }

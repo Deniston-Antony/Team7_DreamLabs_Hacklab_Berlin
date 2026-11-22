@@ -53,7 +53,7 @@ def blocked_reason(records: list[Record]) -> str | None:
         return "This run has no report yet."
     if any(task.refinement_of for task, _, _ in records):
         return "This run is already a suggestion test."
-    if any((evidence.vision or {}).get("status") == "running" for _, evidence, _ in records):
+    if any((evidence.video_judge or {}).get("verdict") == "RUNNING" for _, evidence, _ in records):
         return "The benchmark is still analysing this run's videos."
     if any(evidence.execution_status == "CANCELLED" for _, evidence, _ in records):
         return "This run was stopped early. Run it to the end before testing suggestions."

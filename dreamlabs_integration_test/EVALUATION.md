@@ -84,9 +84,9 @@ Each test starts from the failed attempt's saved scene and makes one change: mov
 
 Tests are stored with the run but do not change its benchmark score. They do not retrain Dream-1, and each change is tried once, so repeat a promising result before relying on it.
 
-## Video perception
+## Video judge
 
-Dream-1 returns actions, not its detections. After a run, OWLv2 samples 10 frames from each attempt's video and tracks which objects moved. This is shown as **Perception (from video)**, is not scored, and describes observed behaviour rather than the model's internal understanding. On 36 object checks from real runs, it matched MuJoCo's movement data in 35.
+Dream-1 returns actions, not its detections. After a run, `video_judge.py` sends 8 frames from each attempt's video to Claude, half from the final 15%. Claude returns Pass, Fail or Unsure with a confidence and reason. A verdict that differs from the simulator is flagged in the report. The verdict appears as **Perception (from video)**, is not scored, and describes the visible result rather than Dream-1's internal understanding. Older reports keep their saved OWLv2 results.
 
 ## Timing and Dream-1 capacity
 
@@ -97,17 +97,10 @@ When Dream-1 reports no capacity, the attempt holds still and retries with incre
 ## Limitations
 
 - Dream-1's API returns arm actions, not detections or attention maps, so video perception is evidence of behaviour and does not prove what the model recognised.
-- The vision check runs locally after the task and is not scored. On 108 first-frame simulator checks it reached 94% agreement with MuJoCo visibility, with 6 missed objects and no false detections.
+- The video judge needs an Anthropic credential, uses API credits, and can be wrong. Review flagged videos before trusting a disagreement.
 - Contacts are sampled at control steps, so very brief contacts can be missed.
 - Uploaded STL collisions use a convex shape.
 - A small number of runs does not establish statistically meaningful performance.
-
-Install the optional vision model from `backend`:
-
-```bash
-uv venv --python 3.12 .vision-venv
-uv pip install --python .vision-venv/bin/python -r vision/requirements.txt
-```
 
 Run the tests from `backend`:
 

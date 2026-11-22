@@ -246,6 +246,20 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(len(store.suggestion_results("source")), 1)
             self.assertEqual(store.run_report("tests")["refinement_of"], "source")
 
+    def test_video_judge_is_saved_without_changing_the_score(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = EvaluationStore(Path(folder))
+            item = task("put apple into the bowl", "j1").model_copy(update={"batch_id": store.current_batch, "run_id": "judge"})
+            before = store.submit(item, evidence(IN_BOWL, task_id="j1")).score
+            store.attach_video_judge("j1", {"verdict": "FAIL", "confidence": 0.9, "reason": "The apple is beside the bowl.", "agrees_with_sim": False})
+            report = store.run_report("judge")
+            self.assertEqual(report["attempts"][0]["result"]["score"], before)
+            self.assertEqual(report["attempts"][0]["result"]["scene_understanding"]["perception"]["status"], "FAIL")
+            self.assertTrue(any("disagrees" in row["title"] for row in report["insights"]["findings"]))
+            self.assertIn("Video judge", task_html(store.report("j1")))
+            store.attach_video_judge("j1", {"verdict": "RUNNING"})
+            self.assertEqual(EvaluationStore(Path(folder)).records["j1"][1].video_judge["verdict"], "ERROR")
+
     def test_instruction_parsing(self):
         parsed = parse_instruction("Put the apple in the bowl without moving the cup", IDS)
         self.assertEqual(parsed.criteria, [Criterion(type="pick_place", object_id="apple", destination_id="bowl")])

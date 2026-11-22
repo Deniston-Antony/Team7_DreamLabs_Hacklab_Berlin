@@ -81,10 +81,11 @@ type Vision = {
   cameras?: Record<string, { url: string; width: number; height: number; objects: Record<string, VisionObject> }>;
   video?: VideoAnalysis | null;
 };
+type VideoJudgeVerdict = { verdict: string; confidence?: number; reason?: string; frames?: number; agrees_with_sim?: boolean };
 type AttemptReport = {
   task: { task_id: string; attempt: number; where: string; instruction: string; scene_number?: number; scene_label?: string | null; test_kind?: string | null; test_change?: string | null };
   execution: { status: string; duration_seconds: number | null; action_count: number | null; model_calls: number | null };
-  evidence: { videos: string[]; vision?: Vision | null };
+  evidence: { videos: string[]; vision?: Vision | null; video_judge?: VideoJudgeVerdict | null };
   result: Result;
 };
 type AttemptRow = { attempt: number; where: string; instruction?: string; scene_id?: string; execution_status: string; outcome: string; score: number | null; summary: string };
@@ -247,6 +248,24 @@ function VisionCheck({ vision }: { vision?: Vision | null }) {
   );
 }
 
+function VideoJudgeView({ judge }: { judge: VideoJudgeVerdict }) {
+  if (judge.verdict === "RUNNING") return <><h3>Video judge</h3><p className="hint">Claude is watching this attempt's video...</p></>;
+  if (!["PASS", "FAIL", "UNSURE"].includes(judge.verdict)) return <><h3>Video judge</h3><p className="hint">{judge.reason ?? "This video was not judged."}</p></>;
+  return (
+    <>
+      <h3>Video judge (not scored)</h3>
+      <div className="video-analysis">
+        <span className={`pill small ${statusClass(judge.verdict)}`}>{label(judge.verdict)}</span>
+        {judge.confidence != null && <span className="muted"> {Math.round(judge.confidence * 100)}% confidence</span>}
+        {judge.agrees_with_sim === true && <span className="muted"> · agrees with the simulator</span>}
+        {judge.agrees_with_sim === false && <strong> · disagrees with the simulator</strong>}
+        <p>{judge.reason}</p>
+        {judge.frames != null && <p className="hint">Based on {judge.frames} frames from this attempt's video, weighted toward the ending.</p>}
+      </div>
+    </>
+  );
+}
+
 function AttemptView({ report }: { report: AttemptReport }) {
   const result = report.result;
   const checks = result.verification.flatMap((item) => item.checks);
@@ -290,7 +309,7 @@ function AttemptView({ report }: { report: AttemptReport }) {
           <td>{item.detail}</td>
         </tr>
       ))}</tbody></table>
-      <VisionCheck vision={report.evidence.vision} />
+      {report.evidence.video_judge ? <VideoJudgeView judge={report.evidence.video_judge} /> : report.evidence.vision ? <VisionCheck vision={report.evidence.vision} /> : <><h3>Video judge</h3><p className="hint">This video has not been judged.</p></>}
       <div className="report-columns">
         <List title="What went well" items={result.went_well} />
         <List title="What went wrong" items={result.went_wrong} />
@@ -436,7 +455,7 @@ function RunView({ runId }: { runId: string }) {
   }, [runId]);
 
   useEffect(() => {
-    if (!report?.attempts.some((item) => item.evidence.vision?.status === "running")) return;
+    if (!report?.attempts.some((item) => item.evidence.video_judge?.verdict === "RUNNING")) return;
     const timer = window.setTimeout(() => {
       getJson<RunReport>(`/api/reports/runs/${runId}`).then(setReport).catch(() => undefined);
     }, 2500);
@@ -446,7 +465,7 @@ function RunView({ runId }: { runId: string }) {
   if (error) return <div className="status error">{error}</div>;
   if (!report) return <p className="hint">Loading report...</p>;
   const current = report.attempts.find((item) => item.task.attempt === tab);
-  const needsVideoCheck = report.attempts.some((item) => item.evidence.videos.length > 0 && !item.evidence.vision?.video && item.evidence.vision?.status !== "running");
+  const needsVideoCheck = report.attempts.some((item) => item.evidence.videos.length > 0 && !["PASS", "FAIL", "UNSURE", "RUNNING"].includes(item.evidence.video_judge?.verdict ?? ""));
   const analyse = async () => {
     await fetch(`/api/reports/runs/${runId}/analyze-videos`, { method: "POST" });
     setReport(await getJson<RunReport>(`/api/reports/runs/${runId}`));
@@ -456,7 +475,7 @@ function RunView({ runId }: { runId: string }) {
       <div className="stream-bar" style={{ marginTop: 14 }}>
         <h3 style={{ margin: 0 }}>{report.run.instruction} <span className="muted">· {when(report.run.started_at)}</span></h3>
         <span className="report-links">
-          {needsVideoCheck && <button onClick={() => void analyse()}>Analyse videos</button>}
+          {needsVideoCheck && <button onClick={() => void analyse()}>Judge videos</button>}
           <a href={`/api/reports/runs/${runId}?format=html`} target="_blank" rel="noreferrer">HTML</a>
           <a href={`/api/reports/runs/${runId}`} target="_blank" rel="noreferrer">JSON</a>
         </span>

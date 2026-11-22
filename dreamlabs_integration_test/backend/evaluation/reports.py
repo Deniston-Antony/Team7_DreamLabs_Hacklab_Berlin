@@ -68,6 +68,7 @@ def task_report(task: TaskDefinition, evidence: Evidence, result: TaskResult) ->
             "approach": evidence.approach,
             "model_output_keys": evidence.model_output_keys,
             "vision": evidence.vision,
+            "video_judge": evidence.video_judge,
         },
     }
 
@@ -82,6 +83,17 @@ def bullets(items: list[str]) -> str:
 
 def page(title: str, body: str) -> str:
     return f'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{escape(title)}</title><style>{STYLE}</style></head><body><main>{body}</main>{SPEED_SCRIPT}</body></html>'
+
+
+def judge_section(judge: dict[str, Any] | None) -> str:
+    if not judge:
+        return ""
+    verdict = judge.get("verdict")
+    if verdict not in ("PASS", "FAIL", "UNSURE"):
+        return f'<section><h2>Video judge</h2><p class="muted">{escape(str(judge.get("reason") or "Judging this video..."))}</p></section>'
+    confidence = "" if judge.get("confidence") is None else f" · {round(judge['confidence'] * 100)}% confidence"
+    agreement = {True: "Agrees with the simulator.", False: "Disagrees with the simulator.", None: ""}[judge.get("agrees_with_sim")]
+    return f'<section><h2>Video judge (not scored)</h2><p><strong>{escape(verdict)}</strong>{escape(confidence)}. {escape(agreement)}</p><p>{escape(str(judge.get("reason") or ""))}</p></section>'
 
 
 def vision_section(vision: dict[str, Any] | None) -> str:
@@ -130,7 +142,7 @@ def task_body(report: dict[str, Any]) -> str:
     <section><h2>What went well</h2>{bullets(result['went_well'])}<h2>What went wrong</h2>{bullets(result['went_wrong'])}<h2>Recommendations</h2>{bullets(result['recommendations'])}<h2>Missing evidence</h2>{bullets(result['missing_evidence'])}</section>
     <section><h2>Evidence</h2>{videos}<h3>Initial and final object positions</h3><table><tr><th>Object</th><th>Initial (m)</th><th>Final (m)</th></tr>{rows(moved)}</table>
     <p class="muted">Contact events recorded: {escape(str(report['evidence']['contact_events_total']))}</p></section>
-    {vision_section(report['evidence'].get('vision'))}
+    {judge_section(report['evidence'].get('video_judge')) or vision_section(report['evidence'].get('vision'))}
     """
     return body
 

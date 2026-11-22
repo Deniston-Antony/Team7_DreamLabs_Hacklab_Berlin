@@ -37,7 +37,7 @@ The simulator runs on your own computer through the official Dream Labs library.
 | Evaluation | 0 to 100 score, outcome, penalties, task checks and missing-evidence notes for each attempt |
 | Benchmarks | Numbered, renamable history with old reports, videos and timestamps |
 | Video | A video for every run, a combined video, and 1x, 1.5x, 2x and 4x playback |
-| Vision check | A separate local OWLv2 model checks camera visibility and which objects moved in each video |
+| Video judge | Claude watches frames from each attempt video, gives Pass, Fail or Unsure, and flags disagreements with the simulator |
 | Final reports | Task and scene comparison, best task, best and hardest scene, and recommendations from each run's data |
 | Suggestion testing | Selectable one-change tests, unchanged controls, a test viewer and a before/after graph |
 | Hosting | Runs from your computer on a custom domain through Cloudflare Tunnel, behind an email login |
@@ -52,7 +52,7 @@ FastAPI backend ───────► evaluation engine, reports and saved be
    │
    ├─ live MuJoCo simulator
    ├─ hidden worker processes for parallel runs
-   └─ local OWLv2 vision check
+   └─ background Claude video judge
    │
    ▼
 Dream-1 API (the key stays on the backend machine)
@@ -63,7 +63,7 @@ Dream-1 API (the key stays on the backend machine)
 | `dreamlabs_integration_test/frontend/` | Website |
 | `dreamlabs_integration_test/backend/` | API, simulator control, scenes and run sessions |
 | `dreamlabs_integration_test/backend/evaluation/` | Scoring, insights, reports, storage and suggestion comparison |
-| `dreamlabs_integration_test/backend/vision/` | Separate local vision model |
+| `dreamlabs_integration_test/backend/video_judge.py` | Claude video judge |
 | `SortFlow/` | Success checks, parallel workers, capacity retries, live feeds and recording |
 | `dreamlabs_integration_test/EVALUATION.md` | Detailed scoring and evidence rules |
 
@@ -83,7 +83,7 @@ Run data is saved locally in `backend/evaluation_data/` and `backend/task_videos
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-git clone -b web-integration https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
+git clone -b Umair+Deniston_code_combined https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
 cd Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test
 
 cd backend
@@ -95,16 +95,17 @@ npm ci
 cd ..
 ```
 
-### Optional: install the vision check
+### Optional: turn on the video judge
 
-This is a large download. Without it, runs and scoring still work, and reports say the vision check is unavailable.
+Without an Anthropic key, runs and scoring still work, and reports say the video was not judged. To turn it on, run this in the terminal that starts the backend:
 
 ```bash
-cd backend
-uv venv --python 3.12 .vision-venv
-uv pip install --python .vision-venv/bin/python -r vision/requirements.txt
-cd ..
+printf 'Paste your Anthropic API key, then press Enter: '
+read -rs ANTHROPIC_API_KEY; echo
+export ANTHROPIC_API_KEY
 ```
+
+The default model is `claude-opus-5-5`. Set `VIDEO_JUDGE_MODEL` to use another. Never commit the key or put it in frontend code.
 
 ### Add your API key
 
@@ -183,7 +184,7 @@ Each attempt gets a score from 0 to 100:
 
 Outcomes are **Success**, **Partial success**, **Failure**, **Unsafe** and **Not evaluable**. Penalties and score caps are explained in [EVALUATION.md](dreamlabs_integration_test/EVALUATION.md).
 
-Dream-1 returns robot actions, not what it internally detected. The local vision check therefore describes what the cameras and videos show. It is not scored and does not prove what Dream-1 understood.
+Dream-1 returns robot actions, not what it internally detected. After each run, the **video judge** sends 8 frames from each attempt video to Claude, weighted toward the ending. It returns Pass, Fail or Unsure with a confidence and reason, and flags any disagreement with the simulator. It is not scored, so simulator evidence remains the source of the score.
 
 ## Suggestion testing
 
@@ -280,7 +281,7 @@ These tests use no API key and no credits:
 ```bash
 cd dreamlabs_integration_test/backend
 uv pip install --python .venv/bin/python httpx
-DREAM_VISION=off DREAM_GATEWAY_URL=https://127.0.0.1:9 MUJOCO_GL=cgl .venv/bin/python -m unittest test_evaluation test_outcome
+DREAM_VISION=off DREAM_GATEWAY_URL=https://127.0.0.1:9 MUJOCO_GL=cgl .venv/bin/python -m unittest test_video_judge test_evaluation test_outcome
 cd ../../SortFlow
 MUJOCO_GL=cgl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest test_capacity test_parallel_bench test_recording
 ```
@@ -289,6 +290,7 @@ Use `MUJOCO_GL=egl` on headless Linux.
 
 ## Costs and limitations
 
+- The video judge uses Anthropic API credits for each judged attempt and sends its video frames to Anthropic.
 - Every live, parallel and suggestion run uses Dream Labs credits. The website estimates about $0.07 for a 120-second run and shows the most a request can cost. Check the [Billing page](https://platform.dreamlabs.ai/billing) for current prices.
 - One request runs at a time, with up to 9 runs, or up to 8 for suggestion tests.
 - Only the YAM robot can run. Other arms are listed until they have simulator actuators, cameras and a measured tool center point.
@@ -306,7 +308,7 @@ Use `MUJOCO_GL=egl` on headless Linux.
 | Website says **Reconnecting** | Start the backend, then refresh |
 | Task fails with a key or credit error | Check `~/.dreamlabs/credentials` and your Dream Labs balance |
 | Dream-1 reports no capacity | The run waits and retries. Use fewer parallel runs or try later |
-| Vision check is unavailable | Install the optional vision environment |
+| Video judge says no Anthropic credential | Set `ANTHROPIC_API_KEY` in the backend terminal and restart it, then press **Judge videos** |
 | Domain does not open in Chrome | Check that the backend and tunnel are running, then try Cloudflare secure DNS |
 | Page differs from this README | Restart the servers after pulling, rebuild if hosted, and refresh |
 | `task_videos` is large | Delete old run folders you no longer need |
@@ -321,5 +323,7 @@ Use `MUJOCO_GL=egl` on headless Linux.
 | `Deniston+Final_Report` | Shared scenes, combined videos, playback speeds, scene comparison, parallel 3D editing and per-run timers |
 | `suggestion_testing` | One-change tests, controls, test viewer and before/after results |
 | `web-integration` | Custom-domain hosting through Cloudflare Tunnel and this README |
+| `umair-video-judge` | Claude video judge |
+| `Umair+Deniston_code_combined` | Web interface with the Claude judge replacing the earlier OWLv2 check |
 
-**Team:** Deniston (website and simulator integration), Umar (evaluation, scoring and reports) and Ashiq (robot, CLI and execution).
+**Team:** Deniston (website and simulator integration), Umair (evaluation, scoring, reports and video judge) and Ashiq (robot, CLI and execution).

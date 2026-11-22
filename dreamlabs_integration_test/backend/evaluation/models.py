@@ -101,7 +101,8 @@ class Evidence(BaseModel):
     model_output_keys: list[str] = Field(default_factory=list)
     frames: dict[str, str] = Field(default_factory=dict)
     visible_pixels: dict[str, dict[str, int]] = Field(default_factory=dict)
-    vision: dict[str, Any] | None = None
+    vision: dict[str, Any] | None = None  # the earlier OWLv2 check, kept so saved reports still show it
+    video_judge: dict[str, Any] | None = None
     hidden_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
