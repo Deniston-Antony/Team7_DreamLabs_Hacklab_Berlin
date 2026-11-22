@@ -6,6 +6,9 @@ Set up a tabletop scene, give Dream-1 tasks in plain English, watch up to 9 runs
 
 Built by Team 7 at Dream Labs Hacklab Berlin.
 
+> [!NOTE]
+> **Claude is optional.** RoboTester works without an Anthropic account or key. The free **Offline judge** is the default. You can [add the Claude judge](#optional-add-the-claude-judge) later without changing any code.
+
 > [!IMPORTANT]
 > Real runs use your Dream Labs credits. The simulator runs on your computer through the official Dream Labs library. Simulation results do not prove that a real robot is safe or reliable.
 
@@ -30,6 +33,7 @@ Everyone completes [Part 1: Install RoboTester](#part-1-install-robotester). The
 - [Part 1: Install RoboTester](#part-1-install-robotester)
 - [Option A: Run locally](#option-a-run-locally)
 - [Option B: Use a custom domain](#option-b-use-a-custom-domain)
+- [Optional: Add the Claude judge](#optional-add-the-claude-judge)
 - [Use the website](#use-the-website)
 - [How scoring works](#how-scoring-works)
 - [Stop, restart and update](#stop-restart-and-update)
@@ -53,7 +57,7 @@ Everyone completes [Part 1: Install RoboTester](#part-1-install-robotester). The
 | **Dream-1 logs** | A request log for each run, including timing and errors |
 | **Saved scenes** | Every run saves its starting scenes so a test can be repeated |
 | **Scoring** | A 0 to 100 score from simulator evidence, with penalties and checks |
-| **Video judges** | A free Offline judge or a Claude judge, each with its own task prompt |
+| **Video judges** | The free Offline judge by default, with an optional Claude judge add-on |
 | **Benchmarks** | Named history with old reports, videos and timestamps |
 | **Reports** | Task and scene comparison, combined videos and recommendations based on each run |
 | **Suggestion testing** | One-change tests, unchanged controls and a before/after graph |
@@ -68,8 +72,9 @@ You need:
 - About **8 GB of free disk space**, including the optional Offline judge.
 - At least **16 GB of RAM** if you plan to run several parallel runs.
 - An internet connection.
-- An [Anthropic API key](https://platform.claude.com/settings/keys), only if you want the Claude judge.
 - A domain name, only for Option B.
+
+You do **not** need an Anthropic account unless you choose the [optional Claude judge](#optional-add-the-claude-judge).
 
 | System | Status |
 | --- | --- |
@@ -289,9 +294,9 @@ You should see `built in` near the end.
 
 The key is saved outside the project. Never commit it or put it in website code.
 
-### Step 7: Install the Offline judge (recommended)
+### Step 7: Install the Offline judge (default)
 
-The Offline judge checks which objects moved in each video. It runs on your computer and uses no Anthropic credits. It is a large download. If you skip it, runs and scoring still work, but videos are not analysed.
+The Offline judge is RoboTester's default. It checks which objects moved in each video, runs on your computer, and needs no Anthropic account or credits. It is a large download. If you skip it, runs and scoring still work, but videos are not analysed.
 
 ```bash
 cd backend
@@ -302,15 +307,7 @@ cd ..
 
 The vision model downloads the first time this judge analyses a video.
 
-### Step 8: Prepare the Claude judge (optional)
-
-The Claude judge reviews each attempt's video and returns **Pass**, **Fail** or **Unsure** with a reason. It uses Anthropic credits and sends video frames to Anthropic.
-
-1. Open the [Claude Console](https://platform.claude.com), add credits under **Settings → Billing**, and create a key under [API keys](https://platform.claude.com/settings/keys).
-2. Copy the key. It is only shown once.
-3. You will enter it when you start the backend in Option A or B.
-
-Installation is finished. Continue with [Option A](#option-a-run-locally) or [Option B](#option-b-use-a-custom-domain).
+Installation is finished. Continue with [Option A](#option-a-run-locally) or [Option B](#option-b-use-a-custom-domain). You do not need Claude for either option.
 
 ---
 
@@ -326,15 +323,7 @@ Open a terminal and go to the backend folder:
 cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
 ```
 
-**Optional, for the Claude judge:** run this and paste your Anthropic key:
-
-```bash
-printf 'Paste your Anthropic API key, then press Enter: '
-read -rs ANTHROPIC_API_KEY; echo
-export ANTHROPIC_API_KEY
-```
-
-Then start the backend:
+Start the backend:
 
 <details>
 <summary><strong>macOS</strong></summary>
@@ -521,14 +510,6 @@ npm run build
 cd ../backend
 ```
 
-**Optional, for the Claude judge:** run this and paste your Anthropic key:
-
-```bash
-printf 'Paste your Anthropic API key, then press Enter: '
-read -rs ANTHROPIC_API_KEY; echo
-export ANTHROPIC_API_KEY
-```
-
 Start the backend, using your domain:
 
 <details>
@@ -586,13 +567,141 @@ If RoboTester opens without a login, **stop the tunnel immediately** with `Ctrl 
 
 ---
 
+## Optional: Add the Claude judge
+
+**Skip this section unless you want it.** Without it, the whole website works with the Offline judge, and **Claude judge** simply shows as not available.
+
+No code changes are needed. Claude support is already included and stays off until the backend has an Anthropic API key.
+
+| | Offline judge (default) | Claude judge (optional) |
+| --- | --- | --- |
+| **Account needed** | None | Anthropic API account |
+| **Cost** | Free | Uses Anthropic credits for each judged attempt |
+| **Runs on** | Your computer | Anthropic API |
+| **Video data** | Stays on your computer | Selected video frames are sent to Anthropic |
+| **Result** | Which objects moved | Pass, Fail or Unsure with a reason |
+
+### C1: Create an Anthropic API key
+
+1. Open the [Claude Console](https://platform.claude.com) and sign up or log in.
+2. Add credits under **Settings → Billing**. A Claude chat subscription does not include API credits.
+3. Optional: set a monthly spend limit under **Settings → Limits**.
+4. Open [API keys](https://platform.claude.com/settings/keys) and click **Create Key**.
+5. Name it `RoboTester`, then copy it. The full key is only shown once.
+
+Never put this key in the project, GitHub, a screenshot or a chat.
+
+### C2: Add the key to the backend terminal
+
+1. Stop the running backend with `Ctrl + C`.
+2. In that same terminal, paste this whole block and press Enter:
+
+   ```bash
+   {
+     printf 'Paste your Anthropic API key, then press Enter: '
+     read -rs ANTHROPIC_API_KEY; echo
+     export ANTHROPIC_API_KEY
+     echo "Anthropic key loaded for this terminal."
+   }
+   ```
+
+3. Paste your key when asked and press Enter. **Nothing appears while you paste.** That is normal.
+
+The key is kept only in this terminal and is not saved to a file. Repeat this step whenever you open a new backend terminal.
+
+### C3: Start the backend again
+
+Use the command for your system and setup. For a custom domain, replace `your-domain.com`.
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+**Run locally:**
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+MUJOCO_GL=cgl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+**Custom domain:**
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+DREAM_PUBLIC_ORIGIN=https://your-domain.com MUJOCO_GL=cgl caffeinate -i .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+**Run locally:**
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+**Custom domain:**
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+DREAM_PUBLIC_ORIGIN=https://your-domain.com MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+```
+
+If rendering fails, use `MUJOCO_GL=osmesa`.
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Run these in **Ubuntu**.
+
+**Run locally:**
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+**Custom domain:**
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+DREAM_PUBLIC_ORIGIN=https://your-domain.com MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+```
+
+If rendering fails, use `MUJOCO_GL=osmesa`.
+
+</details>
+
+### C4: Choose the Claude judge
+
+1. Refresh the website.
+2. In **Tasks** or **Suggestion testing**, open **Judge** and choose **Claude judge**.
+3. Check that **Prompt sent to Dream-1** now ends with `and let go so it rests there`.
+4. Run a task. After it finishes, open its report and find **Video judge (not scored)**.
+
+On a custom domain, everyone you approve can use the Claude judge and spend your Anthropic credits.
+
+### Turn Claude off
+
+Stop the backend with `Ctrl + C`, run this, and start the backend normally:
+
+```bash
+unset ANTHROPIC_API_KEY
+```
+
+The website returns to the Offline judge. Your saved reports stay available.
+
 ## Use the website
 
 ### Run a test
 
 1. On **Simulator**, press **Reset scene**.
 2. Choose a scene style and arrange the objects.
-3. In **Tasks**, choose a **Judge**.
+3. In **Tasks**, keep **Offline judge** selected unless you added the [optional Claude judge](#optional-add-the-claude-judge).
 4. Enter a task such as `put apple into the bowl` or `put orange on the plate`.
 5. Use **Add task** for more tasks.
 6. Set **Scenes per task**. For example, 2 tasks × 3 scenes = 6 runs, up to 9.
@@ -605,10 +714,12 @@ If RoboTester opens without a login, **stop the tunnel immediately** with `Ctrl 
 
 ### Choose a judge
 
+The **Offline judge** is the default. The Claude judge is available only after you complete [its optional setup](#optional-add-the-claude-judge).
+
 | Judge | Runs on | Prompt sent for `put apple into the bowl` | Result |
 | --- | --- | --- | --- |
 | **Offline judge** | Your computer | `put red apple into the white bowl` | Which objects moved |
-| **Claude judge** | Anthropic API | `put apple into the bowl and let go so it rests there` | Pass, Fail or Unsure with a reason |
+| **Claude judge (optional)** | Anthropic API | `put apple into the bowl and let go so it rests there` | Pass, Fail or Unsure with a reason |
 
 The judges do not change the 0 to 100 score. Because their prompts differ, compare them on the same scenes and repeat the test before deciding which prompt works better.
 
@@ -623,7 +734,7 @@ Go to **Benchmarks**, choose a benchmark, and open a run. The **Final report** s
 ### Test suggestions
 
 1. Open a benchmark and choose **Suggestion testing**.
-2. Select a judge and tick the tests to run.
+2. Keep the Offline judge, or choose Claude if you added it, then tick the tests to run.
 3. Keep at least one **unchanged control**.
 4. Press **Run selected tests**.
 5. Watch each test, then compare the before/after graph.
@@ -731,7 +842,7 @@ MUJOCO_GL=egl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest
 | Run fails with a key or credit error | Check `~/.dreamlabs/credentials` and your [Dream Labs billing](https://platform.dreamlabs.ai/billing) |
 | Dream-1 reports no capacity | The run waits and retries. Use fewer parallel runs or try later |
 | Offline judge says not installed | Complete Step 7 and restart the backend |
-| Claude judge is unavailable | Export `ANTHROPIC_API_KEY` in the backend terminal and restart it |
+| Claude judge is unavailable | This is normal without a key. To use it, follow [Optional: Add the Claude judge](#optional-add-the-claude-judge) |
 | Claude judge shows a credit error | Add credits in the [Claude Console](https://platform.claude.com) |
 | Domain does not resolve | Wait for Cloudflare to show **Active**. In Chrome, try **Use secure DNS** with Cloudflare, or another network |
 | Cloudflare error `1033` or `530` | The tunnel is not running. Start it from B6 |
@@ -745,7 +856,7 @@ MUJOCO_GL=egl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest
 **Costs**
 
 - Every live, parallel and suggestion run uses Dream Labs credits. The website estimates about **$0.07 per 120-second run** and shows the maximum before you start. Check [Dream Labs billing](https://platform.dreamlabs.ai/billing) for current prices.
-- The Claude judge uses Anthropic credits for each judged attempt.
+- The optional Claude judge uses Anthropic credits for each judged attempt.
 - The Offline judge, tests and Cloudflare's free plan do not use those credits.
 
 **Security**
@@ -796,7 +907,7 @@ Browser
 FastAPI backend ───► scoring, reports and saved benchmarks
    ├─ live MuJoCo simulator
    ├─ hidden worker processes for parallel runs
-   └─ selected video judge: Offline or Claude
+   └─ video judge: Offline by default, optional Claude
    │
    ▼
 Dream-1 API (the key stays on the backend computer)
