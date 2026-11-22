@@ -108,6 +108,18 @@ class ParallelBenchTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(record["tries_used"], 1)
 
+    def test_a_worker_hands_its_dream_log_path_to_dream_control(self):
+        """--round-trip-log reaches dream_control's arguments; without it none is passed."""
+        seen = []
+
+        def runner(argv, shared_env=None, stop_event=None, **kw):
+            seen.append(list(argv))
+
+        parallel_bench.run_worker("put apple into the bowl", 5, 48, 1, runner=runner, round_trip_log="/x/attempt-2.dream.jsonl")
+        parallel_bench.run_worker("put apple into the bowl", 5, 48, 1, runner=runner)
+        self.assertEqual(seen[0][seen[0].index("--round-trip-log") + 1], "/x/attempt-2.dream.jsonl")
+        self.assertNotIn("--round-trip-log", seen[1])
+
     def test_a_worker_starts_from_a_saved_scene(self):
         """With a scene given, every attempt starts from that model and state, not from the default scene."""
         from yam_env import YamEnv

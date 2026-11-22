@@ -154,6 +154,7 @@ def run_worker(
     evidence=None,
     view=None,
     final_state=None,
+    round_trip_log=None,
 ):
     """Run one trial in this process: up to `tries` attempts, each from a reset scene.
     @param task The prompt, such as "put orange into the bowl"; it must name an item and a bowl or plate.
@@ -170,6 +171,7 @@ def run_worker(
         nothing.
     @param view (json_path, run number) of the website's 3D camera, followed while this run is being watched.
     @param final_state Path of an .npz to save the final scene to, so the website can keep rotating it after the run.
+    @param round_trip_log Path of a JSON-lines file to log every Dream-1 request to (roundtrip_log.py); None logs none.
     @param scene (model_path, state_path) of a scene to start every attempt from: a compiled MuJoCo model saved with
         mujoco.mj_saveModel and an .npz of its qpos, qvel and ctrl. None uses the default Dream YAM scene.
     @param goal (body_name, target) judged by the website's contact rule, for any body in the scene; None parses the
@@ -190,6 +192,8 @@ def run_worker(
     argv = ["--task", task, "--headless", "--quiet", "--seconds", str(run_seconds), "--actions", str(actions)]
     if model:
         argv += ["--model", model]
+    if round_trip_log:
+        argv += ["--round-trip-log", str(round_trip_log)]
     env = YamEnv()
     reset = env.reset
     if scene:
@@ -342,6 +346,7 @@ def worker_main(args):
             evidence=evidence,
             view=view,
             final_state=args.final_state,
+            round_trip_log=args.round_trip_log,
         )
     except StopRequested:  # stopped before the run began
         record = {"task": args.task, "success": False, "error": "stopped", "stopped": True}
@@ -467,6 +472,7 @@ def main(argv=None):
     parser.add_argument("--final-state", default=None, help=".npz path for the final scene")
     parser.add_argument("--evidence", default=None, help="JSON path for a worker's simulator evidence")
     parser.add_argument("--evidence-objects", default=None, help="comma-separated scene objects to record")
+    parser.add_argument("--round-trip-log", default=None, help="JSON-lines file to log a worker's Dream-1 requests to")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not (

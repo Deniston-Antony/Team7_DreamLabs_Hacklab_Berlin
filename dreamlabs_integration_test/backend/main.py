@@ -26,6 +26,7 @@ import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
 import capacity  # noqa: E402
+import roundtrip_log  # noqa: E402  (SortFlow's; outcome puts SortFlow on the path)
 import evaluation  # noqa: E402
 import environments  # noqa: E402
 import scene_saves  # noqa: E402
@@ -818,6 +819,7 @@ tasks = {}
 active_task = None
 active_stop = None
 active_clock = None
+active_dream_log = None  # the live run's Dream-1 log (roundtrip_log.RoundTripLog) while a task runs
 environments.free_view = sim.free_view_params
 view_pool = ThreadPoolExecutor(max_workers=1)  # renders finished parallel runs while the simulator thread is busy
 final_scenes = OrderedDict()
@@ -838,6 +840,8 @@ def open_counted_policy(config, key):
         client = capacity.CapacityClient(client, active_clock)
     if sim.capture is not None:
         sim.capture.watch_model_calls(client)
+    if active_dream_log is not None:
+        active_dream_log.watch(client)
     return client
 
 
@@ -1179,7 +1183,7 @@ def plan_goals(plan):
 
 
 def run_task(task, stop):
-    global active_task, active_stop, active_clock
+    global active_task, active_stop, active_clock, active_dream_log
     result = {}
     goals = plan_goals(task["plan"])
     goal = goals[0]
@@ -1190,6 +1194,7 @@ def run_task(task, stop):
     )
     active_clock = clock
     sim.clock = clock
+    active_dream_log = roundtrip_log.RoundTripLog(outcome.dream_log_path(outcome.VIDEOS / task["task_id"], 1), sim.env)
     session = None
     definition = None
     capture = None
@@ -1268,6 +1273,8 @@ def run_task(task, stop):
         active_task = None
         active_stop = None
         active_clock = None
+        active_dream_log.close()
+        active_dream_log = None
         task.update(result, finished_at=finished_at)
 
 
@@ -1915,6 +1922,21 @@ def task_video(task_id: str, clip: str):
     if not known or not outcome.CLIP.match(clip) or not path.is_file():
         raise HTTPException(404, "no such video")
     return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/api/tasks/{task_id}/dream-log/{attempt}")
+def task_dream_log(task_id: str, attempt: int, full: bool = False, after: int = 0):
+    """Run `attempt`'s Dream-1 log: one entry per request (timing, rows, errors) and a summary.
+
+    `after` leaves out the entries numbered up to it, so a page following a running run fetches only new ones;
+    `full` adds each request's state and returned chunk.
+    """
+    known = task_id in tasks or evaluations.has_run(task_id)
+    if not known or not 1 <= attempt <= outcome.MAX_ATTEMPTS:
+        raise HTTPException(404, "no such run")
+    log = roundtrip_log.read(outcome.dream_log_path(outcome.VIDEOS / task_id, attempt), full=full)
+    log["entries"] = [entry for entry in log["entries"] if entry.get("n", 0) > after]
+    return log
 
 
 @app.get("/api/tasks/{task_id}/frames/{attempt}/{camera}")

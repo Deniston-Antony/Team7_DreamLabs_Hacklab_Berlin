@@ -222,3 +222,9 @@ tr.run-row { cursor: pointer; }
 .test-viewer .main-view { touch-action: none; }
 .result-head { align-items: center; margin-top: 14px; }
 .result-head h3 { margin: 0; }
+.dream-log-summary { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: #4b545c; }
+.dream-log-summary .bad { color: #8a1f17; }
+.dream-log-toggle { margin-top: 8px; }
+.dream-log-table { margin-top: 8px; max-height: 320px; overflow-y: auto; }
+.dream-log-table tr.warn td { background: #f9eeda; }
+.dream-log-table tr.bad td { background: #fdecea; color: #8a1f17; }

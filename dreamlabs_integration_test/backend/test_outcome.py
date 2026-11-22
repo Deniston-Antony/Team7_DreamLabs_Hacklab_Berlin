@@ -13,6 +13,7 @@ os.environ.setdefault("DREAM_VISION", "off")
 os.environ.setdefault("DREAM_EVALUATION_DATA", tempfile.mkdtemp(prefix="dream-evaluation-tests-"))
 
 import textwrap
+import types
 import time
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ import main
 import mujoco
 import numpy as np
 import outcome
+import roundtrip_log
 import scene_saves
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -770,6 +772,66 @@ class OutcomeTest(unittest.TestCase):
             outcome.Session.finish = original
         self.assertIn("disk full", task["attempts_error"])
         self.assertEqual(self.client.post("/api/scene/reset").status_code, 200, "the backend is free again")
+
+    def test_every_run_has_a_dream_log_the_api_serves(self):
+        """The live run and each worker are told where to log their Dream-1 requests; the API serves each run's log."""
+        line = (
+            "import roundtrip_log, types, time\n"
+            "log = roundtrip_log.RoundTripLog(arg('--round-trip-log'))\n"
+            "for _ in range(3):\n"
+            "    log(types.SimpleNamespace(sent_s=time.time(), frames={}, observation={'prompt': said},\n"
+            "        action={'q_l_chunk': [[0] * 7] * 48, 'q_r_chunk': [[0] * 7] * 48}, timing={'rtt_ms': 500.0, 'serve_infer_ms': 400}, error=None))\n"
+            "log.close()\n"
+            'print("RESULT " + json.dumps({"success": False, "sim_seconds": None, "closest_cm": 9}))'
+        )
+        outcome.SORTFLOW = self.fake_workers(line)
+        live = model(steps=20)
+
+        class Client:
+            """Stands in for the dream client: get_action() reports itself to on_round_trip() as the real one does."""
+
+            fns = []
+
+            def on_round_trip(self, fn):
+                self.fns.append(fn)
+
+            def get_action(self):
+                for fn in self.fns:
+                    fn(types.SimpleNamespace(sent_s=time.time(), frames={}, observation={}, action=None,
+                                             timing={"rtt_ms": 900.0}, error=RuntimeError("DA-6000 serve error")))
+                raise RuntimeError("DA-6000 serve error")
+
+        def logged(argv, **kw):
+            client = main.dc.open_policy({}, "fake-not-a-key")  # the backend's wrapper around the real opener
+            try:
+                client.get_action()
+            except RuntimeError:
+                pass
+            return live(argv, **kw)
+
+        opener = main._open_policy
+        main._open_policy = lambda config, key: Client()
+        try:
+            task = self.submit("put apple into the bowl", logged, attempts=3)
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+            main._open_policy = opener
+        first = self.client.get(f"/api/tasks/{task['task_id']}/dream-log/1").json()
+        self.assertEqual(first["summary"]["requests"], 1)
+        self.assertEqual(first["summary"]["errors"], 1)
+        for attempt in (2, 3):
+            log = self.client.get(f"/api/tasks/{task['task_id']}/dream-log/{attempt}").json()
+            self.assertEqual([e["n"] for e in log["entries"]], [1, 2, 3])
+            self.assertNotIn("chunk", log["entries"][0])
+            self.assertEqual(log["summary"]["serve_infer_ms"]["mean"], 400)
+        newer = self.client.get(f"/api/tasks/{task['task_id']}/dream-log/2?after=2").json()
+        self.assertEqual([e["n"] for e in newer["entries"]], [3])
+        full = self.client.get(f"/api/tasks/{task['task_id']}/dream-log/2?full=true").json()
+        self.assertEqual(len(full["entries"][0]["chunk"]["q_l_chunk"]), 48)
+        self.assertEqual(self.client.get("/api/tasks/nope/dream-log/1").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-log/0").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-log/10").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-log/4").json()["entries"], [])
 
     def test_bad_requests_are_refused(self):
         """Too many attempts, and video names that try to leave the folder, are refused."""

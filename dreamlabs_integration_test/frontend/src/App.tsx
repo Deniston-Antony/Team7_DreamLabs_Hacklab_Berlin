@@ -4,6 +4,7 @@ import { BenchmarksPage } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
 import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
 import { clock, RunProgress, runTone } from "./RunProgress";
+import { DreamLogPanel } from "./DreamLog";
 import type { TestViewerState } from "./SuggestionTests";
 
 type SceneObject = {
@@ -829,6 +830,7 @@ export default function App() {
             </div>
           </div>
           {task && <AttemptsPanel key={task.task_id} task={task} />}
+          {task && !task.suggestion_test && <DreamLogPanel key={`${task.task_id}-${viewAttempt}`} taskId={task.task_id} attempt={viewAttempt} runLabel={runName(viewAttempt)} running={running} />}
           {task?.evaluation && (
             <div className="panel report-prompt">
               <span>This task's report is ready.</span>

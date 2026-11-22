@@ -337,6 +337,7 @@ def main(argv=None, shared_env=None, shared_viewer=None, stop_event=None, collis
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Render and validate observation without calling API")
     parser.add_argument("--quiet", action="store_true", help="Compact progress and one final summary")
+    parser.add_argument("--round-trip-log", default=None, help="JSON-lines file to log every Dream-1 request to")
     args = parser.parse_args(argv)
     if not 1 <= args.actions <= 48 or not np.isfinite(args.seconds) or args.seconds <= 0 or not args.task.strip():
         parser.error("Use 1–48 actions, positive finite seconds, and a nonempty task.")
@@ -360,7 +361,12 @@ def main(argv=None, shared_env=None, shared_viewer=None, stop_event=None, collis
     policy = None
     request_times, adjustments = [], []
     executed_rows = 0
+    log = None
     try:
+        if args.round_trip_log and not args.dry_run:
+            from roundtrip_log import RoundTripLog
+
+            log = RoundTripLog(args.round_trip_log, env)
         windows = {name: deque(maxlen=FRAMES) for name in VIDEO_ROLES}
         steps = 0  # control steps run, simulated time: a frame joins the windows every FRAME_EVERY_STEPS
         while any(len(window) < FRAMES for window in windows.values()):
@@ -410,6 +416,8 @@ def main(argv=None, shared_env=None, shared_viewer=None, stop_event=None, collis
             if poses and not args.quiet:
                 print("  This model reads each hand's pose; the serve adds it from the YAM station keys.")
             policy = open_policy(policy_config(args.model, gateway, poses), key)
+            if log:
+                log.watch(policy)
             feed(policy, env, windows, args.task, args.model, steps, every=0, station=poses)
             restarts = 0
             while active():
@@ -442,6 +450,8 @@ def main(argv=None, shared_env=None, shared_viewer=None, stop_event=None, collis
                     policy.close()
                     poses = True
                     policy = open_policy(policy_config(args.model, gateway, poses), key)
+                    if log:
+                        log.watch(policy)
                     feed(policy, env, windows, args.task, args.model, steps, every=0, station=poses)
                     continue
                 restarts = 0
@@ -501,6 +511,8 @@ def main(argv=None, shared_env=None, shared_viewer=None, stop_event=None, collis
                 + (" · limits adjusted (details: --verbose)" if adjustments else ""),
                 flush=True,
             )
+        if log:
+            log.close()
         if shared_env is None:
             env.close()
 

@@ -42,6 +42,11 @@ current = None  # the newest request's Session: its workers' latest frames stay 
 previews = None  # prepared parallel environments shown before a run: {"mode", "seed", "count", "envs", "version"}
 
 
+def dream_log_path(folder, attempt):
+    """Where run `attempt` of a task logs its Dream-1 requests (SortFlow/roundtrip_log.py), in the task's folder."""
+    return Path(folder) / f"attempt-{attempt}.dream.jsonl"
+
+
 def describe(goal):
     """A short name for a goal, for video labels: "apple>plate"."""
     return f"{goal['object']}>{goal['target']}"
@@ -151,6 +156,8 @@ class Workers:
             str(self.view_path),
             "--final-state",
             str(self.folder / f"attempt-{job['attempt']}.final.npz"),
+            "--round-trip-log",
+            str(dream_log_path(self.folder, job["attempt"])),
         ] + (
             [
                 "--evidence",
