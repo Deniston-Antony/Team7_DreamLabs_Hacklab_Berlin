@@ -78,13 +78,15 @@ def entry(round_trip, number, sim_s=None):
 class RoundTripLog:
     """Appends one line per request to a file; register it with `client.on_round_trip(log)`.
 
-    A write that fails is reported once on stderr and never stops the run.
+    Numbering goes on from the lines already in the file: a worker that restarts its Dream-1 loop (after repeated
+    refusals, say) logs into the same file, and its requests keep counting up. A write that fails is reported once
+    on stderr and never stops the run.
     """
 
     def __init__(self, path, env=None):
         self.path = path
         self.env = env
-        self.count = 0
+        self.count = max((entry.get("n", 0) for entry in read(path)["entries"]), default=0)
         self._lock = threading.Lock()
         self._failed = False
         self._file = None
@@ -141,7 +143,7 @@ def read(path, full=False):
                     item.pop("state", None)
                     item.pop("chunk", None)
                 entries.append(item)
-    except FileNotFoundError:
+    except OSError:  # no file yet, or a path that cannot hold one: no entries
         pass
     return {"entries": entries, "summary": summary(entries)}
 

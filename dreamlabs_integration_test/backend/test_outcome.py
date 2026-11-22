@@ -864,6 +864,31 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(self.client.get("/api/tasks/nope/dream-client-log/1").status_code, 404)
         self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-client-log/10").status_code, 404)
 
+    def test_a_run_that_waited_most_of_its_time_for_a_seat_is_not_judged(self):
+        """A failed run that spent a quarter of its limit or more waiting for a Dream-1 seat is marked starved and
+        counted apart; a success that waited still counts, and a failure that barely waited is an ordinary failure."""
+        line = (
+            "wait = {'2': 15.0, '3': 15.0, '4': 1.0}[arg('--attempt')]\n"
+            "ok = arg('--attempt') == '3'\n"
+            'print("RESULT " + json.dumps({"success": ok, "sim_seconds": 4.0 if ok else None, "closest_cm": 9, "seat_wait_s": wait}))'
+        )
+        outcome.SORTFLOW = self.fake_workers(line)
+        try:
+            task = self.submit("put apple into the bowl", model(steps=20), attempts=4, max_seconds=20)
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+        rows = {r["attempt"]: r for r in task["attempt_results"]}
+        self.assertEqual({a: rows[a]["starved"] for a in (2, 3, 4)}, {2: True, 3: False, 4: False})
+        self.assertEqual(rows[2]["seat_wait_s"], 15.0)
+        self.assertEqual(task["attempts_starved"], 1)
+        self.assertFalse(rows[1]["starved"])
+        states = {s["attempt"]: s for s in self.client.get(f"/api/tasks/{task['task_id']}/status").json().get("attempt_states", [])}
+        if states:  # the page reads the same marks from the run states
+            self.assertTrue(states[2]["starved"])
+        self.assertTrue(outcome.starved(False, 30, 120))
+        self.assertFalse(outcome.starved(False, 29, 120))
+        self.assertFalse(outcome.starved(True, 119, 120))
+
     def test_bad_requests_are_refused(self):
         """Too many attempts, and video names that try to leave the folder, are refused."""
         reply = self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "attempts": 10})

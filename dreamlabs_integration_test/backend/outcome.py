@@ -47,6 +47,15 @@ def dream_log_path(folder, attempt):
     return Path(folder) / f"attempt-{attempt}.dream.jsonl"
 
 
+STARVED_SHARE = 0.25  # a run that failed after waiting this share of its time limit for a Dream-1 seat is not judged
+
+
+def starved(success, seat_wait_s, limit_s):
+    """Whether a run is not judged: it failed, but spent so much of its time waiting for a free Dream-1 seat
+    (DA-2000 pool_full) that the failure says nothing about the robot. A success always counts."""
+    return not success and bool(limit_s) and (seat_wait_s or 0.0) >= STARVED_SHARE * limit_s
+
+
 def client_log_path(folder, attempt):
     """Where run `attempt` keeps the dream client's own log (sessions, pacing, warnings): a worker's DREAM_LOG_DIR
     points at this file's folder, and the live run's lines are copied here while it runs."""
@@ -288,6 +297,7 @@ class Session:
         global current
         self.task, self.env, self.finished, self.workers = task, env, False, None
         self.clock, self.held, self.live_passed = clock, 0.0, None
+        self.waits = {}  # attempt -> {"seat_wait_s", "starved"} once the runs are finished
         self.plan = [
             {"instruction": p["instruction"], "attempts": int(p.get("attempts", 1)), "goal": g}
             for p, g in zip(task["plan"], goals)
@@ -368,6 +378,7 @@ class Session:
                 "where": "live",
                 "success": live_ok,
                 "sim_seconds": round(self.env.data.time - self.started, 1) if live_ok else None,
+                "seat_wait_s": round(self.clock.waited(), 1) if self.clock else 0.0,
             }
         ] if self.has_live else []
         ended = result.get("status") == "CANCELLED"  # a failed live run leaves the parallel runs to finish
@@ -398,10 +409,16 @@ class Session:
                     "sim_seconds": record.get("sim_seconds"),
                     "closest_cm": record.get("closest_cm"),
                     "error": record.get("error"),
+                    "seat_wait_s": record.get("seat_wait_s", 0.0),
                     "env": job.get("env_label") or (job["environment"].label if job.get("environment") is not None else None),
                     "name": job.get("name"),
                 }
             )
+        limit = float(self.task["max_seconds"])
+        for r in results:
+            job = next((j for j in self.jobs if j["attempt"] == r["attempt"]), None)
+            r["starved"] = starved(r["success"], r.get("seat_wait_s"), float((job or {}).get("max_seconds") or limit))
+            self.waits[r["attempt"]] = {"seat_wait_s": r.get("seat_wait_s"), "starved": r["starved"]}
         self._hold(result, records)
         self.task["finalizing"] = True
         entries = []
@@ -411,7 +428,7 @@ class Session:
                 goal = self.plan[r["task"] - 1]["goal"]
                 what = r.get("name") or (f"{describe(goal)} scene {r['scene']}" if goal and len(self.plan) > 1 else f"attempt {r['attempt']}")
                 seconds = f" {r['sim_seconds']:.0f} s" if r.get("sim_seconds") is not None else ""
-                verdict = f"OK{seconds}" if r["success"] else "STOPPED" if r.get("stopped") else "FAIL"
+                verdict = f"OK{seconds}" if r["success"] else "STOPPED" if r.get("stopped") else "NOT JUDGED" if r.get("starved") else "FAIL"
                 label = f"{what} #{r['attempt']}: {verdict}"
                 entries.append((clip, label, r["success"]))
         names = [clip.stem for clip, _, _ in entries]
@@ -422,6 +439,7 @@ class Session:
         if total > 1 or not self.has_live:  # one selected suggestion test still needs its result saved
             result["attempt_results"] = results
             result["attempts_succeeded"] = sum(1 for r in results if r["success"])
+            result["attempts_starved"] = sum(1 for r in results if r.get("starved"))
         if len(self.plan) > 1:
             groups = []
             for number, entry in enumerate(self.plan, 1):
@@ -432,6 +450,7 @@ class Session:
                         "instruction": entry["instruction"],
                         "attempts": entry["attempts"],
                         "succeeded": sum(1 for r in mine if r["success"]),
+                        "starved": sum(1 for r in mine if r.get("starved")),
                         "passed": any(r["success"] for r in mine),
                         "results": mine,
                     }
@@ -458,6 +477,7 @@ class Session:
                 "passed": self.live_passed,
                 "timer_s": round(self.clock.used(), 1) if self.clock else 0.0,
                 "limit_s": limit,
+                **self.waits.get(1, {}),
             }
         ]
         for position, job in enumerate(self.jobs):
@@ -479,6 +499,7 @@ class Session:
                     "timer_s": round(watching.timer_seconds(), 1),
                     "limit_s": float(job.get("max_seconds") or limit),
                     "name": job.get("name"),
+                    **self.waits.get(job["attempt"], {}),
                 }
             )
         return out
@@ -497,6 +518,7 @@ class SuggestionSession(Session):
         """
         global current
         self.task, self.env, self.finished, self.clock, self.held, self.live_passed = task, env, False, None, 0.0, None
+        self.waits = {}
         self.recorder, self.started = None, env.data.time
         self.folder = VIDEOS / task["task_id"]
         self.folder.mkdir(parents=True, exist_ok=True)

@@ -285,6 +285,8 @@ def run_worker(
             timer_thread.join(timeout=1)
         if clock:
             clock.close()
+            record["seat_wait_s"] = round(clock.waited(), 1)  # time spent waiting for a free Dream-1 seat
+            record["limit_s"] = float(seconds)
         if capture:
             try:
                 write_evidence(capture, evidence[0], record, clock)

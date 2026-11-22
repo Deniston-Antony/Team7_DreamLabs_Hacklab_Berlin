@@ -107,6 +107,16 @@ class LogFileTest(unittest.TestCase):
         self.assertEqual(summary["rows"], 48)
         self.assertEqual(summary["serve_infer_ms"], {"mean": 412, "median": 412, "max": 412})
 
+    def test_numbering_goes_on_when_the_loop_restarts(self):
+        """A second log on the same file (a worker restarting dream_control) counts on from the first's last line."""
+        path = self.folder / "attempt-4.dream.jsonl"
+        for _ in range(2):
+            log = roundtrip_log.RoundTripLog(path)
+            for _ in range(3):
+                log(round_trip(error=Refusal("pool_full")))
+            log.close()
+        self.assertEqual([e["n"] for e in roundtrip_log.read(path)["entries"]], [1, 2, 3, 4, 5, 6])
+
     def test_missing_file_reads_empty(self):
         self.assertEqual(roundtrip_log.read(self.folder / "none.jsonl")["entries"], [])
 

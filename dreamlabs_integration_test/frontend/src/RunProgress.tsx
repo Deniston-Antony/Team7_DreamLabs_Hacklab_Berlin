@@ -4,6 +4,7 @@ export function clock(seconds: number) {
 }
 
 export function runTone(state: string, passed?: boolean | null) {
+  if (state === "not_judged") return "stopped";
   if (state === "starting" || state === "running") return "running";
   if (state === "succeeded" || passed === true) return "succeeded";
   if (state === "failed" || state === "error" || passed === false) return "failed";

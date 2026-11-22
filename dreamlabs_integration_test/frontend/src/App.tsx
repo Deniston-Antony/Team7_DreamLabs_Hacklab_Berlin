@@ -29,6 +29,7 @@ type Task = {
   videos: string[];
   attempt_results?: AttemptResult[];
   attempts_succeeded?: number;
+  attempts_starved?: number;
   attempts_note?: string;
   task_results?: TaskResult[];
   tasks_succeeded?: number;
@@ -61,6 +62,7 @@ type TaskResult = {
   instruction: string;
   attempts: number;
   succeeded: number;
+  starved?: number;
   passed: boolean;
   results: AttemptResult[];
 };
@@ -76,6 +78,8 @@ type AttemptResult = {
   stopped?: boolean;
   env?: string | null;
   name?: string | null;
+  seat_wait_s?: number | null;
+  starved?: boolean;
 };
 type WorkerState = {
   attempt: number;
@@ -84,11 +88,13 @@ type WorkerState = {
   where: "live" | "hidden";
   label: string;
   env?: string;
-  state: "ready" | "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped";
+  state: "ready" | "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped" | "not_judged";
   name?: string;
   passed?: boolean | null;
   timer_s?: number;
   limit_s?: number;
+  seat_wait_s?: number | null; // seconds spent waiting for a free Dream-1 seat, once the run is finished
+  starved?: boolean; // failed after waiting too long for a seat: not judged
 };
 type Live = {
   layout_saved?: boolean;
@@ -119,6 +125,7 @@ const RUN_STATE_LABEL: Record<WorkerState["state"], string> = {
   error: "Error",
   ended: "Stopped",
   stopped: "Stopped",
+  not_judged: "Not judged",
 };
 const MAX_TASK_SECONDS = 200;
 const DEFAULT_TASK_SECONDS = 120;
@@ -178,6 +185,7 @@ function saveName(save: SceneSave) {
 }
 
 function shownState(worker: WorkerState): WorkerState["state"] {
+  if (worker.starved) return "not_judged";
   if (worker.state !== "finished") return worker.state;
   return worker.passed === true ? "succeeded" : worker.passed === false ? "failed" : "finished";
 }
@@ -204,7 +212,9 @@ function AttemptsPanel({ task }: { task: Task }) {
     });
   };
   const summary = (r: AttemptResult) =>
-    r.success
+    r.starved
+      ? `Not judged: waited ${Math.round(r.seat_wait_s ?? 0)} s for a free Dream-1 seat`
+      : r.success
       ? `Succeeded${r.sim_seconds != null ? ` in ${r.sim_seconds} s` : ""}`
       : r.stopped
         ? "Stopped"
@@ -223,7 +233,13 @@ function AttemptsPanel({ task }: { task: Task }) {
           {suite ? (
             <span className="muted"> {task.tasks_succeeded} of {suite.length} tasks succeeded</span>
           ) : (
-            results.length > 0 && <span className="muted"> {task.attempts_succeeded} of {task.attempts} runs succeeded</span>
+            results.length > 0 && (
+              <span className="muted">
+                {" "}
+                {task.attempts_succeeded} of {task.attempts - (task.attempts_starved ?? 0)} judged runs succeeded
+                {task.attempts_starved ? ` · ${task.attempts_starved} not judged (waited for a Dream-1 seat)` : ""}
+              </span>
+            )
           )}
         </h2>
         {clips.length > 1 && (
@@ -237,7 +253,8 @@ function AttemptsPanel({ task }: { task: Task }) {
         <ul className="task-results">
           {suite.map((t) => (
             <li key={t.task}>
-              {t.passed ? "✓" : "✗"} {t.instruction}: {t.succeeded} of {t.attempts} run{t.attempts > 1 ? "s" : ""} succeeded
+              {t.passed ? "✓" : "✗"} {t.instruction}: {t.succeeded} of {t.attempts - (t.starved ?? 0)} judged run{t.attempts - (t.starved ?? 0) === 1 ? "" : "s"} succeeded
+              {t.starved ? ` · ${t.starved} not judged` : ""}
             </li>
           ))}
         </ul>
@@ -738,52 +755,7 @@ export default function App() {
       {page === "benchmarks" && <BenchmarksPage latestRunId={task?.refinement_of ?? (task?.evaluation ? task.task_id : "")} latestBatchId={task?.batch_id ?? ""} locked={running} testsActive={running && !!task?.suggestion_test} viewer={testViewer} />}
       <div className="layout" hidden={page !== "simulator"}>
         <section>
-          <div className="panel viewer">
-            <nav className="run-tabs" aria-label="Runs">
-              <div className="run-tabs-title">Runs</div>
-              <label className="run-count" title="Every task runs once in each scene, with objects in the same places">Scenes per task
-                <input aria-label="Scenes per task" type="number" min={1} max={mostScenes} value={sceneCount} disabled={running} onChange={(event) => changeScenes(Number(event.target.value))} />
-              </label>
-              <div className="run-total">{taskCount} task{taskCount > 1 ? "s" : ""} × {sceneCount} scene{sceneCount > 1 ? "s" : ""} = {totalAttempts} run{totalAttempts > 1 ? "s" : ""}</div>
-              <label className="run-count" title="Counts robot movement, Dream-1 decision time and waiting for a free Dream-1 seat. Loading is not counted.">Time limit per run (s)
-                <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Math.min(MAX_TASK_SECONDS, Math.max(5, Number(event.target.value) || 5)))} />
-              </label>
-              {sceneCount > 1 && (
-                <label className="run-count">Start scenes
-                  <select aria-label="Parallel run environments" value={envMode} disabled={running} onChange={(event) => setEnvMode(event.target.value as typeof envMode)}>
-                    <option value="same">Copies of the live scene</option>
-                    <option value="shuffle">Shuffled positions</option>
-                    <option value="shuffle_style">Shuffled + scene styles</option>
-                  </select>
-                </label>
-              )}
-              {(workers.length > 1 ? workers : [{ attempt: 1, task: 1, where: "live", label: "", state: running ? "running" : "finished" } as WorkerState]).map((worker) => (
-                <button
-                  key={worker.attempt}
-                  className={`run-tab ${viewAttempt === worker.attempt ? "active" : ""}`}
-                  aria-pressed={viewAttempt === worker.attempt}
-                  onClick={() => chooseAttempt(worker.attempt)}
-                >
-                  <span className="run-tab-name">{worker.name ?? (worker.state === "ready" ? `Scene ${worker.scene ?? worker.attempt}` : runName(worker.attempt))}</span>
-                  {worker.state !== "ready" && worker.scene && !worker.name && <span className="run-tab-env">Scene {worker.scene}</span>}
-                  {worker.label && <span className="run-tab-goal">{goalName(worker.label)}</span>}
-                  {worker.env && <span className="run-tab-env">{worker.env}</span>}
-                  <span className={`run-tab-state ${shownState(worker)}`}>
-                    {workers.length > 1 ? RUN_STATE_LABEL[shownState(worker)] : connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Offline"}
-                  </span>
-                  {worker.state !== "ready" && (workers.length > 1 || task) && (
-                    <RunProgress
-                      seconds={workers.length > 1 ? worker.timer_s ?? 0 : task?.run_timer_s ?? 0}
-                      limit={workers.length > 1 ? worker.limit_s ?? maxSeconds : task?.max_seconds ?? maxSeconds}
-                      tone={runTone(
-                        worker.state,
-                        workers.length > 1 ? worker.passed : task?.outcome === "SUCCESS" ? true : task?.outcome === "FAILURE" || task?.status === "FAILED" ? false : null,
-                      )}
-                    />
-                  )}
-                </button>
-              ))}
-            </nav>
+          <div className="panel viewer viewer-stacked">
             <div className="viewer-main">
             <div className="stream-bar">
               <div className="cameras">
@@ -828,9 +800,56 @@ export default function App() {
                   : "Ctrl + drag to open the 3D view. Use the overhead or 3D view to select and move objects."}
             </p>
             </div>
+            <div className="run-settings">
+              <label className="run-count" title="Every task runs once in each scene, with objects in the same places">Scenes per task
+                <input aria-label="Scenes per task" type="number" min={1} max={mostScenes} value={sceneCount} disabled={running} onChange={(event) => changeScenes(Number(event.target.value))} />
+              </label>
+              <div className="run-total">{taskCount} task{taskCount > 1 ? "s" : ""} × {sceneCount} scene{sceneCount > 1 ? "s" : ""} = {totalAttempts} run{totalAttempts > 1 ? "s" : ""}</div>
+              <label className="run-count" title="Counts robot movement, Dream-1 decision time and waiting for a free Dream-1 seat. Loading is not counted.">Time limit per run (s)
+                <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Math.min(MAX_TASK_SECONDS, Math.max(5, Number(event.target.value) || 5)))} />
+              </label>
+              {sceneCount > 1 && (
+                <label className="run-count">Start scenes
+                  <select aria-label="Parallel run environments" value={envMode} disabled={running} onChange={(event) => setEnvMode(event.target.value as typeof envMode)}>
+                    <option value="same">Copies of the live scene</option>
+                    <option value="shuffle">Shuffled positions</option>
+                    <option value="shuffle_style">Shuffled + scene styles</option>
+                  </select>
+                </label>
+              )}
+            </div>
+            <nav className="run-strip" aria-label="Runs">
+              {(workers.length > 1 ? workers : [{ attempt: 1, task: 1, where: "live", label: "", state: running ? "running" : "finished" } as WorkerState]).map((worker) => (
+                <button
+                  key={worker.attempt}
+                  className={`run-tab ${viewAttempt === worker.attempt ? "active" : ""}`}
+                  aria-pressed={viewAttempt === worker.attempt}
+                  onClick={() => chooseAttempt(worker.attempt)}
+                >
+                  <span className="run-tab-name">{worker.name ?? (worker.state === "ready" ? `Scene ${worker.scene ?? worker.attempt}` : runName(worker.attempt))}</span>
+                  {worker.state !== "ready" && worker.scene && !worker.name && <span className="run-tab-env">Scene {worker.scene}</span>}
+                  {worker.label && <span className="run-tab-goal">{goalName(worker.label)}</span>}
+                  {worker.env && <span className="run-tab-env">{worker.env}</span>}
+                  {worker.starved && <span className="run-tab-env">Waited {Math.round(worker.seat_wait_s ?? 0)} s for a Dream-1 seat</span>}
+                  <span className={`run-tab-state ${shownState(worker)}`}>
+                    {workers.length > 1 ? RUN_STATE_LABEL[shownState(worker)] : connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Offline"}
+                  </span>
+                  {worker.state !== "ready" && (workers.length > 1 || task) && (
+                    <RunProgress
+                      seconds={workers.length > 1 ? worker.timer_s ?? 0 : task?.run_timer_s ?? 0}
+                      limit={workers.length > 1 ? worker.limit_s ?? maxSeconds : task?.max_seconds ?? maxSeconds}
+                      tone={runTone(
+                        worker.state,
+                        workers.length > 1 ? worker.passed : task?.outcome === "SUCCESS" ? true : task?.outcome === "FAILURE" || task?.status === "FAILED" ? false : null,
+                      )}
+                    />
+                  )}
+                </button>
+              ))}
+            </nav>
           </div>
-          {task && <AttemptsPanel key={task.task_id} task={task} />}
           {task && !task.suggestion_test && <DreamLogPanel key={`${task.task_id}-${viewAttempt}`} taskId={task.task_id} attempt={viewAttempt} runLabel={runName(viewAttempt)} running={running} />}
+          {task && <AttemptsPanel key={task.task_id} task={task} />}
           {task?.evaluation && (
             <div className="panel report-prompt">
               <span>This task's report is ready.</span>
