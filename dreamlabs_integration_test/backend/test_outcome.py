@@ -833,6 +833,32 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-log/10").status_code, 404)
         self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-log/4").json()["entries"], [])
 
+    def test_a_tasks_dream_client_log_is_the_lines_written_while_it_ran(self):
+        """The dream client's log lines from the task's start to its end; earlier ones are left out."""
+        folder = Path(tempfile.mkdtemp())
+        log = folder / "dream.log"
+        stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".000Z"
+        log.write_text(f"{stamp(time.time() - 600)} INFO dream.client session before started (new)\n")
+
+        def writes(argv, **kw):
+            with open(log, "a") as stream:
+                stream.write(f"{stamp(time.time())} INFO dream.client session during started (new)\n")
+            return model(steps=20)(argv, **kw)
+
+        saved = os.environ.get("DREAM_LOG_DIR")
+        os.environ["DREAM_LOG_DIR"] = str(folder)
+        try:
+            task = self.submit("put apple into the bowl", writes)
+            reply = self.client.get(f"/api/tasks/{task['task_id']}/dream-client-log").json()
+        finally:
+            if saved is None:
+                del os.environ["DREAM_LOG_DIR"]
+            else:
+                os.environ["DREAM_LOG_DIR"] = saved
+        self.assertEqual([e["session"] for e in reply["entries"]], ["during"])
+        self.assertEqual(reply["summary"]["sessions"], 1)
+        self.assertEqual(self.client.get("/api/tasks/nope/dream-client-log").status_code, 404)
+
     def test_bad_requests_are_refused(self):
         """Too many attempts, and video names that try to leave the folder, are refused."""
         reply = self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "attempts": 10})

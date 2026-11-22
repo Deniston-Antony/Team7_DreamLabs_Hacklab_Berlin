@@ -30,6 +30,103 @@ function problem(entry: DreamLogEntry) {
   return "";
 }
 
+// One line of the dream client's own log (~/.dream/logs/dream.log), as GET /api/tasks/{id}/dream-client-log serves it.
+type ClientLine = {
+  time_s: number;
+  level: string;
+  logger: string;
+  message: string;
+  kind: "pacing" | "session" | "warning" | "other";
+  mode?: "sync" | "async";
+  median_ms?: number;
+  last_ms?: number;
+  event?: string;
+  reason?: string | null;
+};
+type ClientLog = { path: string; exists: boolean; entries: ClientLine[]; summary: { sessions: number; replaced: number; warnings: number; sync_switches: number } };
+
+function clientNote(line: ClientLine) {
+  if (line.kind === "pacing") return `${line.mode === "sync" ? "Replies slow: robot waits for each one" : "Replies fast enough to keep moving"} (median ${line.median_ms} ms, last ${line.last_ms} ms)`;
+  if (line.kind === "session") return `Session ${line.event}${line.reason ? ` (${line.reason})` : ""}`;
+  return line.message;
+}
+
+/** The dream client's own log while this task ran: sessions opened and released, pacing switches, warnings. */
+function DreamClientLog({ taskId, running }: { taskId: string; running: boolean }) {
+  const [log, setLog] = useState<ClientLog | null>(null);
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const response = await fetch(`/api/tasks/${taskId}/dream-client-log`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = (await response.json()) as ClientLog;
+        if (alive) {
+          setLog(data);
+          setError("");
+        }
+      } catch (problem) {
+        if (alive) setError(problem instanceof Error ? problem.message : String(problem));
+      }
+    };
+    void load();
+    const timer = running ? window.setInterval(load, POLL_MS) : undefined;
+    return () => {
+      alive = false;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [taskId, running]);
+
+  if (error) return <div className="status error spaced">Dream client log: {error}</div>;
+  if (!log) return null;
+  const s = log.summary;
+  return (
+    <div className="dream-client-log">
+      <h3>
+        Dream client log <span className="muted">all runs of this task · {log.path}</span>
+      </h3>
+      {!log.exists && <p className="hint">The dream client has not written its log on this computer.</p>}
+      {log.exists && log.entries.length === 0 && <p className="hint">{running ? "Nothing logged yet for this task." : "The dream client logged nothing while this task ran."}</p>}
+      {log.entries.length > 0 && (
+        <>
+          <div className="dream-log-summary">
+            <span><b>{s.sessions}</b> session{s.sessions === 1 ? "" : "s"} opened</span>
+            <span className={s.sync_switches ? "warn" : ""} title="Times the client saw slow replies (median over 700 ms)"><b>{s.sync_switches}</b> slow-reply switch{s.sync_switches === 1 ? "" : "es"}</span>
+            <span className={s.replaced ? "bad" : ""} title="Dream-1 restarted a session mid-run"><b>{s.replaced}</b> session restart{s.replaced === 1 ? "" : "s"}</span>
+            <span className={s.warnings ? "bad" : ""}><b>{s.warnings}</b> warning{s.warnings === 1 ? "" : "s"}</span>
+          </div>
+          <button className="dream-log-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
+            {open ? "Hide client log" : `Show client log (${log.entries.length} lines)`}
+          </button>
+          {open && (
+            <div className="dream-log-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>What</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...log.entries].reverse().map((line, index) => (
+                    <tr key={`${line.time_s}-${index}`} className={line.kind === "warning" || line.event === "replaced" ? "bad" : line.mode === "sync" ? "warn" : ""}>
+                      <td>{new Date(line.time_s * 1000).toLocaleTimeString()}</td>
+                      <td title={line.message}>{clientNote(line)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 /** A run's Dream-1 requests: what each cost in time, how many rows came back, and any refusal or error. */
 export function DreamLogPanel({ taskId, attempt, runLabel, running }: { taskId: string; attempt: number; runLabel: string; running: boolean }) {
   const [log, setLog] = useState<DreamLog | null>(null);
@@ -119,6 +216,7 @@ export function DreamLogPanel({ taskId, attempt, runLabel, running }: { taskId: 
           )}
         </>
       )}
+      <DreamClientLog taskId={taskId} running={running} />
     </div>
   );
 }

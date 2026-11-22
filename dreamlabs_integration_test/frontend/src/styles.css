@@ -228,3 +228,6 @@ tr.run-row { cursor: pointer; }
 .dream-log-table { margin-top: 8px; max-height: 320px; overflow-y: auto; }
 .dream-log-table tr.warn td { background: #f9eeda; }
 .dream-log-table tr.bad td { background: #fdecea; color: #8a1f17; }
+.dream-client-log { margin-top: 14px; padding-top: 10px; border-top: 1px solid #e3e6e9; }
+.dream-client-log h3 { margin: 0 0 6px; font-size: 13px; }
+.dream-log-summary .warn { color: #8a5a00; }

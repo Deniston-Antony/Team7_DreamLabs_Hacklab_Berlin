@@ -26,6 +26,7 @@ import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
 import capacity  # noqa: E402
+import dream_client_log  # noqa: E402
 import roundtrip_log  # noqa: E402  (SortFlow's; outcome puts SortFlow on the path)
 import evaluation  # noqa: E402
 import environments  # noqa: E402
@@ -1937,6 +1938,19 @@ def task_dream_log(task_id: str, attempt: int, full: bool = False, after: int = 
     log = roundtrip_log.read(outcome.dream_log_path(outcome.VIDEOS / task_id, attempt), full=full)
     log["entries"] = [entry for entry in log["entries"] if entry.get("n", 0) > after]
     return log
+
+
+@app.get("/api/tasks/{task_id}/dream-client-log")
+def task_dream_client_log(task_id: str, limit: int = Query(300, ge=1, le=2000)):
+    """The dream client's own log lines (sessions, pacing, warnings) from this task's start to its end.
+
+    Every run of the task (the live one and the parallel workers) writes the same file, so these are all of them.
+    """
+    task = tasks.get(task_id)
+    if task is None:
+        raise HTTPException(404, "no such task")
+    until = task.get("finished_at")
+    return dream_client_log.read(task["started_at"] - 1, None if until is None else until + 5, limit)
 
 
 @app.get("/api/tasks/{task_id}/frames/{attempt}/{camera}")
