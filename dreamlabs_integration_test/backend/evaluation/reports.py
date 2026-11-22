@@ -40,6 +40,9 @@ def task_report(task: TaskDefinition, evidence: Evidence, result: TaskResult) ->
             "instruction": task.instruction,
             "started_at": task.started_at,
             "protected_objects": task.protected_objects,
+            "test_kind": task.test_kind,
+            "test_change": task.test_change,
+            "source_attempt": task.source_attempt,
             "criteria": [item.model_dump() for item in task.criteria],
         },
         "execution": {
@@ -160,6 +163,17 @@ def run_report(summary: dict[str, Any], attempts: list[dict[str, Any]], grid_url
     return {"report_type": "run", "run": summary, "grid_url": grid_url, "attempts": attempts}
 
 
+def refinement_html(refinement: dict[str, Any] | None) -> str:
+    if not refinement:
+        return ""
+    table = [
+        [item["test"], item["change"], item["source_attempt"], "n/a" if item["before_score"] is None else item["before_score"], "n/a" if item["after_score"] is None else item["after_score"], "n/a" if item["effect"] is None else item["effect"], item["verdict"].replace("_", " ")]
+        for item in refinement["rows"]
+    ]
+    return f"""<section><h2>Before and after suggestions</h2><p><strong>{escape(refinement['recommendation'])}</strong></p>
+    <table><tr><th>Test</th><th>Change</th><th>From attempt</th><th>Before</th><th>After</th><th>Effect vs control</th><th>Result</th></tr>{rows(table)}</table><p class="muted">{escape(refinement['note'])}</p></section>"""
+
+
 def run_html(report: dict[str, Any]) -> str:
     run = report["run"]
     score = "Not scored" if run["final_score"] is None else f"{run['final_score']:g}/100"
@@ -169,7 +183,7 @@ def run_html(report: dict[str, Any]) -> str:
     <section><h1>Final run report</h1><p><strong>{escape(run['instruction'])}</strong></p><div class="score">{escape(score)}</div>
     <p>{escape(run['outcome'])} · {run['attempts_succeeded']} of {run['attempts_total']} attempts succeeded</p>{grid}
     <table><tr><th>Attempt</th><th>Where</th><th>Execution</th><th>Outcome</th><th>Score</th></tr>{rows(table)}</table>
-    <h2>What the runs show</h2>{findings_html(report.get('insights', {}).get('findings', []))}</section>{comparison_html(report.get('comparison'))}
+    <h2>What the runs show</h2>{findings_html(report.get('insights', {}).get('findings', []))}</section>{refinement_html(report.get('refinement'))}{comparison_html(report.get('comparison'))}
     """ + "".join(task_body(item) for item in report["attempts"])
     return page(f"Run report {run['run_id']}", body)
 

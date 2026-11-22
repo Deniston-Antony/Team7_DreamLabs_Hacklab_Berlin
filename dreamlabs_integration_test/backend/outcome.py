@@ -11,6 +11,7 @@ joined into one labelled grid. The logic is SortFlow's (../../SortFlow); this fi
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -101,6 +102,8 @@ class Workers:
         mujoco.mj_saveModel(env.model, str(self.model_path))
         np.savez(self.state_path, qpos=env.data.qpos, qvel=env.data.qvel, ctrl=env.data.ctrl)
         for job in jobs:  # a job with its own environment starts from that; the others from the live scene's copy
+            if "scene" in job:
+                continue
             environment = job.get("environment")
             job["scene"] = environment.save(folder) if environment is not None else (self.model_path, self.state_path)
         self.seconds = str(task["max_seconds"])
@@ -127,7 +130,7 @@ class Workers:
             "--task",
             job["instruction"],
             "--seconds",
-            self.seconds,
+            str(job.get("max_seconds") or self.seconds),
             "--actions",
             "48",
             "--tries",
@@ -256,6 +259,8 @@ class Workers:
 class Session:
     """One request's recording and hidden attempts: start it before dc.main, call finish() after."""
 
+    has_live = True
+
     def __init__(self, task, env, goals, environments=None, objects=None, clock=None):
         """Start recording the live attempt and, when asked and possible, every hidden attempt.
         @param task The task dictionary: task_id, max_seconds and `plan`, a list of {"instruction", "attempts"}.
@@ -302,6 +307,9 @@ class Session:
             position = job["scene_number"] - 2
             job["environment"] = environments[position] if environments and 0 <= position < len(environments) else None
         self.workers = Workers(task, env, self.jobs, self.folder, objects) if self.jobs else None
+        if self.workers is None:  # a later suggestion test starts from this saved scene
+            mujoco.mj_saveModel(env.model, str(self.folder / "scene.mjb"))
+            np.savez(self.folder / "scene.npz", qpos=env.data.qpos, qvel=env.data.qvel, ctrl=env.data.ctrl)
         self.recorder = recording.attach(env, self.folder / "attempt-1.mp4")
         self.started = env.data.time
         current = self  # last, so the page never sees a half-built session
@@ -334,7 +342,8 @@ class Session:
         @param result The status dictionary run_task is about to merge into the task; its status and outcome
             describe the live attempt and are left as they are.
         """
-        self.recorder.close()
+        if self.recorder:
+            self.recorder.close()
         live_ok = result.get("outcome") == "SUCCESS"
         self.live_passed = True if live_ok else False if result.get("outcome") == "FAILURE" or result.get("status") == "FAILED" else None
         self.finished = True
@@ -347,9 +356,10 @@ class Session:
                 "success": live_ok,
                 "sim_seconds": round(self.env.data.time - self.started, 1) if live_ok else None,
             }
-        ]
+        ] if self.has_live else []
         ended = result.get("status") == "CANCELLED"  # a failed live run leaves the parallel runs to finish
-        results[0]["stopped"] = result.get("status") == "CANCELLED"
+        if results:
+            results[0]["stopped"] = ended
         records = []
         if self.workers and ended:
             self.workers.stop()
@@ -375,7 +385,8 @@ class Session:
                     "sim_seconds": record.get("sim_seconds"),
                     "closest_cm": record.get("closest_cm"),
                     "error": record.get("error"),
-                    "env": job["environment"].label if job.get("environment") is not None else None,
+                    "env": job.get("env_label") or (job["environment"].label if job.get("environment") is not None else None),
+                    "name": job.get("name"),
                 }
             )
         self._hold(result, records)
@@ -385,7 +396,7 @@ class Session:
             clip = self.folder / f"attempt-{r['attempt']}.mp4"
             if clip.is_file() and recording.readable(clip):  # a run killed mid-write leaves an unplayable file
                 goal = self.plan[r["task"] - 1]["goal"]
-                what = f"{describe(goal)} scene {r['scene']}" if goal and len(self.plan) > 1 else f"attempt {r['attempt']}"
+                what = r.get("name") or (f"{describe(goal)} scene {r['scene']}" if goal and len(self.plan) > 1 else f"attempt {r['attempt']}")
                 seconds = f" {r['sim_seconds']:.0f} s" if r.get("sim_seconds") is not None else ""
                 verdict = f"OK{seconds}" if r["success"] else "STOPPED" if r.get("stopped") else "FAIL"
                 label = f"{what} #{r['attempt']}: {verdict}"
@@ -395,7 +406,7 @@ class Session:
             names.append("grid")
         result["videos"] = names
         total = sum(p["attempts"] for p in self.plan)
-        if total > 1:
+        if total > 1 or not self.has_live:  # one selected suggestion test still needs its result saved
             result["attempt_results"] = results
             result["attempts_succeeded"] = sum(1 for r in results if r["success"])
         if len(self.plan) > 1:
@@ -422,7 +433,7 @@ class Session:
         """
         limit = float(self.task["max_seconds"])
         label = lambda entry: describe(entry["goal"]) if entry["goal"] else entry["instruction"][:30]  # noqa: E731
-        out = [
+        out = [] if not self.has_live else [
             {
                 "attempt": 1,
                 "task": 1,
@@ -450,13 +461,56 @@ class Session:
                     "scene": job["scene_number"],
                     "where": "hidden",
                     "label": label(self.plan[job["index"]]),
-                    "env": job["environment"].label if job.get("environment") is not None else "Copy of live scene",
+                    "env": job.get("env_label") or (job["environment"].label if job.get("environment") is not None else "Copy of live scene"),
                     "state": state,
                     "timer_s": round(watching.timer_seconds(), 1),
-                    "limit_s": limit,
+                    "limit_s": float(job.get("max_seconds") or limit),
+                    "name": job.get("name"),
                 }
             )
         return out
+
+
+class SuggestionSession(Session):
+    """A run of one-change tests. Every test is a hidden worker, so the live scene is never touched."""
+
+    has_live = False
+
+    def __init__(self, task, env, tests):
+        """Save each test's starting scene and start its worker.
+        @param task The task dictionary.
+        @param env The backend's simulation environment.
+        @param tests Tests from suggestions.build_tests.
+        """
+        global current
+        self.task, self.env, self.finished, self.clock, self.held, self.live_passed = task, env, False, None, 0.0, None
+        self.recorder, self.started = None, env.data.time
+        self.folder = VIDEOS / task["task_id"]
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.plan, self.jobs = [], []
+        for index, test in enumerate(tests):
+            goal = {"object": test["target"], "target": test["destination"]}
+            self.plan.append({"instruction": test["instruction"], "attempts": 1, "goal": goal})
+            attempt = index + 2
+            model, state = self.folder / f"test-{attempt}.mjb", self.folder / f"test-{attempt}.npz"
+            shutil.copyfile(test["model_path"], model)
+            np.savez(state, qpos=test["qpos"], qvel=test["qvel"], ctrl=test["ctrl"])
+            self.jobs.append(
+                {
+                    "instruction": test["instruction"],
+                    "goal": goal,
+                    "attempt": attempt,
+                    "index": index,
+                    "scene_number": test["test"],
+                    "scene": (model, state),
+                    "environment": None,
+                    "env_label": test["change"],
+                    "max_seconds": test["max_seconds"],
+                    "name": f"Test {test['test']}" + (" (control)" if test["kind"] == "control" else ""),
+                }
+            )
+        self.workers = Workers(task, env, self.jobs, self.folder, tests[0]["objects"])
+        current = self
 
 
 def clear_runs():

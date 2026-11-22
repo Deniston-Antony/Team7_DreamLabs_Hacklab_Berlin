@@ -11,6 +11,7 @@ from .config import DEFAULT_CONFIG, ScoringConfig
 from .evaluator import evaluate_task
 from .insights import analyze_run, compare_scenes
 from .models import Evidence, TaskDefinition, TaskResult
+from .refinement import compare_tests
 from .reports import run_report, task_report
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -112,6 +113,21 @@ class EvaluationStore:
             key=lambda record: record[0].attempt,
         )
 
+    def run_records(self, run_id: str):
+        with self.lock:
+            return self._run_records(run_id)
+
+    def suggestion_results(self, run_id: str):
+        """Every finished suggestion test of a run, newest first."""
+        with self.lock:
+            source = self._run_records(run_id)
+            names = list(dict.fromkeys(self.records[item][0].run for item in self.order if self.records[item][0].refinement_of == run_id))
+            output = []
+            for name in reversed(names):
+                rows = self._run_records(name)
+                output.append({"run_id": name, "started_at": rows[0][0].started_at, "comparison": compare_tests(source, rows)})
+            return output
+
     def vision_items(self, run_id: str):
         with self.lock:
             return [(task, evidence) for task, evidence, _ in self._run_records(run_id) if evidence.initial_snapshot]
@@ -152,11 +168,18 @@ class EvaluationStore:
         comparison = compare_scenes(records)
         summary["recommendations"] = [item["action"] for item in insights["findings"]]
         report = run_report(summary, [task_report(*record) for record in records], f"/api/tasks/{run_id}/video/grid" if grid else None)
-        return {**report, "insights": insights, "comparison": comparison}
+        output = {**report, "insights": insights, "comparison": comparison}
+        source = records[0][0].refinement_of
+        if source:
+            with self.lock:
+                original = self._run_records(source)
+            output["refinement_of"] = source
+            output["refinement"] = compare_tests(original, records)
+        return output
 
     def batches(self):
         with self.lock:
-            names = list(dict.fromkeys(self.records[task_id][0].batch_id for task_id in self.order))
+            names = list(dict.fromkeys(self.records[task_id][0].batch_id for task_id in self.order if not self.records[task_id][0].refinement_of))
             if self.current_batch not in names:
                 names.append(self.current_batch)
             output = []
@@ -186,7 +209,7 @@ class EvaluationStore:
             rows = [
                 (task, result, evidence.execution_status)
                 for task, evidence, result in (self.records[task_id] for task_id in self.order)
-                if task.batch_id == batch_id
+                if task.batch_id == batch_id and not task.refinement_of  # suggestion tests change the setup, so they stay out of the score
             ]
         if not rows and batch_id != self.current_batch:
             return None

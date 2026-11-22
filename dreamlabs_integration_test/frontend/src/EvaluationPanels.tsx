@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
+import { SuggestionTests } from "./SuggestionTests";
+import type { TestViewerState } from "./SuggestionTests";
 
 type Component = {
   status: "MEASURED" | "NOT_MEASURED";
@@ -80,7 +82,7 @@ type Vision = {
   video?: VideoAnalysis | null;
 };
 type AttemptReport = {
-  task: { task_id: string; attempt: number; where: string; instruction: string; scene_number?: number; scene_label?: string | null };
+  task: { task_id: string; attempt: number; where: string; instruction: string; scene_number?: number; scene_label?: string | null; test_kind?: string | null; test_change?: string | null };
   execution: { status: string; duration_seconds: number | null; action_count: number | null; model_calls: number | null };
   evidence: { videos: string[]; vision?: Vision | null };
   result: Result;
@@ -102,7 +104,7 @@ type RunSummary = {
   attempts: AttemptRow[];
   recommendations: string[];
 };
-type RunReport = { run: RunSummary; grid_url: string | null; attempts: AttemptReport[]; insights?: { stages: StageCount[]; attempts: AttemptFact[]; findings: Finding[] }; comparison?: Comparison };
+type RunReport = { run: RunSummary; grid_url: string | null; attempts: AttemptReport[]; insights?: { stages: StageCount[]; attempts: AttemptFact[]; findings: Finding[] }; comparison?: Comparison; refinement_of?: string };
 type BatchEntry = {
   batch_id: string;
   name?: string | null;
@@ -144,6 +146,8 @@ const outcomeClass = (outcome: string) =>
   outcome === "SUCCESS" ? "good" : outcome === "PARTIAL_SUCCESS" ? "warn" : outcome === "NOT_EVALUABLE" ? "neutral" : "bad";
 const statusClass = (status: string) => (status === "PASS" ? "good" : status === "FAIL" ? "bad" : status === "PARTIAL" ? "warn" : "neutral");
 const show = (value: number | null | undefined, suffix = "") => (value == null ? "n/a" : `${value}${suffix}`);
+const attemptName = (task: AttemptReport["task"]) =>
+  task.test_kind ? `Test ${task.scene_number ?? task.attempt - 1}${task.test_kind === "control" ? " (control)" : ""}` : `Attempt ${task.attempt}`;
 const when = (seconds: number | null | undefined) =>
   seconds == null
     ? "No runs yet"
@@ -384,13 +388,13 @@ function FinalView({ report, openAttempt }: { report: RunReport; openAttempt: (a
             {clips.map((item) => (
               <figure key={item.task.task_id} className={item.result.outcome === "SUCCESS" ? "passed" : item.result.outcome === "NOT_EVALUABLE" ? "" : "failed"}>
                 <VideoPlayer src={item.evidence.videos[0]} loop groupSpeed={allSpeed} />
-                <figcaption><strong>Attempt {item.task.attempt}</strong> · Scene {item.task.scene_number ?? item.task.attempt}: {label(item.result.outcome)} · {show(item.result.score)}</figcaption>
+                <figcaption><strong>{attemptName(item.task)}</strong> · {item.task.test_change ?? `Scene ${item.task.scene_number ?? item.task.attempt}`}: {label(item.result.outcome)} · {show(item.result.score)}</figcaption>
               </figure>
             ))}
           </div>
         </>
       )}
-      {report.comparison?.comparable && <ComparisonView comparison={report.comparison} openAttempt={openAttempt} />}
+      {!report.refinement_of && report.comparison?.comparable && <ComparisonView comparison={report.comparison} openAttempt={openAttempt} />}
       {insights && insights.stages.length > 0 && (
         <>
           <h3>Where each attempt ended</h3>
@@ -461,7 +465,7 @@ function RunView({ runId }: { runId: string }) {
         <button role="tab" aria-selected={tab === 0} className={tab === 0 ? "active" : ""} onClick={() => setTab(0)}>Final report</button>
         {report.attempts.map((item) => (
           <button role="tab" key={item.task.attempt} aria-selected={tab === item.task.attempt} className={tab === item.task.attempt ? "active" : ""} onClick={() => setTab(item.task.attempt)}>
-            Attempt {item.task.attempt}{(report.comparison?.tasks.length ?? 0) > 1 ? ` · S${item.task.scene_number ?? item.task.attempt}` : ""}{" "}
+            {attemptName(item.task)}{!item.task.test_kind && (report.comparison?.tasks.length ?? 0) > 1 ? ` · S${item.task.scene_number ?? item.task.attempt}` : ""}{" "}
             <span className={item.result.outcome === "SUCCESS" ? "mark-good" : item.result.outcome === "NOT_EVALUABLE" ? "" : "mark-bad"}>
               {item.result.outcome === "SUCCESS" ? "✓" : item.result.outcome === "NOT_EVALUABLE" ? "–" : "✗"}
             </span>
@@ -473,7 +477,8 @@ function RunView({ runId }: { runId: string }) {
   );
 }
 
-export function BenchmarksPage({ latestRunId, locked }: { latestRunId: string; locked: boolean }) {
+export function BenchmarksPage({ latestRunId, latestBatchId, locked, testsActive, viewer }: { latestRunId: string; latestBatchId: string; locked: boolean; testsActive: boolean; viewer: TestViewerState }) {
+  const [view, setView] = useState<"report" | "suggestions">(testsActive ? "suggestions" : "report");
   const [batches, setBatches] = useState<BatchEntry[]>([]);
   const [batchId, setBatchId] = useState("");
   const [summary, setSummary] = useState<BatchSummary | null>(null);
@@ -489,15 +494,19 @@ export function BenchmarksPage({ latestRunId, locked }: { latestRunId: string; l
     setRunId(run || data.runs?.[0]?.run_id || "");
   }, []);
 
-  const loadHistory = useCallback(async (run = "") => {
+  const loadHistory = useCallback(async (run = "", batch = "") => {
     const data = await getJson<{ current_batch: string; batches: BatchEntry[] }>("/api/evaluation/batches");
     setBatches(data.batches ?? []);
-    await openBatch(data.current_batch, run);
+    await openBatch(run && batch ? batch : data.current_batch, run);
   }, [openBatch]);
 
   useEffect(() => {
-    loadHistory(latestRunId).catch((reason) => setProblem(reason.message));
-  }, [loadHistory, latestRunId]);
+    loadHistory(latestRunId, latestBatchId).catch((reason) => setProblem(reason.message));
+  }, [loadHistory, latestRunId, latestBatchId]);
+
+  useEffect(() => {
+    if (testsActive) setView("suggestions");
+  }, [testsActive]);
 
   const startNew = async () => {
     setProblem("");
@@ -589,16 +598,36 @@ export function BenchmarksPage({ latestRunId, locked }: { latestRunId: string; l
         {problem && <div className="status error">{problem}</div>}
         {summary && (
           <>
-            <div className="stream-bar">
-              <h2>{title(active)}</h2>
-              {summary.total_tasks > 0 && (
+            <div className="stream-bar benchmark-head">
+              <div className="benchmark-title">
+                <h2>{title(active)}</h2>
+                {summary.total_tasks > 0 && (
+                  <div className="benchmark-tabs" role="tablist" aria-label="Benchmark views">
+                    <button role="tab" aria-selected={view === "report"} className={view === "report" ? "active" : ""} onClick={() => setView("report")}>Report</button>
+                    <button role="tab" aria-selected={view === "suggestions"} className={view === "suggestions" ? "active" : ""} onClick={() => setView("suggestions")}>Suggestion testing</button>
+                  </div>
+                )}
+              </div>
+              {summary.total_tasks > 0 && view === "report" && (
                 <span className="report-links">
                   <a href={`/api/reports/batches/${summary.batch_id}?format=html`} target="_blank" rel="noreferrer">HTML</a>
                   <a href={`/api/reports/batches/${summary.batch_id}`} target="_blank" rel="noreferrer">JSON</a>
                 </span>
               )}
             </div>
-            {summary.total_tasks === 0 ? <p className="hint">No test runs yet. Run a task on the Simulator page to add it here.</p> : (
+            {summary.total_tasks > 0 && view === "suggestions" && (
+              <>
+                {summary.runs.length > 1 && (
+                  <label className="run-picker">Test run
+                    <select aria-label="Test run for suggestions" value={runId} disabled={testsActive} onChange={(event) => setRunId(event.target.value)}>
+                      {summary.runs.map((item) => <option key={item.run_id} value={item.run_id}>{when(item.started_at)} · {item.instruction} · {show(item.final_score)}/100</option>)}
+                    </select>
+                  </label>
+                )}
+                {runId && <SuggestionTests key={runId} runId={runId} locked={locked} viewer={viewer} renderRun={(id) => <RunView key={id} runId={id} />} />}
+              </>
+            )}
+            {summary.total_tasks === 0 ? <p className="hint">No test runs yet. Run a task on the Simulator page to add it here.</p> : view === "report" && (
               <>
                 <div className="score-head">
                   <div className="score-value">{summary.batch_score == null ? "Not scored" : <>{summary.batch_score}<small>/100</small></>}</div>

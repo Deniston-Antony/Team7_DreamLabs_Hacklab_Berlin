@@ -76,6 +76,14 @@ Every task runs once in each scene, and the n-th run of every task uses the same
 
 Run recommendations come from each attempt's stored data: where it failed, closest distance, lift, contact time, distance to the goal, movement time, disturbances and video analysis.
 
+## Suggestion tests
+
+After a finished run with failed attempts, **Test suggestions** in its Final report turns the attempts' suggestions into separate runs. It uses one test per original run plus an unchanged control, up to 8 parallel runs, with 2 controls from 6 runs.
+
+Each test starts from the failed attempt's saved scene and makes one change: move the object, shorten the carry, add clear space, use a successful orientation, name the object more clearly, or give more time. The report compares each test with its original attempt and subtracts the change seen in the control. A difference under 10 points is shown as no clear change.
+
+Tests are stored with the run but do not change its benchmark score. They do not retrain Dream-1, and each change is tried once, so repeat a promising result before relying on it.
+
 ## Video perception
 
 Dream-1 returns actions, not its detections. After a run, OWLv2 samples 10 frames from each attempt's video and tracks which objects moved. This is shown as **Perception (from video)**, is not scored, and describes observed behaviour rather than the model's internal understanding. On 36 object checks from real runs, it matched MuJoCo's movement data in 35.

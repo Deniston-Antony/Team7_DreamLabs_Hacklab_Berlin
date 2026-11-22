@@ -3,6 +3,8 @@ import type { PointerEvent } from "react";
 import { BenchmarksPage } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
 import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
+import { clock, RunProgress, runTone } from "./RunProgress";
+import type { TestViewerState } from "./SuggestionTests";
 
 type SceneObject = {
   object_id: string;
@@ -36,6 +38,9 @@ type Task = {
   holding?: boolean;
   evaluation?: EvaluationRef | null;
   evaluation_error?: string | null;
+  batch_id?: string;
+  suggestion_test?: boolean;
+  refinement_of?: string;
 };
 type TaskResult = {
   task: number;
@@ -56,6 +61,7 @@ type AttemptResult = {
   error?: string | null;
   stopped?: boolean;
   env?: string | null;
+  name?: string | null;
 };
 type WorkerState = {
   attempt: number;
@@ -65,6 +71,7 @@ type WorkerState = {
   label: string;
   env?: string;
   state: "ready" | "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped";
+  name?: string;
   passed?: boolean | null;
   timer_s?: number;
   limit_s?: number;
@@ -139,11 +146,6 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
   return parse<T>(response);
 }
 
-function clock(seconds: number) {
-  const whole = Math.max(0, Math.floor(seconds));
-  return `${String(Math.floor(whole / 60)).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}`;
-}
-
 // "apple>bowl" or "stl_coffee_cup>plate" -> "Apple → Bowl", "Coffee cup → Plate"
 function goalName(label: string) {
   const nice = (part: string) => {
@@ -153,32 +155,9 @@ function goalName(label: string) {
   return label.includes(">") ? label.split(">").map(nice).join(" → ") : label;
 }
 
-function runTone(state: WorkerState["state"], passed?: boolean | null) {
-  if (state === "starting" || state === "running") return "running";
-  if (state === "succeeded" || passed === true) return "succeeded";
-  if (state === "failed" || state === "error" || passed === false) return "failed";
-  return "stopped";
-}
-
 function shownState(worker: WorkerState): WorkerState["state"] {
   if (worker.state !== "finished") return worker.state;
   return worker.passed === true ? "succeeded" : worker.passed === false ? "failed" : "finished";
-}
-
-function RunProgress({ seconds, limit, tone }: { seconds: number; limit: number; tone: string }) {
-  const share = limit > 0 ? Math.min(100, Math.max(0, (seconds / limit) * 100)) : 0;
-  const percent = Math.floor(share);
-  return (
-    <span className={`run-progress ${tone}`}>
-      <span className="run-progress-text">
-        <span>{clock(seconds)} / {clock(limit)}</span>
-        <span>{percent}%</span>
-      </span>
-      <span className="run-progress-track" role="progressbar" aria-label="Run time used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
-        <span className="run-progress-fill" style={{ width: `${share}%` }} />
-      </span>
-    </span>
-  );
 }
 
 function runName(attempt: number) {
@@ -189,7 +168,7 @@ function AttemptsPanel({ task }: { task: Task }) {
   const videos = useRef<HTMLDivElement | null>(null);
   const [allSpeed, setAllSpeed] = useState(1);
   if (task.waiting_for_attempts) {
-    return <div className="panel">Live run finished. Waiting for {task.attempts - 1} parallel run{task.attempts > 2 ? "s" : ""} to complete…</div>;
+    return <div className="panel">{task.suggestion_test ? `Running ${task.attempts} suggestion tests…` : `Live run finished. Waiting for ${task.attempts - 1} parallel run${task.attempts > 2 ? "s" : ""} to complete…`}</div>;
   }
   if (task.status === "RUNNING") return null;
   const results = task.attempt_results ?? [];
@@ -252,8 +231,8 @@ function AttemptsPanel({ task }: { task: Task }) {
             <figure key={name} className={state}>
               <VideoPlayer src={url(name)} loop groupSpeed={allSpeed} />
               <figcaption>
-                <strong>{runName(number)}</strong>
-                {result?.scene ? ` · Scene ${result.scene}` : ""}
+                <strong>{result?.name ?? runName(number)}</strong>
+                {result?.scene && !task.suggestion_test ? ` · Scene ${result.scene}` : ""}
                 {result && goalOf(result) ? ` · ${goalOf(result)}` : ""}
                 {result?.env ? ` · ${result.env}` : ""}
                 {result ? `: ${summary(result)}` : ""}
@@ -263,7 +242,7 @@ function AttemptsPanel({ task }: { task: Task }) {
         })}
       </div>
       {results.filter((r) => !clips.includes(`attempt-${r.attempt}`)).map((r) => (
-        <p className="hint" key={r.attempt}>{runName(r.attempt)} has no video. {summary(r)}</p>
+        <p className="hint" key={r.attempt}>{r.name ?? runName(r.attempt)} has no video. {summary(r)}</p>
       ))}
       {task.videos.includes("grid") && (
         <p className="hint"><a href={url("grid")} target="_blank" rel="noreferrer">Open all runs side by side</a></p>
@@ -305,6 +284,7 @@ export default function App() {
   const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
   const zoom = useRef({ sending: false, delta: 0 });
   const viewRef = useRef<HTMLDivElement | null>(null);
+  const wheelRef = useRef<((event: WheelEvent) => void) | null>(null);
 
   useEffect(() => {
     let closed = false;
@@ -380,11 +360,26 @@ export default function App() {
     if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ attempt }));
   };
 
+  const stableChooseAttempt = useCallback((attempt: number) => {
+    attemptRef.current = attempt;
+    setViewAttempt(attempt);
+    if (socket.current?.readyState === WebSocket.OPEN) socket.current.send(JSON.stringify({ attempt }));
+  }, []);
   const workers = live?.workers ?? [];
   useEffect(() => {
     // the dropdown's list changed (a new task, or none): go back to the live simulation if the choice is gone
     if (viewAttempt > 1 && !workers.some((worker) => worker.attempt === viewAttempt)) chooseAttempt(1);
   }, [workers.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const openedTests = useRef("");
+  useEffect(() => {
+    const current = live?.task;
+    const first = workers[0]?.attempt;
+    if (current?.suggestion_test && current.status === "RUNNING" && first && openedTests.current !== current.task_id) {
+      openedTests.current = current.task_id;
+      chooseAttempt(first); // a suggestion test has no live run to watch
+    }
+  }, [live?.task?.task_id, live?.task?.status, workers.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const chooseCamera = (name: string) => {
     cameraRef.current = name;
@@ -394,7 +389,6 @@ export default function App() {
 
   useEffect(() => {
     const element = viewRef.current;
-    if (!element) return;
     const sendZoom = async () => {
       const state = zoom.current;
       if (state.sending) return;
@@ -418,9 +412,12 @@ export default function App() {
       zoom.current.delta += event.deltaY * unit * (event.ctrlKey ? 4 : 1);
       void sendZoom();
     };
+    wheelRef.current = onWheel;
+    if (!element) return;
     element.addEventListener("wheel", onWheel, { passive: false });
     return () => element.removeEventListener("wheel", onWheel);
   }, []);
+  const zoomView = useCallback((event: WheelEvent) => wheelRef.current?.(event), []);
 
   // Before a run, a parallel run's tab can be edited like the live scene: the table and controls act on that run.
   const editingRun = viewAttempt > 1 && (live?.view_editable ?? false);
@@ -477,6 +474,23 @@ export default function App() {
   const locked = busy || running || dragging;
   const position = { x: pose.x, y: pose.y, z: pose.z };
   const where = editingRun ? ` in ${runName(viewAttempt).toLowerCase()}` : "";
+  const testViewer: TestViewerState = {
+    frameUrl,
+    camera,
+    cameras: CAMERAS,
+    cameraLabels: CAMERA_LABEL,
+    chooseCamera: (name) => chooseCamera(name),
+    attempt: viewAttempt,
+    chooseAttempt: stableChooseAttempt,
+    workers: task?.suggestion_test ? workers : [],
+    refinementOf: task?.refinement_of,
+    status: connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Reconnecting…",
+    fps,
+    onPointerDown: (event) => void startDrag(event),
+    onPointerMove: (event) => moveDrag(event),
+    onPointerUp: () => void endDrag(),
+    onWheel: zoomView,
+  };
   const canDrag = (viewAttempt === 1 || editingRun) && (camera === "top" || camera === "free") && !running && !busy;
 
   useEffect(() => {
@@ -673,7 +687,7 @@ export default function App() {
         <button className={page === "simulator" ? "active" : ""} onClick={() => setPage("simulator")}>Simulator</button>
         <button className={page === "benchmarks" ? "active" : ""} onClick={() => setPage("benchmarks")}>Benchmarks</button>
       </nav>
-      {page === "benchmarks" && <BenchmarksPage latestRunId={task?.evaluation ? task.task_id : ""} locked={running} />}
+      {page === "benchmarks" && <BenchmarksPage latestRunId={task?.refinement_of ?? (task?.evaluation ? task.task_id : "")} latestBatchId={task?.batch_id ?? ""} locked={running} testsActive={running && !!task?.suggestion_test} viewer={testViewer} />}
       <div className="layout" hidden={page !== "simulator"}>
         <section>
           <div className="panel viewer">
@@ -702,8 +716,8 @@ export default function App() {
                   aria-pressed={viewAttempt === worker.attempt}
                   onClick={() => chooseAttempt(worker.attempt)}
                 >
-                  <span className="run-tab-name">{worker.state === "ready" ? `Scene ${worker.scene ?? worker.attempt}` : runName(worker.attempt)}</span>
-                  {worker.state !== "ready" && worker.scene && <span className="run-tab-env">Scene {worker.scene}</span>}
+                  <span className="run-tab-name">{worker.name ?? (worker.state === "ready" ? `Scene ${worker.scene ?? worker.attempt}` : runName(worker.attempt))}</span>
+                  {worker.state !== "ready" && worker.scene && !worker.name && <span className="run-tab-env">Scene {worker.scene}</span>}
                   {worker.label && <span className="run-tab-goal">{goalName(worker.label)}</span>}
                   {worker.env && <span className="run-tab-env">{worker.env}</span>}
                   <span className={`run-tab-state ${shownState(worker)}`}>
@@ -903,7 +917,7 @@ export default function App() {
             </div>
             {running && task?.waiting_for_capacity && <p className="hint">Dream-1 is busy. Waiting for a free seat. The robot holds still and this time counts toward the limit.</p>}
             {running && !task?.waiting_for_capacity && !task?.finalizing && !task?.waiting_for_attempts && !task?.elapsed_s && <p className="hint">Starting. The timer counts movement, Dream-1 decisions and waiting for Dream-1.</p>}
-            {running && task?.waiting_for_attempts && <p className="hint">Live run finished and left Dream-1. Parallel runs are still moving.</p>}
+            {running && task?.waiting_for_attempts && <p className="hint">{task.suggestion_test ? "Suggestion tests are running in their own scenes. The live scene is not changed." : "Live run finished and left Dream-1. Parallel runs are still moving."}</p>}
             {running && task?.holding && <p className="hint">All runs have finished and disconnected from Dream-1. Waiting for the full time; press Stop to generate the report now.</p>}
             {task?.finalizing && <p className="hint">Robots stopped. Saving videos and reports...</p>}
             <div className="row">
@@ -920,7 +934,7 @@ export default function App() {
             </div>
             {task && (
               <div className={`status ${task.outcome === "SUCCESS" ? "success" : task.status === "FAILED" || task.outcome === "FAILURE" ? "error" : ""}`}>
-                <strong>{TASK_LABEL[task.status]}</strong>: {task.result_message ?? task.instruction}
+                <strong>{task.suggestion_test && task.status === "COMPLETED" ? "Tests finished" : TASK_LABEL[task.status]}</strong>: {task.result_message ?? task.instruction}
                 {task.error && <div>{task.error}</div>}
               </div>
             )}

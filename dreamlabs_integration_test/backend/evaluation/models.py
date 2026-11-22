@@ -67,6 +67,11 @@ class TaskDefinition(BaseModel):
     where: Literal["live", "hidden"] = "live"
     scene_number: int | None = None
     scene_label: str | None = None
+    refinement_of: str | None = None
+    source_attempt: int | None = None
+    test_kind: str | None = None
+    test_change: str | None = None
+    test_suggestion: str | None = None
 
     @property
     def run(self) -> str:

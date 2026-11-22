@@ -28,6 +28,7 @@ import outcome  # noqa: E402
 import capacity  # noqa: E402
 import evaluation  # noqa: E402
 import environments  # noqa: E402
+import suggestions  # noqa: E402
 
 DEFAULT_SCENE = "yam_tabletop"
 ROBOT_ID = "yam"
@@ -42,6 +43,7 @@ JPEG_QUALITY = 70
 WAITING_AFTER_S = 0.3
 ALLOWED_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
 MAX_TASK_SECONDS = 200
+SUGGESTION_COST_PER_120S = 0.07  # the website's displayed estimate
 MAX_STL_BYTES = 60 * 1024 * 1024
 MAX_STL_TRIANGLES = 1_500_000
 SIM_MESH_TRIANGLES = 60_000
@@ -796,6 +798,10 @@ class ExecuteTask(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
 
+class SuggestionChoice(BaseModel):
+    tests: list[int] = Field(min_length=1, max_length=8)
+
+
 class PrepareEnvironments(BaseModel):
     count: int = Field(ge=0, le=outcome.MAX_ATTEMPTS - 1)
     mode: str = Field(default="shuffle", pattern="^(same|shuffle|shuffle_style)$")
@@ -1184,6 +1190,8 @@ def task_view(task):
     session = outcome.current if outcome.current is not None and outcome.current.task is task else None
     if clock is not None:
         elapsed = session.progress() if session is not None else clock.used()
+    elif task is active_task and session is not None:
+        elapsed = session.progress()
     elif task.get("run_seconds") is not None:
         elapsed = task["run_seconds"]
     elif task.get("timer_seconds") is not None:
@@ -1638,6 +1646,154 @@ def analyze_run_videos(run_id: str):
     if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
         raise HTTPException(404, "No report exists for this run.")
     return {"queued": vision_checks.submit(run_id, outcome.VIDEOS / run_id, only_missing=True)}
+
+
+def suggestion_rules():
+    return {"x": SHUFFLE_X, "y": SHUFFLE_Y, "spacing": SHUFFLE_SPACING_M, "clearance": dict(FIXED_CLEARANCE_M)}
+
+
+def plan_suggestions(run_id):
+    """A finished run's one-change tests, or why they cannot start."""
+    records = evaluations.run_records(run_id)
+    reason = evaluation.refinement.blocked_reason(records)
+    if reason:
+        return {"tests": [], "untested": [], "problem": reason}
+    return suggestions.build_tests(outcome.VIDEOS / run_id, records, suggestion_rules())
+
+
+def run_suggestions(task, stop, tests):
+    """Run a plan's tests in parallel and score each against the attempt it came from."""
+    global active_task, active_stop
+    result = {}
+    session = None
+    try:
+        session = outcome.SuggestionSession(task, sim.env, tests)
+        session.finish(result)
+        result["run_seconds"] = round(session.progress(), 1)
+        rows = result.get("attempt_results", [])
+        if task.get("cancel_requested"):
+            result["status"], result["result_message"] = "CANCELLED", "suggestion tests stopped, so no comparison was saved."
+        elif rows and all(row.get("error") for row in rows):
+            result["status"], result["error"] = "FAILED", rows[0]["error"]
+        else:
+            result["status"] = "COMPLETED"
+            result["result_message"] = f"{result.get('attempts_succeeded', 0)} of {len(rows)} tests succeeded. The comparison is in the benchmark report."
+            result["evaluation"] = evaluate_suggestions(task, tests, result)
+    except Exception as error:
+        result["status"], result["error"] = "FAILED", f"{type(error).__name__}: {error}"
+        if session is not None and session.workers is not None:
+            session.workers.stop()
+    finally:
+        result.setdefault("videos", [])
+        task["waiting_for_attempts"] = False
+        finished_at = time.time()
+        active_task = None
+        active_stop = None
+        task.update(result, finished_at=finished_at)
+
+
+def evaluate_suggestions(task, tests, result):
+    videos = result.get("videos", [])
+    clips = [name for name in videos if name != "grid"]
+    folder = outcome.VIDEOS / task["task_id"]
+    sources = {record[0].attempt: record[0] for record in evaluations.run_records(task["refinement_of"])}
+    for row in result.get("attempt_results", []):
+        number = row["attempt"]
+        test = tests[number - 2]
+        proof = hidden_evidence(task, number, row, folder)
+        proof.videos = [name for name in clips if name == f"attempt-{number}"]
+        proof.run_videos = list(videos)
+        definition = sources[test["source_attempt"]].model_copy(
+            update={
+                "task_id": proof.task_id,
+                "run_id": task["task_id"],
+                "attempt": number,
+                "where": "hidden",
+                "instruction": test["instruction"],
+                "max_duration_seconds": test["max_seconds"],
+                "started_at": task["started_at"],
+                "scene_number": test["test"],
+                "scene_label": f"Test {test['test']}: {test['change']}",
+                "refinement_of": task["refinement_of"],
+                "source_attempt": test["source_attempt"],
+                "test_kind": test["kind"],
+                "test_change": test["change"],
+                "test_suggestion": test["suggestion"],
+            }
+        )
+        evaluations.submit(definition, proof)
+    vision_checks.submit(task["task_id"], folder)
+    run = evaluations.run_report(task["task_id"])["run"]
+    return {
+        "outcome": run["outcome"],
+        "score": run["final_score"],
+        "coverage": 100 * run["attempts_scored"] / run["attempts_total"],
+        "batch_id": run["batch_id"],
+        "run_id": run["run_id"],
+        "report_url": f"/api/reports/runs/{run['run_id']}",
+    }
+
+
+@app.get("/api/reports/runs/{run_id}/suggestion-tests")
+async def suggestion_tests(run_id: str):
+    if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
+        raise HTTPException(404, "No report exists for this run.")
+    results = evaluations.suggestion_results(run_id)
+    if active_task is not None:
+        mine = active_task.get("refinement_of") == run_id
+        running = {"task_id": active_task["task_id"], "phase": live_phase()} if mine else None
+        reason = "Suggestion tests are running." if mine else "Wait for the current run to finish."
+        return {"ready": False, "reason": reason, "tests": active_task.get("tests", []) if mine else [], "untested": [], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": running, "results": results}
+    plan = await asyncio.to_thread(plan_suggestions, run_id)
+    tests = [suggestions.public(test) for test in plan["tests"]]
+    return {"ready": bool(tests), "reason": plan["problem"], "tests": tests, "untested": plan["untested"], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": None, "results": results}
+
+
+@app.post("/api/reports/runs/{run_id}/suggestion-tests", status_code=202)
+async def start_suggestion_tests(run_id: str, body: SuggestionChoice):
+    global active_task, active_stop
+    if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
+        raise HTTPException(404, "No report exists for this run.")
+    if active_task is not None:
+        raise HTTPException(409, "A task is already running.")
+    plan = await asyncio.to_thread(plan_suggestions, run_id)
+    if plan["problem"] or not plan["tests"]:
+        raise HTTPException(409, plan["problem"] or "There is nothing to test.")
+    if active_task is not None:
+        raise HTTPException(409, "A task is already running.")
+    wanted = set(body.tests)
+    if not wanted <= {test["test"] for test in plan["tests"]}:
+        raise HTTPException(422, "One of the selected tests is no longer available. Reload the page and choose again.")
+    tests = [test for test in plan["tests"] if test["test"] in wanted]
+    source = evaluations.run_records(run_id)[0][0]
+    public = [suggestions.public(test) for test in tests]
+    task = {
+        "task_id": uuid.uuid4().hex[:12],
+        "instruction": f"Suggestion tests for {source.instruction}",
+        "plan": [{"instruction": test["instruction"], "attempts": 1} for test in tests],
+        "max_seconds": max(test["max_seconds"] for test in tests),
+        "status": "RUNNING",
+        "started_at": time.time(),
+        "finished_at": None,
+        "error": None,
+        "outcome": None,
+        "result_message": None,
+        "attempts": len(tests),
+        "videos": [],
+        "batch_id": source.batch_id,
+        "evaluation": None,
+        "evaluation_error": None,
+        "environments": "same",
+        "seed": 0,
+        "suggestion_test": True,
+        "refinement_of": run_id,
+        "tests": public,
+    }
+    tasks[task["task_id"]] = task
+    active_task = task
+    active_stop = threading.Event()
+    pool.submit(run_suggestions, task, active_stop, tests)
+    return task
 
 
 @app.get("/api/tasks/{task_id}/video/{clip}")

@@ -5,6 +5,7 @@ from pathlib import Path
 from evaluation import Evidence, TaskDefinition, evaluate_task, parse_instruction
 from evaluation.batch import aggregate
 from evaluation.insights import analyze_run, compare_groups, compare_scenes, failure_finding
+from evaluation.refinement import compare_tests
 from evaluation.models import ContactEvent, Criterion, Environment, ObjectState, Snapshot
 from evaluation.reports import batch_html, task_html, task_report
 from evaluation.store import EvaluationStore
@@ -217,6 +218,33 @@ class EvaluationTests(unittest.TestCase):
         self.assertIn("90%", str(slow.components["efficiency"]))
         waited = evaluate_task(task(), evidence(IN_BOWL, duration=20).model_copy(update={"wait_seconds": 70}))
         self.assertEqual(waited.score, quick.score)
+
+    def test_suggestions_are_judged_against_the_control(self):
+        source = task("put apple into the bowl", "s1").model_copy(update={"attempt": 1, "run_id": "source"})
+        failed = evidence({}, task_id="s1", final_contacts=[])
+        before = (source, failed, evaluate_task(source, failed))
+        def test(number, kind, final):
+            item = source.model_copy(update={"task_id": f"t{number}", "run_id": "tests", "attempt": number + 1, "scene_number": number, "refinement_of": "source", "source_attempt": 1, "test_kind": kind, "test_change": kind})
+            proof = evidence(final, task_id=item.task_id, final_contacts=[["apple", "bowl"]] if final else [])
+            return item, proof, evaluate_task(item, proof)
+        helped = compare_tests([before], [test(1, "control", {}), test(2, "shorter_carry", IN_BOWL)])
+        self.assertEqual([row["verdict"] for row in helped["rows"]], ["control", "helped"])
+        self.assertEqual(helped["best_attempt"], 3)
+        self.assertEqual(helped["after"]["successes"], 1)
+        lucky = compare_tests([before], [test(1, "control", IN_BOWL), test(2, "shorter_carry", IN_BOWL)])
+        self.assertEqual(lucky["rows"][1]["verdict"], "no_change", "a gain the unchanged control also got is not credited")
+        self.assertIsNone(lucky["best_attempt"])
+
+    def test_suggestion_tests_stay_out_of_the_benchmark_score(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = EvaluationStore(Path(folder))
+            source = task("put apple into the bowl", "s1").model_copy(update={"batch_id": store.current_batch, "run_id": "source"})
+            store.submit(source, evidence({}, task_id="s1", final_contacts=[]))
+            trial = source.model_copy(update={"task_id": "t1", "run_id": "tests", "attempt": 2, "refinement_of": "source", "source_attempt": 1, "test_kind": "shorter_carry", "test_change": "moved"})
+            store.submit(trial, evidence(IN_BOWL, task_id="t1"))
+            self.assertEqual(store.batch_report(store.current_batch)["total_tasks"], 1)
+            self.assertEqual(len(store.suggestion_results("source")), 1)
+            self.assertEqual(store.run_report("tests")["refinement_of"], "source")
 
     def test_instruction_parsing(self):
         parsed = parse_instruction("Put the apple in the bowl without moving the cup", IDS)
