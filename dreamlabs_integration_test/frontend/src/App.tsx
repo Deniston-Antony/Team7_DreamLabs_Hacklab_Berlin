@@ -108,6 +108,7 @@ const RUN_STATE_LABEL: Record<WorkerState["state"], string> = {
   stopped: "Stopped",
 };
 const MAX_TASK_SECONDS = 200;
+const DEFAULT_TASK_SECONDS = 120;
 const MAX_ATTEMPTS = 8;
 const CREDITS_PER_ATTEMPT_120S = 0.06;
 const FRAME_WIDTH = 640;
@@ -267,7 +268,7 @@ export default function App() {
   const [stlSize, setStlSize] = useState(8);
   const [uploadKey, setUploadKey] = useState(0);
   const [instruction, setInstruction] = useState("put apple into the bowl");
-  const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
+  const [maxSeconds, setMaxSeconds] = useState(DEFAULT_TASK_SECONDS);
   const [totalRuns, setTotalRuns] = useState(1); // every task's runs together; task 1 gets what the others leave
   const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
   const [lastRequest, setLastRequest] = useState<Record<string, unknown> | null>(null);

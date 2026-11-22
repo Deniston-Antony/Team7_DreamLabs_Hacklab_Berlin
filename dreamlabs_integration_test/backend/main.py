@@ -41,6 +41,7 @@ JPEG_QUALITY = 70
 WAITING_AFTER_S = 0.3
 ALLOWED_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
 MAX_TASK_SECONDS = 200
+DEFAULT_TASK_SECONDS = 120
 MAX_STL_BYTES = 60 * 1024 * 1024
 MAX_STL_TRIANGLES = 1_500_000
 SIM_MESH_TRIANGLES = 60_000
@@ -771,7 +772,7 @@ class SubTask(BaseModel):
 class ExecuteTask(BaseModel):
     # One task as `instruction` (with `attempts`), or several at once as `tasks`, each with its own attempts.
     instruction: str | None = Field(default=None, min_length=1, max_length=500)
-    max_seconds: int = Field(default=MAX_TASK_SECONDS, ge=5, le=MAX_TASK_SECONDS)
+    max_seconds: int = Field(default=DEFAULT_TASK_SECONDS, ge=5, le=MAX_TASK_SECONDS)
     attempts: int = Field(default=1, ge=1, le=outcome.MAX_ATTEMPTS)
     tasks: list[SubTask] | None = Field(default=None, min_length=1, max_length=outcome.MAX_ATTEMPTS)
     # What the parallel runs start from: a copy of the live scene, shuffled positions, or shuffled + other styles.
