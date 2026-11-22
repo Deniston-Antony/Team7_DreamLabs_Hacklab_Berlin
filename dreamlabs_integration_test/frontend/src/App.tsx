@@ -821,7 +821,7 @@ export default function App() {
             </div>
             <nav className="run-strip" aria-label="Runs">
               {(workers.length > 1 ? workers : [{ attempt: 1, task: 1, where: "live", label: "", state: running ? "running" : "finished" } as WorkerState]).map((worker) => (
-                <div key={worker.attempt} className="run-card">
+                <div key={worker.attempt} className={`run-card ${viewAttempt === worker.attempt ? "active" : ""}`}>
                 <button
                   className={`run-tab ${viewAttempt === worker.attempt ? "active" : ""}`}
                   aria-pressed={viewAttempt === worker.attempt}
