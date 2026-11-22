@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PointerEvent, ReactNode } from "react";
+import type { PointerEvent } from "react";
 import { BenchmarksPage } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
 import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
@@ -188,23 +188,6 @@ function shownState(worker: WorkerState): WorkerState["state"] {
   if (worker.starved) return "not_judged";
   if (worker.state !== "finished") return worker.state;
   return worker.passed === true ? "succeeded" : worker.passed === false ? "failed" : "finished";
-}
-
-/** A run's log over the page: closes on its button, the backdrop or Escape. */
-function LogDialog({ onClose, children }: { onClose: () => void; children: ReactNode }) {
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => event.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-  return (
-    <div className="log-backdrop" onClick={onClose}>
-      <div className="log-dialog" role="dialog" aria-modal="true" aria-label="Dream-1 log" onClick={(event) => event.stopPropagation()}>
-        <button className="log-close" onClick={onClose} aria-label="Close the log">✕</button>
-        {children}
-      </div>
-    </div>
-  );
 }
 
 function runName(attempt: number) {
@@ -864,19 +847,25 @@ export default function App() {
                   )}
                 </button>
                 {task && !task.suggestion_test && worker.state !== "ready" && (
-                  <button className="run-log-button" onClick={() => setLogAttempt(worker.attempt)} aria-label={`Dream-1 log of ${runName(worker.attempt).toLowerCase()}`}>
-                    Log
+                  <button
+                    className={`run-log-button ${logAttempt === worker.attempt ? "open" : ""}`}
+                    onClick={() => setLogAttempt(logAttempt === worker.attempt ? null : worker.attempt)}
+                    aria-expanded={logAttempt === worker.attempt}
+                    aria-controls="run-log-tab"
+                    aria-label={`Dream-1 log of ${runName(worker.attempt).toLowerCase()}`}
+                  >
+                    {logAttempt === worker.attempt ? "Hide log" : "Log"}
                   </button>
                 )}
                 </div>
               ))}
             </nav>
+            {task && !task.suggestion_test && logAttempt !== null && (
+              <div id="run-log-tab" className="run-log-tab">
+                <DreamLogPanel key={`${task.task_id}-${logAttempt}`} taskId={task.task_id} attempt={logAttempt} runLabel={runName(logAttempt)} running={running} />
+              </div>
+            )}
           </div>
-          {task && !task.suggestion_test && logAttempt !== null && (
-            <LogDialog onClose={() => setLogAttempt(null)}>
-              <DreamLogPanel key={`${task.task_id}-${logAttempt}`} taskId={task.task_id} attempt={logAttempt} runLabel={runName(logAttempt)} running={running} />
-            </LogDialog>
-          )}
           {task && <AttemptsPanel key={task.task_id} task={task} />}
           {task?.evaluation && (
             <div className="panel report-prompt">
