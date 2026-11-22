@@ -31,6 +31,19 @@ type Task = {
   waiting_for_attempts?: boolean;
   evaluation?: EvaluationRef | null;
   evaluation_error?: string | null;
+  scene_save?: string;
+  scene_save_error?: string;
+};
+type SceneSave = {
+  save_id: string;
+  saved_at: number;
+  plan: { instruction: string; attempts: number }[];
+  total_runs: number;
+  max_seconds: number;
+  mode: "same" | "shuffle" | "shuffle_style";
+  seed: number | null;
+  scene_id: string;
+  edited_runs: number;
 };
 type TaskResult = {
   task: number;
@@ -145,6 +158,13 @@ function goalName(label: string) {
   return label.includes(">") ? label.split(">").map(nice).join(" → ") : label;
 }
 
+function saveName(save: SceneSave) {
+  const when = new Date(save.saved_at * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const what = save.plan.length > 1 ? `${save.plan.length} tasks` : save.plan[0]?.instruction ?? "";
+  const edited = save.edited_runs ? ` · ${save.edited_runs} edited` : "";
+  return `${when} · ${what} · ${save.total_runs} run${save.total_runs > 1 ? "s" : ""}${edited}`;
+}
+
 function runName(attempt: number) {
   return attempt === 1 ? "Live run" : `Parallel run ${attempt}`;
 }
@@ -253,6 +273,8 @@ export default function App() {
   const [lastRequest, setLastRequest] = useState<Record<string, unknown> | null>(null);
   const [envMode, setEnvMode] = useState<"same" | "shuffle" | "shuffle_style">("same");
   const [seed, setSeed] = useState(() => Math.floor(Math.random() * 100000));
+  const [saves, setSaves] = useState<SceneSave[]>([]);
+  const [chosenSave, setChosenSave] = useState("");
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator…", error: false });
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
@@ -432,6 +454,30 @@ export default function App() {
     }, 400);
     return () => window.clearTimeout(timer);
   }, [envMode, seed, totalAttempts, connected]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const savedId = task?.scene_save ?? "";
+  useEffect(() => {
+    // the list of saved starting scenes: on connect, and when a run has saved a new one
+    if (!connected) return;
+    api<{ saves: SceneSave[] }>("/api/scene-saves")
+      .then((reply) => setSaves(reply.saves))
+      .catch(() => undefined);
+  }, [connected, savedId]);
+  const loadSave = () => {
+    const save = saves.find((item) => item.save_id === chosenSave);
+    if (!save) return;
+    void run(`Loaded the starting scene of ${saveName(save)}`, async () => {
+      await api(`/api/scene-saves/${save.save_id}/load`, {});
+      // match the page to the save, so the next Run uses exactly these runs (the backend keeps the loaded scenes)
+      const [first, ...rest] = save.plan;
+      setInstruction(first?.instruction ?? "");
+      setExtras(rest.map((item) => ({ text: item.instruction, attempts: item.attempts })));
+      setTotalRuns(save.total_runs);
+      setMaxSeconds(save.max_seconds);
+      setEnvMode(save.mode);
+      if (save.seed != null) setSeed(save.seed);
+    });
+  };
 
   const resetScene = () => {
     if (running && !window.confirm("Stop every run and reset the scene?")) return;
@@ -823,6 +869,19 @@ export default function App() {
             {uploadStatus && <div className={`status ${uploadStatus.error ? "error" : ""}`}>{uploadStatus.text}</div>}
           </div>
           <div className="panel">
+            <h2>Saved scenes</h2>
+            <p className="hint">Every Run saves the exact starting scene of each run. Load one to repeat a test from the same scene.</p>
+            <div className="save-row">
+              <select aria-label="Saved scene" value={chosenSave} disabled={running || !saves.length} onChange={(event) => setChosenSave(event.target.value)}>
+                <option value="">{saves.length ? "Choose a saved scene…" : "No saved scenes yet"}</option>
+                {saves.map((save) => (
+                  <option key={save.save_id} value={save.save_id}>{saveName(save)}</option>
+                ))}
+              </select>
+              <button disabled={locked || !chosenSave} onClick={loadSave}>Load</button>
+            </div>
+          </div>
+          <div className="panel">
             <h2>Tasks</h2>
             <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
             <div className="hint">
@@ -874,6 +933,7 @@ export default function App() {
               <div className={`status ${task.outcome === "SUCCESS" ? "success" : task.status === "FAILED" || task.outcome === "FAILURE" ? "error" : ""}`}>
                 <strong>{TASK_LABEL[task.status]}</strong>: {task.result_message ?? task.instruction}
                 {task.error && <div>{task.error}</div>}
+                {task.scene_save_error && <div>{task.scene_save_error}</div>}
               </div>
             )}
             <div className={`status spaced ${status.error ? "error" : ""}`}>{status.text}</div>

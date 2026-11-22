@@ -7,3 +7,4 @@ frontend/dist/
 .env
 backend/task_videos/
 backend/evaluation_data/
+backend/scene_saves/

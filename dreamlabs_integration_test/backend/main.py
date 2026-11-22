@@ -26,6 +26,7 @@ import yam_env  # noqa: E402
 import outcome  # noqa: E402
 import evaluation  # noqa: E402
 import environments  # noqa: E402
+import scene_saves  # noqa: E402
 
 DEFAULT_SCENE = "yam_tabletop"
 ROBOT_ID = "yam"
@@ -902,6 +903,92 @@ def run_environments(task):
     return prepare_environments(needed, mode, task["seed"])
 
 
+def live_state():
+    """The live scene as a save keeps it: its objects and the full simulator state."""
+    return {
+        "scene_id": sim.scene_id,
+        "added": sim.added,
+        "removed": sim.removed,
+        "type_overrides": sim.type_overrides,
+        "poses": capture_layout()["poses"],
+        "qpos": sim.env.data.qpos.copy(),
+        "qvel": sim.env.data.qvel.copy(),
+        "ctrl": sim.env.data.ctrl.copy(),
+    }
+
+
+def save_scene(task, envs):
+    """Save the starting scene of every run of a task, before the robot moves; a failure never stops the run."""
+    try:
+        saved = scene_saves.write(
+            task["task_id"], task, live_state(), envs or [], task.get("environments", "same"), task.get("seed")
+        )
+        task["scene_save"] = saved["save_id"]
+    except Exception as error:
+        task["scene_save_error"] = f"The starting scene could not be saved: {type(error).__name__}: {error}"
+
+
+def load_scene(save_id):
+    """Put the live scene and every parallel run back exactly as a save has them; runs on the simulator thread.
+    @return The save's summary, so the page can set Total runs, the tasks and Start scenes to match.
+    """
+    description, arrays = scene_saves.read(save_id)
+    if description["scene_id"] not in SCENES:
+        raise scene_saves.SaveError(f"The saved scene style {description['scene_id']!r} no longer exists.", 422)
+    sim.scene_id = description["scene_id"]
+    sim.added.clear()
+    sim.added.update(scene_saves.added_objects(description, arrays))
+    sim.removed.clear()
+    sim.removed.update(description["removed"])
+    sim.type_overrides.clear()
+    sim.type_overrides.update(description["type_overrides"])
+    sim.grab = None
+    sim.selected = None
+    sim._rebuild(keep_poses=False, poses={name: np.array(pose) for name, pose in description["poses"].items()})
+    model, data = sim.env.model, sim.env.data
+    if model.nq != arrays["live_qpos"].size or model.nu != arrays["live_ctrl"].size:
+        raise scene_saves.SaveError("The saved scene does not match the simulator's objects any more.", 422)
+    data.qpos[:], data.qvel[:], data.ctrl[:] = arrays["live_qpos"], arrays["live_qvel"], arrays["live_ctrl"]
+    mujoco.mj_forward(model, data)
+    movable = list(sim._joint_by_body())
+    present = [n for n in sim.managed() if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) >= 0]
+    rules = environment_rules(movable, present)
+    poses = {n: np.r_[data.body(n).xpos, data.body(n).xquat] for n in present}
+    models = {sim.scene_id: model}
+    envs = []
+    for run in description["runs"]:
+        style = run["style"] if run["style"] in SCENES else sim.scene_id
+        if style not in models:
+            models[style] = sim._compile(poses, style)
+        run_model = models[style]
+        prefix = f"run{run['attempt']}"
+        if run_model.nq != arrays[f"{prefix}_qpos"].size:
+            raise scene_saves.SaveError(f"Parallel run {run['attempt']}'s saved scene does not match its objects.", 422)
+        run_data = mujoco.MjData(run_model)
+        run_data.qpos[:], run_data.qvel[:] = arrays[f"{prefix}_qpos"], arrays[f"{prefix}_qvel"]
+        run_data.ctrl[:] = arrays[f"{prefix}_ctrl"]
+        environment = environments.Environment(
+            run["attempt"],
+            run_model,
+            run_data,
+            style,
+            SCENES[style]["name"],
+            run["seed"],
+            run["shuffled"],
+            {**rules, "restyled": style != sim.scene_id},
+        )
+        environment.edited = run["edited"]
+        environment.previews = environments.render_previews(run_model, run_data)
+        envs.append(environment)
+    outcome.clear_runs()
+    if envs:
+        outcome.set_previews(envs, description["mode"], description["seed"])
+    else:
+        outcome.clear_previews()
+    sim.publish()
+    return scene_saves.summary(description)
+
+
 def refresh_previews(keep_edits=True):
     """Rebuild the prepared environments from the scene as it is now; runs on the simulator thread.
     @param keep_edits Keep the environments the user edited by hand; False rebuilds every one (Reset scene).
@@ -1063,6 +1150,7 @@ def run_task(task, stop):
         result["evaluation_error"] = f"Evaluation could not start: {type(error).__name__}: {error}"
     try:
         envs = run_environments(task)
+        save_scene(task, envs)
         session = outcome.Session(task, sim.env, goals, envs, sim.managed())
         dc.main(
             [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
@@ -1305,6 +1393,27 @@ async def environment_rotate(attempt: int, body: RotateObject):
 async def environment_shuffle(attempt: int):
     await edit_environment(attempt, "shuffle")
     return {"environment": preview_environment(attempt).describe()}
+
+
+@app.get("/api/scene-saves")
+def scene_save_list():
+    """Every run's saved starting scenes, newest first."""
+    return {"saves": scene_saves.list_saves()}
+
+
+@app.post("/api/scene-saves/{save_id}/load")
+async def scene_save_load(save_id: str):
+    """Put back the live scene and every parallel run exactly as they were when that run started."""
+    if active_task is not None:
+        raise HTTPException(409, "A saved scene cannot be loaded while a task is running.")
+
+    def apply():
+        try:
+            return load_scene(save_id)
+        except scene_saves.SaveError as error:
+            raise HTTPException(error.status, str(error)) from error
+
+    return {"loaded": await on_sim(apply)}
 
 
 @app.delete("/api/scene/layout")

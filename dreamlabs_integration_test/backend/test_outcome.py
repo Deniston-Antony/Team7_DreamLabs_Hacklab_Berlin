@@ -24,6 +24,7 @@ import main
 import mujoco
 import numpy as np
 import outcome
+import scene_saves
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -70,6 +71,7 @@ class OutcomeTest(unittest.TestCase):
     def setUp(self):
         """Every task starts from the default scene, with no saved layout."""
         main.saved_layout = None
+        scene_saves.SAVES = Path(tempfile.mkdtemp())  # every test starts with no saved scenes
         outcome.clear_previews()
         self.client.post("/api/scene/reset")
 
@@ -576,6 +578,73 @@ class OutcomeTest(unittest.TestCase):
         hidden = sorted((r for r in task["attempt_results"] if r["where"] == "hidden"), key=lambda r: r["attempt"])
         self.assertEqual([r["closest_cm"] for r in hidden], [-20, round(live_x * 100)])
         self.assertEqual(hidden[0]["env"], "Default lab, edited")
+
+    def position(self, name):
+        return [round(v, 3) for v in self.objects()[name]["position"]]
+
+    def test_a_run_saves_every_runs_starting_scene_and_load_puts_it_back(self):
+        """Run with an edited run 2; change everything; Load gives back the live scene and both runs exactly."""
+        self.client.post("/api/environments", json={"count": 2, "mode": "shuffle", "seed": 4})
+        self.client.post("/api/environments/2/move", json={"object_id": "apple", "position": {"x": -0.2, "y": 0.15, "z": 0.8}})
+        self.client.post("/api/objects/move", json={"object_id": "orange", "position": {"x": -0.2, "y": -0.05, "z": 0.8}})
+        orange, run3_apple = self.position("orange"), self.apple_xy(outcome.previews["envs"][1])
+        outcome.SORTFLOW = self.fake_workers(
+            'print("RESULT " + json.dumps({"success": False, "sim_seconds": None, "closest_cm": x_cm}))'
+        )
+        try:
+            task = self.submit("put apple into the bowl", model(steps=20), attempts=3, environments="shuffle", seed=4)
+        finally:
+            outcome.SORTFLOW = self.keep[2]
+        self.assertEqual(task["scene_save"], task["task_id"])
+        [listed] = self.client.get("/api/scene-saves").json()["saves"]
+        self.assertEqual((listed["save_id"], listed["total_runs"], listed["edited_runs"]), (task["task_id"], 3, 1))
+        self.assertEqual((listed["mode"], listed["seed"]), ("shuffle", 4))
+        self.assertEqual(listed["plan"], [{"instruction": "put apple into the bowl", "attempts": 3}])
+
+        self.client.post("/api/scene/reset")  # change everything
+        self.client.post("/api/environments", json={"count": 1, "mode": "same"})
+        self.assertNotEqual(self.position("orange"), orange)
+
+        reply = self.client.post(f"/api/scene-saves/{task['task_id']}/load")
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["loaded"]["total_runs"], 3)
+        self.assertEqual(self.position("orange"), orange, "the live scene is back")
+        run2, run3 = outcome.previews["envs"]
+        self.assertEqual(self.apple_xy(run2), [-0.2, 0.15], "the edited run is back")
+        self.assertEqual(self.apple_xy(run3), run3_apple, "the shuffled run is back")
+        self.assertEqual((run2.label, run2.edited, run3.label), ("Default lab, edited", True, "Default lab, shuffled"))
+        self.assertEqual((outcome.previews["mode"], outcome.previews["seed"]), ("shuffle", 4))
+        self.assertEqual(outcome.worker_frame(3, "top")[1][:2], b"\xff\xd8")
+        kept = self.client.post("/api/environments", json={"count": 2, "mode": "shuffle", "seed": 4}).json()
+        self.assertTrue(kept["environments"][0]["edited"], "the page asking for the same runs keeps the loaded ones")
+
+    def test_load_puts_back_added_objects_and_moved_fixed_objects(self):
+        """A save keeps added blocks and where a fixed object stood, which the simulator state alone does not."""
+        block = self.client.post("/api/objects/add", json={"type": "block", "position": {"x": -0.25, "y": 0.0, "z": 0.8}}).json()["object_id"]
+        self.client.post("/api/objects/type", json={"object_id": "bowl", "movable": True})
+        self.client.post("/api/objects/move", json={"object_id": "bowl", "position": {"x": 0.05, "y": -0.1, "z": 0.8}})
+        self.client.post("/api/objects/type", json={"object_id": "bowl", "movable": False})
+        bowl, placed = self.position("bowl"), self.position(block)
+        task = self.submit("put apple into the bowl", model(steps=20))
+        self.client.post("/api/objects/remove", json={"object_id": block})
+        self.client.post("/api/scene/reset")
+        self.assertNotIn(block, self.objects())
+        self.assertEqual(self.client.post(f"/api/scene-saves/{task['task_id']}/load").status_code, 200)
+        self.assertEqual(self.position(block), placed)
+        self.assertEqual(self.position("bowl"), bowl)
+        self.assertFalse(self.objects()["bowl"]["movable"])
+
+    def test_loading_a_missing_or_bad_save_is_refused(self):
+        self.assertEqual(self.client.post("/api/scene-saves/nothing-here/load").status_code, 404)
+        self.assertEqual(self.client.post("/api/scene-saves/a.b/load").status_code, 422)
+        self.assertEqual(self.client.get("/api/scene-saves").json(), {"saves": []})
+
+    def test_a_save_cannot_be_loaded_while_a_task_runs(self):
+        task = self.submit("put apple into the bowl", model(steps=20))
+        main.dc.main = model(steps=4000)
+        self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20})
+        time.sleep(0.3)
+        self.assertEqual(self.client.post(f"/api/scene-saves/{task['task_id']}/load").status_code, 409)
 
     def test_parallel_runs_cannot_be_edited_while_a_task_runs(self):
         self.client.post("/api/environments", json={"count": 1, "mode": "same"})
