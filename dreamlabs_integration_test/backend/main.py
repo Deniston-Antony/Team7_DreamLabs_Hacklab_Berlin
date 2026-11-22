@@ -1196,6 +1196,7 @@ def run_task(task, stop):
     active_clock = clock
     sim.clock = clock
     active_dream_log = roundtrip_log.RoundTripLog(outcome.dream_log_path(outcome.VIDEOS / task["task_id"], 1), sim.env)
+    client_log = dream_client_log.capture(outcome.client_log_path(outcome.VIDEOS / task["task_id"], 1))
     session = None
     definition = None
     capture = None
@@ -1276,6 +1277,7 @@ def run_task(task, stop):
         active_clock = None
         active_dream_log.close()
         active_dream_log = None
+        dream_client_log.release(client_log)
         task.update(result, finished_at=finished_at)
 
 
@@ -1940,17 +1942,13 @@ def task_dream_log(task_id: str, attempt: int, full: bool = False, after: int = 
     return log
 
 
-@app.get("/api/tasks/{task_id}/dream-client-log")
-def task_dream_client_log(task_id: str, limit: int = Query(300, ge=1, le=2000)):
-    """The dream client's own log lines (sessions, pacing, warnings) from this task's start to its end.
-
-    Every run of the task (the live one and the parallel workers) writes the same file, so these are all of them.
-    """
-    task = tasks.get(task_id)
-    if task is None:
-        raise HTTPException(404, "no such task")
-    until = task.get("finished_at")
-    return dream_client_log.read(task["started_at"] - 1, None if until is None else until + 5, limit)
+@app.get("/api/tasks/{task_id}/dream-client-log/{attempt}")
+def task_dream_client_log(task_id: str, attempt: int, limit: int = Query(300, ge=1, le=2000)):
+    """Run `attempt`'s own dream client log: its sessions, pacing switches and warnings, no other run's."""
+    known = task_id in tasks or evaluations.has_run(task_id)
+    if not known or not 1 <= attempt <= outcome.MAX_ATTEMPTS:
+        raise HTTPException(404, "no such run")
+    return dream_client_log.read(file=outcome.client_log_path(outcome.VIDEOS / task_id, attempt), limit=limit)
 
 
 @app.get("/api/tasks/{task_id}/frames/{attempt}/{camera}")

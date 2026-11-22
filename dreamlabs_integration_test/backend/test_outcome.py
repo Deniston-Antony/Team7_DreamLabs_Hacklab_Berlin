@@ -20,6 +20,7 @@ from pathlib import Path
 
 import io
 import json
+import logging
 
 import environments
 import main
@@ -833,31 +834,35 @@ class OutcomeTest(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-log/10").status_code, 404)
         self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-log/4").json()["entries"], [])
 
-    def test_a_tasks_dream_client_log_is_the_lines_written_while_it_ran(self):
-        """The dream client's log lines from the task's start to its end; earlier ones are left out."""
-        folder = Path(tempfile.mkdtemp())
-        log = folder / "dream.log"
-        stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".000Z"
-        log.write_text(f"{stamp(time.time() - 600)} INFO dream.client session before started (new)\n")
+    def test_each_run_keeps_its_own_dream_client_log(self):
+        """The live run's dream client lines and each worker's go to separate files, served per run."""
+        line = (
+            "import os\n"
+            "folder = os.environ['DREAM_LOG_DIR']\n"
+            "os.makedirs(folder, exist_ok=True)\n"
+            "open(os.path.join(folder, 'dream.log'), 'a').write("
+            "'2026-11-22T09:36:21.131Z INFO dream.client session worker-' + arg('--attempt') + ' started (new)\\n')\n"
+            'print("RESULT " + json.dumps({"success": False, "sim_seconds": None, "closest_cm": 9}))'
+        )
+        outcome.SORTFLOW = self.fake_workers(line)
 
-        def writes(argv, **kw):
-            with open(log, "a") as stream:
-                stream.write(f"{stamp(time.time())} INFO dream.client session during started (new)\n")
+        def live(argv, **kw):
+            logging.getLogger("dream.client").info("session live-1 started (new)")
             return model(steps=20)(argv, **kw)
 
-        saved = os.environ.get("DREAM_LOG_DIR")
-        os.environ["DREAM_LOG_DIR"] = str(folder)
         try:
-            task = self.submit("put apple into the bowl", writes)
-            reply = self.client.get(f"/api/tasks/{task['task_id']}/dream-client-log").json()
+            task = self.submit("put apple into the bowl", live, attempts=3)
         finally:
-            if saved is None:
-                del os.environ["DREAM_LOG_DIR"]
-            else:
-                os.environ["DREAM_LOG_DIR"] = saved
-        self.assertEqual([e["session"] for e in reply["entries"]], ["during"])
-        self.assertEqual(reply["summary"]["sessions"], 1)
-        self.assertEqual(self.client.get("/api/tasks/nope/dream-client-log").status_code, 404)
+            outcome.SORTFLOW = self.keep[2]
+        logging.getLogger("dream.client").info("session after-the-task started (new)")  # no longer captured
+        sessions = {
+            attempt: [e["session"] for e in self.client.get(f"/api/tasks/{task['task_id']}/dream-client-log/{attempt}").json()["entries"]]
+            for attempt in (1, 2, 3)
+        }
+        self.assertEqual(sessions, {1: ["live-1"], 2: ["worker-2"], 3: ["worker-3"]})
+        self.assertFalse(self.client.get(f"/api/tasks/{task['task_id']}/dream-client-log/4").json()["exists"])
+        self.assertEqual(self.client.get("/api/tasks/nope/dream-client-log/1").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/tasks/{task['task_id']}/dream-client-log/10").status_code, 404)
 
     def test_bad_requests_are_refused(self):
         """Too many attempts, and video names that try to leave the folder, are refused."""

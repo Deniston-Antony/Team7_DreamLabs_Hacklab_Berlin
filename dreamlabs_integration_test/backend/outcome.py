@@ -47,6 +47,12 @@ def dream_log_path(folder, attempt):
     return Path(folder) / f"attempt-{attempt}.dream.jsonl"
 
 
+def client_log_path(folder, attempt):
+    """Where run `attempt` keeps the dream client's own log (sessions, pacing, warnings): a worker's DREAM_LOG_DIR
+    points at this file's folder, and the live run's lines are copied here while it runs."""
+    return Path(folder) / f"attempt-{attempt}.client" / "dream.log"
+
+
 def describe(goal):
     """A short name for a goal, for video labels: "apple>plate"."""
     return f"{goal['object']}>{goal['target']}"
@@ -179,7 +185,7 @@ class Workers:
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
-                        env=self.env,
+                        env={**self.env, "DREAM_LOG_DIR": str(client_log_path(self.folder, job["attempt"]).parent)},
                         cwd=SORTFLOW,
                         start_new_session=True,
                         pass_fds=(write_fd,),

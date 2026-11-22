@@ -9,6 +9,7 @@ Line format (dream/logs.py): `2026-11-22T09:36:20.829Z INFO dream.pacing <messag
 """
 
 import calendar
+import logging
 import os
 import re
 import time
@@ -24,6 +25,33 @@ def path():
     """Where the dream client writes its log: `DREAM_LOG_DIR` if set, else `~/.dream/logs` (as dream/logs.py)."""
     override = os.environ.get("DREAM_LOG_DIR")
     return (Path(override).expanduser() if override else Path.home() / ".dream" / "logs") / "dream.log"
+
+
+def capture(file):
+    """Copy the dream client's log records of this process into `file` too, in the client's own format, until
+    release(). The live run uses it: it shares the backend's process, so it cannot have a log folder of its own.
+    @return The handler, for release(); None when the file cannot be opened (the run goes on without it).
+    """
+    try:
+        Path(file).parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(file, encoding="utf-8")
+    except OSError:
+        return None
+    formatter = logging.Formatter("%(asctime)s.%(msecs)03dZ %(levelname)s %(name)s %(message)s", "%Y-%m-%dT%H:%M:%S")
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
+    logger = logging.getLogger("dream")
+    if logger.level == logging.NOTSET:  # the dream package sets its level on import; before that, keep its INFO lines
+        logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    return handler
+
+
+def release(handler):
+    """Stop a capture() and close its file."""
+    if handler is not None:
+        logging.getLogger("dream").removeHandler(handler)
+        handler.close()
 
 
 def parse(line):

@@ -51,8 +51,8 @@ function clientNote(line: ClientLine) {
   return line.message;
 }
 
-/** The dream client's own log while this task ran: sessions opened and released, pacing switches, warnings. */
-function DreamClientLog({ taskId, running }: { taskId: string; running: boolean }) {
+/** This run's own dream client log: its sessions opened and released, pacing switches and warnings. */
+function DreamClientLog({ taskId, attempt, running }: { taskId: string; attempt: number; running: boolean }) {
   const [log, setLog] = useState<ClientLog | null>(null);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
@@ -61,7 +61,7 @@ function DreamClientLog({ taskId, running }: { taskId: string; running: boolean 
     let alive = true;
     const load = async () => {
       try {
-        const response = await fetch(`/api/tasks/${taskId}/dream-client-log`);
+        const response = await fetch(`/api/tasks/${taskId}/dream-client-log/${attempt}`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = (await response.json()) as ClientLog;
         if (alive) {
@@ -78,7 +78,7 @@ function DreamClientLog({ taskId, running }: { taskId: string; running: boolean 
       alive = false;
       if (timer) window.clearInterval(timer);
     };
-  }, [taskId, running]);
+  }, [taskId, attempt, running]);
 
   if (error) return <div className="status error spaced">Dream client log: {error}</div>;
   if (!log) return null;
@@ -86,10 +86,9 @@ function DreamClientLog({ taskId, running }: { taskId: string; running: boolean 
   return (
     <div className="dream-client-log">
       <h3>
-        Dream client log <span className="muted">all runs of this task · {log.path}</span>
+        Dream client log <span className="muted">this run only</span>
       </h3>
-      {!log.exists && <p className="hint">The dream client has not written its log on this computer.</p>}
-      {log.exists && log.entries.length === 0 && <p className="hint">{running ? "Nothing logged yet for this task." : "The dream client logged nothing while this task ran."}</p>}
+      {log.entries.length === 0 && <p className="hint">{running ? "Nothing logged yet for this run." : "No dream client log for this run."}</p>}
       {log.entries.length > 0 && (
         <>
           <div className="dream-log-summary">
@@ -216,7 +215,7 @@ export function DreamLogPanel({ taskId, attempt, runLabel, running }: { taskId: 
           )}
         </>
       )}
-      <DreamClientLog taskId={taskId} running={running} />
+      <DreamClientLog taskId={taskId} attempt={attempt} running={running} />
     </div>
   );
 }
