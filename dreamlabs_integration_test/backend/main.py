@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(list(dream_examples.__path__)[0]) / "yam_mujoco"))
 import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
+import video_judge  # noqa: E402
 import evaluation  # noqa: E402
 import environments  # noqa: E402
 
@@ -1106,6 +1107,15 @@ def run_task(task, stop):
         active_task = None
         active_stop = None
         task.update(result, finished_at=finished_at)
+        # Judge the saved videos in the background while the robot is free for the next task.
+        video_judge.submit(task, outcome.VIDEOS)
+
+
+def video_judgements(limit=5):
+    """The newest finished tasks' video verdicts, so they stay on screen while the robot runs the next task."""
+    judged = [t for t in tasks.values() if t.get("video_judge")]
+    judged.sort(key=lambda t: t.get("finished_at") or 0, reverse=True)
+    return [{"task_id": t["task_id"], "instruction": t["instruction"], **t["video_judge"]} for t in judged[:limit]]
 
 
 def task_view(task):
@@ -1553,6 +1563,7 @@ async def live(socket: WebSocket):
                     "selected": sim.selected,
                     "phase": live_phase(),
                     "task": task_view(task),
+                    "video_judgements": video_judgements(),
                     "objects": feed.objects,
                     **outcome.viewed_objects(attempt),
                     "robot": feed.robot,
