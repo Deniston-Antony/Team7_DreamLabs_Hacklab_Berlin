@@ -1,103 +1,297 @@
-# RoboTester: Dream-1 Robot Evaluation and Benchmarking Platform
+# RoboTester
 
-Team 7, Dream Labs Hacklab Berlin.
+**A website for testing, scoring and comparing the Dream-1 robot model in a MuJoCo simulator.**
 
-RoboTester is a website for testing the Dream-1 robot model in a MuJoCo simulator. You set up a tabletop scene, give Dream-1 natural-language tasks, watch one or many runs live, and get scored reports from the simulator's evidence. It can then test the report's suggestions and show what changed before and after.
+Set up a tabletop scene, give Dream-1 tasks in plain English, watch up to 9 runs live, and get scored reports. RoboTester can then test its own suggestions and show what changed before and after.
 
-The simulator runs on your own computer through the official Dream Labs library. The hosted Dream Labs Playground is not embedded or controlled. Simulation results do not prove real-robot safety or reliability.
+Built by Team 7 at Dream Labs Hacklab Berlin.
+
+> [!IMPORTANT]
+> Real runs use your Dream Labs credits. The simulator runs on your computer through the official Dream Labs library. Simulation results do not prove that a real robot is safe or reliable.
+
+## Choose your setup
+
+Everyone completes [Part 1: Install RoboTester](#part-1-install-robotester). Then choose one option:
+
+| | [Option A: Run locally](#option-a-run-locally) | [Option B: Use a custom domain](#option-b-use-a-custom-domain) |
+| --- | --- | --- |
+| **Best for** | Personal use and testing | Sharing with approved people |
+| **Address** | `http://127.0.0.1:5173` | `https://your-domain.com` |
+| **Needs** | Just this computer | A domain and a free Cloudflare account |
+| **Login** | Not needed, only this computer can open it | Required, by email code |
+| **Online when** | Your terminals are running | Your computer is awake and both services are running |
+
+> **How to use the operating system tabs:** GitHub READMEs do not support real tabs, so each step has a collapsible section for **macOS**, **Linux** and **Windows**. Click your system and follow only that section.
 
 ## Contents
 
-- [What it does](#what-it-does)
-- [How it works](#how-it-works)
-- [Install](#install)
-- [Run locally](#run-locally)
+- [What RoboTester does](#what-robotester-does)
+- [Before you start](#before-you-start)
+- [Part 1: Install RoboTester](#part-1-install-robotester)
+- [Option A: Run locally](#option-a-run-locally)
+- [Option B: Use a custom domain](#option-b-use-a-custom-domain)
 - [Use the website](#use-the-website)
-- [Scoring and reports](#scoring-and-reports)
-- [Suggestion testing](#suggestion-testing)
-- [Host it on a domain](#host-it-on-a-domain)
-- [API](#api)
-- [Tests](#tests)
-- [Costs and limitations](#costs-and-limitations)
+- [How scoring works](#how-scoring-works)
+- [Stop, restart and update](#stop-restart-and-update)
+- [Run the tests](#run-the-tests)
 - [Troubleshooting](#troubleshooting)
-- [Project history](#project-history)
+- [Costs, security and limitations](#costs-security-and-limitations)
+- [Project structure](#project-structure)
+- [API](#api)
+- [Project history and team](#project-history-and-team)
 
-## What it does
+## What RoboTester does
 
 | Area | Features |
 | --- | --- |
-| Scene setup | Six scene styles, shuffle, save layout, add blocks, import STL meshes, mark objects Movable or Fixed |
-| Object editing | Click to select and outline, drag, rotate and move objects in the overhead or 3D view |
-| 3D view | Ctrl + drag to rotate and two-finger scroll to zoom, for live and parallel runs |
-| Dream-1 runs | Several tasks across shared scenes, up to 9 runs at once |
-| Fair comparison | The n-th run of every task starts from the same object layout |
-| Live tracking | Each run has its own tab, cameras, timer and 0 to 100% progress bar |
-| Timing | The limit counts movement, Dream-1 decisions and waiting for a free seat, and the site holds until the full time has passed |
-| Reliability | Waits and retries when Dream-1 reports no free capacity |
-| Evaluation | 0 to 100 score, outcome, penalties, task checks and missing-evidence notes for each attempt |
-| Benchmarks | Numbered, renamable history with old reports, videos and timestamps |
-| Video | A video for every run, a combined video, and 1x, 1.5x, 2x and 4x playback |
-| Video judges | Choose the free Offline judge (OWLv2) or the Claude judge. Each sends its own task prompt to Dream-1 and reports on the video |
-| Final reports | Task and scene comparison, best task, best and hardest scene, and recommendations from each run's data |
-| Suggestion testing | Selectable one-change tests, unchanged controls, a test viewer and a before/after graph |
-| Hosting | Runs from your computer on a custom domain through Cloudflare Tunnel, behind an email login |
+| **Scene setup** | Six scene styles, shuffling, saved layouts, added blocks and imported STL meshes |
+| **Object editing** | Select, drag, move and rotate objects, and mark them Movable or Fixed |
+| **Dream-1 runs** | Multiple tasks across shared scenes, up to 9 runs at once |
+| **Fair comparison** | The same scene number uses the same object layout for every task |
+| **Live view** | Overhead, wrist and rotatable 3D cameras for each run |
+| **Progress** | A timer and progress bar for every run |
+| **Dream-1 logs** | A request log for each run, including timing and errors |
+| **Saved scenes** | Every run saves its starting scenes so a test can be repeated |
+| **Scoring** | A 0 to 100 score from simulator evidence, with penalties and checks |
+| **Video judges** | A free Offline judge or a Claude judge, each with its own task prompt |
+| **Benchmarks** | Named history with old reports, videos and timestamps |
+| **Reports** | Task and scene comparison, combined videos and recommendations based on each run |
+| **Suggestion testing** | One-change tests, unchanged controls and a before/after graph |
+| **Video playback** | 1x, 1.5x, 2x and 4x speeds |
+| **Custom domain** | Secure hosting from your own computer through Cloudflare Tunnel |
 
-## How it works
+## Before you start
 
-```text
-Browser (React + TypeScript)
-   │  HTTP and WebSocket
-   ▼
-FastAPI backend ───────► evaluation engine, reports and saved benchmarks
-   │
-   ├─ live MuJoCo simulator
-   ├─ hidden worker processes for parallel runs
-   └─ selected video judge: local OWLv2 or Claude
-   │
-   ▼
-Dream-1 API (the key stays on the backend machine)
-```
+You need:
 
-| Folder | Purpose |
-| --- | --- |
-| `dreamlabs_integration_test/frontend/` | Website |
-| `dreamlabs_integration_test/backend/` | API, simulator control, scenes and run sessions |
-| `dreamlabs_integration_test/backend/evaluation/` | Scoring, insights, reports, storage and suggestion comparison |
-| `dreamlabs_integration_test/backend/judges.py` | Judge choices and their task prompts |
-| `dreamlabs_integration_test/backend/video_judge.py` | Claude video judge |
-| `dreamlabs_integration_test/backend/vision/` | Offline OWLv2 judge |
-| `SortFlow/` | Success checks, parallel workers, capacity retries, live feeds and recording |
-| `dreamlabs_integration_test/EVALUATION.md` | Detailed scoring and evidence rules |
-
-Run data is saved locally in `backend/evaluation_data/` and `backend/task_videos/`. Both are ignored by Git.
-
-## Install
-
-**Requirements:** Python 3.12 (installed by `uv` below), Node.js 20.19+ or 22.12+, Git, curl, OpenGL support and a [Dream Labs API key](https://platform.dreamlabs.ai/api-keys).
+- A [Dream Labs API key](https://platform.dreamlabs.ai/api-keys) with credits.
+- About **8 GB of free disk space**, including the optional Offline judge.
+- At least **16 GB of RAM** if you plan to run several parallel runs.
+- An internet connection.
+- An [Anthropic API key](https://platform.claude.com/settings/keys), only if you want the Claude judge.
+- A domain name, only for Option B.
 
 | System | Status |
 | --- | --- |
-| macOS on Apple Silicon | Used for development |
-| Ubuntu 22.04 or newer | Supported by the Dream Labs library, not tested with this project |
-| Windows | Not tested. Use Ubuntu under WSL2 |
+| **macOS on Apple Silicon** | Clean install tested |
+| **Ubuntu 22.04 or 24.04** | Instructions provided, not yet tested with this project |
+| **Windows 10 or 11** | Supported through WSL2 Ubuntu, not yet tested with this project |
+
+Windows must use WSL2 because RoboTester's parallel runs use process features that native Windows Python does not provide.
+
+---
+
+## Part 1: Install RoboTester
+
+### Step 1: Open a terminal
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+Press `Cmd + Space`, type **Terminal**, and press Enter.
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+Press `Ctrl + Alt + T`, or open **Terminal** from your applications.
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+1. Click **Start**, type **PowerShell**, right-click it, and choose **Run as administrator**.
+2. Install WSL2 with Ubuntu:
+
+   ```powershell
+   wsl --install -d Ubuntu-24.04
+   ```
+
+3. Restart Windows if asked.
+4. Open **Ubuntu** from the Start menu.
+5. Create a Linux username and password when asked. The password stays hidden while you type.
+6. Run every remaining command in the **Ubuntu** window, not PowerShell.
+
+Keep the project inside your Ubuntu home folder. Do not put it under `/mnt/c`, because that is much slower.
+
+</details>
+
+### Step 2: Install the required tools
+
+This installs Git, Node.js, `uv` and the graphics libraries the simulator needs.
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+1. Install Apple's command-line tools. Click **Install** if a window appears, and wait for it to finish:
+
+   ```bash
+   xcode-select --install
+   ```
+
+2. If you do not have Homebrew, install it:
+
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   eval "$(/opt/homebrew/bin/brew shellenv)"
+   ```
+
+   Follow any **Next steps** Homebrew prints.
+
+3. Install the tools:
+
+   ```bash
+   brew install git node uv
+   ```
+
+4. Check them. Each command should print a version, and Node must be 20.19 or newer:
+
+   ```bash
+   git --version
+   node --version
+   uv --version
+   ```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+These commands are for Ubuntu or Debian.
+
+1. Install the system tools:
+
+   ```bash
+   sudo apt update
+   sudo apt install -y git curl build-essential libgl1 libegl1 libgl1-mesa-dri libosmesa6 libglib2.0-0
+   ```
+
+2. Install Node.js 22:
+
+   ```bash
+   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+   sudo apt install -y nodejs
+   ```
+
+3. Install `uv`:
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   export PATH="$HOME/.local/bin:$PATH"
+   ```
+
+4. Check them. Each command should print a version:
+
+   ```bash
+   git --version
+   node --version
+   uv --version
+   ```
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Run these in the **Ubuntu** window.
+
+1. Install the system tools:
+
+   ```bash
+   sudo apt update
+   sudo apt install -y git curl build-essential libgl1 libegl1 libgl1-mesa-dri libosmesa6 libglib2.0-0
+   ```
+
+2. Install Node.js 22:
+
+   ```bash
+   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+   sudo apt install -y nodejs
+   ```
+
+3. Install `uv`:
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   export PATH="$HOME/.local/bin:$PATH"
+   ```
+
+4. Check them. Each command should print a version:
+
+   ```bash
+   git --version
+   node --version
+   uv --version
+   ```
+
+</details>
+
+### Step 3: Download RoboTester
+
+This step is the same on macOS, Linux and Windows Ubuntu:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-
-git clone -b Final_RoboTester_Website https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
+cd ~
+git clone https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
 cd Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test
+```
 
+### Step 4: Install the backend
+
+The backend controls the simulator and talks to Dream-1. This step can take several minutes.
+
+```bash
 cd backend
 uv venv --seed --python 3.12 .venv
 uv pip install --python .venv/bin/python --upgrade dreamlabs dreamlabs-client -r requirements.txt
-
-cd ../frontend
-npm ci
+.venv/bin/python -c "import dream, mujoco, fastapi; print('Backend installed')"
 cd ..
 ```
 
-### Optional: install the Offline judge
+You should see `Backend installed`.
+
+### Step 5: Install the website
+
+```bash
+cd frontend
+npm ci
+npm run build
+cd ..
+```
+
+You should see `built in` near the end.
+
+### Step 6: Add your Dream Labs API key
+
+1. Open [Dream Labs API keys](https://platform.dreamlabs.ai/api-keys) and create or copy a key.
+2. Paste this whole block into the terminal and press Enter:
+
+   ```bash
+   {
+     printf 'Paste your Dream API key, then press Enter: '
+     read -rs DREAM_KEY; echo
+     mkdir -p ~/.dreamlabs && chmod 700 ~/.dreamlabs
+     [ ! -f ~/.dreamlabs/credentials ] || cp ~/.dreamlabs/credentials ~/.dreamlabs/credentials.bak
+     printf '%s\n' \
+       DREAM_GATEWAY_URL=https://api.dreamlabs.ai \
+       DREAM_API_URL=https://platform.dreamlabs.ai \
+       DREAM_DATA_URL=https://data.dreamlabs.ai \
+       "DREAM_API_KEY=$DREAM_KEY" > ~/.dreamlabs/credentials
+     chmod 600 ~/.dreamlabs/credentials
+     unset DREAM_KEY
+     echo "API key saved."
+   }
+   ```
+
+3. Paste your key when asked and press Enter. **Nothing appears while you paste.** That is normal.
+
+The key is saved outside the project. Never commit it or put it in website code.
+
+### Step 7: Install the Offline judge (recommended)
+
+The Offline judge checks which objects moved in each video. It runs on your computer and uses no Anthropic credits. It is a large download. If you skip it, runs and scoring still work, but videos are not analysed.
 
 ```bash
 cd backend
@@ -106,9 +300,33 @@ uv pip install --python .vision-venv/bin/python -r vision/requirements.txt
 cd ..
 ```
 
-### Optional: turn on the Claude judge
+The vision model downloads the first time this judge analyses a video.
 
-Without an Anthropic key, the Claude option is unavailable. To turn it on, run this in the terminal that starts the backend:
+### Step 8: Prepare the Claude judge (optional)
+
+The Claude judge reviews each attempt's video and returns **Pass**, **Fail** or **Unsure** with a reason. It uses Anthropic credits and sends video frames to Anthropic.
+
+1. Open the [Claude Console](https://platform.claude.com), add credits under **Settings → Billing**, and create a key under [API keys](https://platform.claude.com/settings/keys).
+2. Copy the key. It is only shown once.
+3. You will enter it when you start the backend in Option A or B.
+
+Installation is finished. Continue with [Option A](#option-a-run-locally) or [Option B](#option-b-use-a-custom-domain).
+
+---
+
+## Option A: Run locally
+
+Only your computer can open the website in this mode. You need **two terminals**.
+
+### A1: Start the backend
+
+Open a terminal and go to the backend folder:
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+```
+
+**Optional, for the Claude judge:** run this and paste your Anthropic key:
 
 ```bash
 printf 'Paste your Anthropic API key, then press Enter: '
@@ -116,74 +334,303 @@ read -rs ANTHROPIC_API_KEY; echo
 export ANTHROPIC_API_KEY
 ```
 
-The default model is `claude-opus-5-5`. Set `VIDEO_JUDGE_MODEL` to use another. Never commit the key or put it in frontend code.
+Then start the backend:
 
-### Add your API key
-
-Paste this block, then paste your key when asked. The key stays hidden and is saved outside the project.
+<details>
+<summary><strong>macOS</strong></summary>
 
 ```bash
-{
-  printf 'Paste your Dream API key, then press Enter: '
-  read -rs DREAM_KEY; echo
-  mkdir -p ~/.dreamlabs && chmod 700 ~/.dreamlabs
-  [ ! -f ~/.dreamlabs/credentials ] || cp ~/.dreamlabs/credentials ~/.dreamlabs/credentials.bak
-  printf '%s\n' \
-    DREAM_GATEWAY_URL=https://api.dreamlabs.ai \
-    DREAM_API_URL=https://platform.dreamlabs.ai \
-    DREAM_DATA_URL=https://data.dreamlabs.ai \
-    "DREAM_API_KEY=$DREAM_KEY" > ~/.dreamlabs/credentials
-  chmod 600 ~/.dreamlabs/credentials
-  unset DREAM_KEY
-  echo "API key saved."
-}
+MUJOCO_GL=cgl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Never commit this file or put the key in frontend code.
+</details>
 
-Before the first run on a new computer, a person should check what the model receives, as the [Dream Labs docs](https://platform.dreamlabs.ai/api-documentation/control-loop/#check-what-the-model-sees) require.
-
-## Run locally
-
-From `dreamlabs_integration_test`, use two terminals.
+<details>
+<summary><strong>Linux</strong></summary>
 
 ```bash
-cd backend
-.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
+If rendering fails, press `Ctrl + C` and use `MUJOCO_GL=osmesa` instead.
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Run this in **Ubuntu**:
+
 ```bash
-cd frontend
+MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+If rendering fails, press `Ctrl + C` and use `MUJOCO_GL=osmesa` instead.
+
+</details>
+
+Wait for `Uvicorn running on http://127.0.0.1:8000`, and keep this terminal open.
+
+### A2: Start the website
+
+Open a **second terminal**. On Windows, open a second **Ubuntu** window.
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/frontend
 npm run dev
 ```
 
-Open **http://127.0.0.1:5173**. API docs are at http://127.0.0.1:8000/docs. In local mode, `http://127.0.0.1:8000` showing `{"detail":"Not Found"}` is normal.
+### A3: Open RoboTester
+
+Open **http://127.0.0.1:5173** in your browser. On Windows, use a normal Windows browser.
+
+Before your first real run on a new computer, a person should check what the model receives, as the [Dream Labs documentation](https://platform.dreamlabs.ai/api-documentation/control-loop/#check-what-the-model-sees) requires.
+
+To stop, press `Ctrl + C` in both terminals.
+
+---
+
+## Option B: Use a custom domain
+
+This serves RoboTester from your computer at your own domain. Cloudflare Tunnel connects it without opening a port on your router, and Cloudflare Access requires an email login.
+
+GitHub Pages cannot host the full app because it needs a running Python backend, MuJoCo and private API keys.
+
+> [!CAUTION]
+> **Never make this site public without the login.** Anyone who can open it can start runs and spend your credits. Complete B3 before B5.
+
+In the commands below, replace `your-domain.com` with your domain.
+
+### B1: Add your domain to Cloudflare
+
+1. Create a free [Cloudflare account](https://dash.cloudflare.com/sign-up).
+2. Click **Add a domain**, enter your domain, and choose the **Free** plan.
+3. You do not need to add DNS records. The tunnel creates the record later.
+4. Continue until Cloudflare shows **two nameservers**.
+
+### B2: Point your domain to Cloudflare
+
+1. Open your domain registrar, such as GoDaddy or Namecheap.
+2. Find **Nameservers** and choose custom nameservers.
+3. Replace the existing nameservers with the two from Cloudflare.
+4. Turn **DNSSEC** off if it is on.
+5. Save, return to Cloudflare, and click **Check nameservers**.
+6. Wait until the domain says **Active**. This is often quick but can take up to 24 hours.
+
+<details>
+<summary><strong>GoDaddy steps</strong></summary>
+
+Go to **My Products → your domain → DNS → Nameservers → Change Nameservers → I'll use my own nameservers**, enter Cloudflare's two nameservers, and save.
+
+</details>
+
+### B3: Add the login
+
+1. In Cloudflare, open **Zero Trust**. Choose a team name and the **Free** plan if asked.
+2. Go to **Access → Applications → Create new application → Self-hosted**.
+3. Set **Application name** to `RoboTester`.
+4. Click **Add public hostname**. Leave **Subdomain** and **Path** blank, and choose your domain.
+5. Under **Access policies**, create a policy:
+   - **Policy name:** `Allowed people`
+   - **Action:** `Allow`
+   - **Include → Selector:** `Emails`
+   - **Value:** only the email addresses you approve
+6. Keep **One-time PIN** on, then save the application.
+
+Do not use the **Everyone** selector.
+
+### B4: Install Cloudflare Tunnel
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+```bash
+brew install cloudflared
+cloudflared --version
+```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+```bash
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt update
+sudo apt install -y cloudflared
+cloudflared --version
+```
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Run this in **Ubuntu**:
+
+```bash
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt update
+sudo apt install -y cloudflared
+cloudflared --version
+```
+
+</details>
+
+### B5: Create the tunnel
+
+1. Log in to Cloudflare from the terminal:
+
+   ```bash
+   cloudflared tunnel login
+   ```
+
+   A browser page opens. If it does not, copy the printed link into your browser. Choose your domain and click **Authorize**.
+
+2. Edit the first line, then paste this whole block. It works on macOS, Linux and Windows Ubuntu:
+
+   ```bash
+   DOMAIN=your-domain.com
+   cloudflared tunnel create robotester
+   TUNNEL_ID=$(cloudflared tunnel list | awk '$2=="robotester"{print $1}')
+   cat > ~/.cloudflared/robotester.yml <<EOF
+   tunnel: $TUNNEL_ID
+   credentials-file: $HOME/.cloudflared/$TUNNEL_ID.json
+   ingress:
+     - hostname: $DOMAIN
+       service: http://127.0.0.1:8020
+     - service: http_status:404
+   EOF
+   chmod 600 ~/.cloudflared/robotester.yml
+   cloudflared tunnel route dns robotester "$DOMAIN"
+   ```
+
+Never commit anything from `~/.cloudflared`. It contains your tunnel credentials.
+
+### B6: Start RoboTester
+
+Open a terminal and build the latest website:
+
+```bash
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/frontend
+npm run build
+cd ../backend
+```
+
+**Optional, for the Claude judge:** run this and paste your Anthropic key:
+
+```bash
+printf 'Paste your Anthropic API key, then press Enter: '
+read -rs ANTHROPIC_API_KEY; echo
+export ANTHROPIC_API_KEY
+```
+
+Start the backend, using your domain:
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+`caffeinate` keeps the Mac awake while the site runs.
+
+```bash
+DREAM_PUBLIC_ORIGIN=https://your-domain.com MUJOCO_GL=cgl caffeinate -i .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+```bash
+DREAM_PUBLIC_ORIGIN=https://your-domain.com MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+```
+
+If rendering fails, press `Ctrl + C` and use `MUJOCO_GL=osmesa` instead. Turn off automatic sleep in your system settings.
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Run this in **Ubuntu**:
+
+```bash
+DREAM_PUBLIC_ORIGIN=https://your-domain.com MUJOCO_GL=egl .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+```
+
+If rendering fails, press `Ctrl + C` and use `MUJOCO_GL=osmesa` instead. In Windows **Power & battery**, stop the PC from sleeping while the site runs.
+
+</details>
+
+Wait for `Uvicorn running`. Then open a **second terminal** and start the tunnel:
+
+```bash
+cloudflared tunnel --config ~/.cloudflared/robotester.yml run
+```
+
+Keep both terminals open.
+
+### B7: Confirm the login works
+
+1. Open your domain in a **private browser window**.
+2. You must see the Cloudflare login **before** RoboTester.
+3. Enter an approved email and the code sent to it.
+4. Confirm the Simulator and Benchmarks pages load.
+5. Try an unapproved email. It must be refused.
+
+If RoboTester opens without a login, **stop the tunnel immediately** with `Ctrl + C` and fix B3.
+
+---
 
 ## Use the website
 
-### Set up and run
+### Run a test
 
-1. On **Simulator**, press **Reset scene** for a clean start.
+1. On **Simulator**, press **Reset scene**.
 2. Choose a scene style and arrange the objects.
-3. Enter a task such as `put apple into the bowl` or `put orange on the plate`. Use **Add task** for more tasks.
-4. Set **Scenes per task**. For example, 2 tasks × 3 scenes = 6 runs, up to 9.
-5. Choose **Start scenes**: copies of the live scene, shuffled positions, or shuffled positions with scene styles.
-6. Set **Time limit per run**, from 5 to 200 seconds. Start with at least 120 seconds.
-7. Press **Run task** and click any run card to watch it.
+3. In **Tasks**, choose a **Judge**.
+4. Enter a task such as `put apple into the bowl` or `put orange on the plate`.
+5. Use **Add task** for more tasks.
+6. Set **Scenes per task**. For example, 2 tasks × 3 scenes = 6 runs, up to 9.
+7. Choose **Start scenes**: copies, shuffled positions, or shuffled positions with scene styles.
+8. Set **Time limit per run**. Start with **120 seconds**.
+9. Check **Prompt sent to Dream-1** and the maximum cost.
+10. Press **Run task**, then click a run card to watch it.
 
-**Layout seed** is the number that decides the shuffled layouts and styles. The same starting scene, mode and seed give the same layouts again. **New layouts** picks a new seed and replaces hand edits in the parallel scenes.
+**Layout seed** decides the shuffled layouts. The same starting scene, mode and seed recreate them. **New layouts** picks a new seed and replaces hand edits in parallel scenes.
 
-### Time limit
+### Choose a judge
 
-Each run's timer starts at its first Dream-1 request and counts robot movement, Dream-1 decision time and waiting for a free seat. Loading is not counted. A finished run leaves Dream-1, but the website waits for the full limit before creating videos and reports.
+| Judge | Runs on | Prompt sent for `put apple into the bowl` | Result |
+| --- | --- | --- | --- |
+| **Offline judge** | Your computer | `put red apple into the white bowl` | Which objects moved |
+| **Claude judge** | Anthropic API | `put apple into the bowl and let go so it rests there` | Pass, Fail or Unsure with a reason |
 
-### Reports
+The judges do not change the 0 to 100 score. Because their prompts differ, compare them on the same scenes and repeat the test before deciding which prompt works better.
 
-Open **Benchmarks** to see every benchmark, rename it, and open its runs. Each run has a **Final report** and a tab for each attempt.
+### Read the time limit
 
-## Scoring and reports
+Each run's timer starts at its first Dream-1 request. It counts robot movement, Dream-1 decisions and waiting for a free Dream-1 seat. Loading is not counted. A finished run leaves Dream-1, but the website waits for the full limit before creating videos and reports.
 
-Each attempt gets a score from 0 to 100:
+### Open reports
+
+Go to **Benchmarks**, choose a benchmark, and open a run. The **Final report** shows combined videos, scene and task comparisons, each attempt's results, and recommendations. Each attempt has its own tab.
+
+### Test suggestions
+
+1. Open a benchmark and choose **Suggestion testing**.
+2. Select a judge and tick the tests to run.
+3. Keep at least one **unchanged control**.
+4. Press **Run selected tests**.
+5. Watch each test, then compare the before/after graph.
+
+Each test starts from a failed attempt's saved scene and changes one thing. A result counts as **Helped** or **Worse** only when it differs from the control by at least 10 points. Each test runs once, so repeat a promising result before relying on it. Suggestion tests do not retrain Dream-1 or change the benchmark score.
+
+## How scoring works
 
 | Component | Points |
 | --- | ---: |
@@ -193,88 +640,171 @@ Each attempt gets a score from 0 to 100:
 | Interaction quality | 15 |
 | Efficiency | 10 |
 
-Outcomes are **Success**, **Partial success**, **Failure**, **Unsafe** and **Not evaluable**. Penalties and score caps are explained in [EVALUATION.md](dreamlabs_integration_test/EVALUATION.md).
+Outcomes are **Success**, **Partial success**, **Failure**, **Unsafe** and **Not evaluable**. Full rules are in [EVALUATION.md](dreamlabs_integration_test/EVALUATION.md).
 
-Dream-1 returns robot actions, not what it internally detected. Choose a **Judge** in the Tasks panel or Suggestion testing tab:
+## Stop, restart and update
 
-| Judge | Runs on | Prompt sent to Dream-1 for `put apple into the bowl` | What it reports |
-| --- | --- | --- | --- |
-| Offline judge | This computer, using OWLv2 | `put red apple into the white bowl` | Which objects moved in the video |
-| Claude judge | Anthropic API | `put apple into the bowl and let go so it rests there` | Pass, Fail or Unsure, with a reason and any disagreement with the simulator |
+**Stop:** press `Ctrl + C` in each terminal.
 
-The page shows the exact prompt before a run. Conditions you write, such as `without moving the banana`, are kept. Judges are not scored, so simulator evidence remains the source of the score. Because the prompts differ, results from different judges are not a clean model comparison unless an unchanged control uses the same prompt.
+**Restart:** repeat [Option A](#option-a-run-locally) or [B6](#b6-start-robotester).
 
-## Suggestion testing
-
-Open a benchmark and choose the **Suggestion testing** tab beside its title. Testing is available after a run and its analysis have finished, when at least one attempt failed.
-
-1. Tick the tests to run, or use **Select all / Deselect all**.
-2. Press **Run selected tests**. The button shows the most they can cost.
-3. Watch each test in the simulator-style viewer.
-4. Compare the before/after graph, result table and saved rounds.
-
-Each test starts from a failed attempt's saved scene and makes **one change**:
-
-- Move the object closer to an arm.
-- Shorten the carry to the destination.
-- Add clear space around the object.
-- Use the orientation from a successful attempt.
-- Name the object more clearly.
-- Give the run more time.
-
-An **unchanged control** measures normal run-to-run variation. A change is marked **Helped** or **Worse** only when it differs from the control's change by at least 10 points. Each test runs once, so repeat a promising result before relying on it.
-
-These tests do not change the benchmark score and do not retrain Dream-1. Fine-tuning Dream-1 requires an uploaded dataset of robot demonstrations, not written suggestions.
-
-## Host it on a domain
-
-This setup serves the site from your computer through Cloudflare Tunnel. GitHub stores the code, but GitHub Pages cannot run this app because it needs the Python backend, MuJoCo and a private API key.
-
-**Do not expose the app without a login. Anyone who can open it can spend your Dream-1 credits.**
-
-1. Add your domain to Cloudflare and change the nameservers at your registrar.
-2. In Cloudflare Zero Trust, create a **Self-hosted** Access application for the domain, with an **Allow** policy listing only approved email addresses.
-3. Install and approve the tunnel:
+**Update to the latest code:**
 
 ```bash
-brew install cloudflared
-cloudflared tunnel login
-cloudflared tunnel create robotester
-cloudflared tunnel route dns robotester your-domain.example
+cd ~/Team7_DreamLabs_Hacklab_Berlin
+git pull origin main
+cd dreamlabs_integration_test/backend
+uv pip install --python .venv/bin/python --upgrade dreamlabs dreamlabs-client -r requirements.txt
+cd ../frontend
+npm ci
+npm run build
 ```
 
-4. Create `~/.cloudflared/robotester.yml`, using the tunnel ID printed above. Never commit this file or the tunnel's credentials.
+Then start the servers again.
 
-```yaml
-tunnel: YOUR_TUNNEL_ID
-credentials-file: /Users/YOUR_USER/.cloudflared/YOUR_TUNNEL_ID.json
-ingress:
-  - hostname: your-domain.example
-    service: http://127.0.0.1:8020
-  - service: http_status:404
-```
-
-5. Build the website and start the backend from `dreamlabs_integration_test`:
+**Take the custom domain offline:** press `Ctrl + C` in the tunnel terminal. To remove it permanently:
 
 ```bash
-(cd frontend && npm run build)
-cd backend
-DREAM_PUBLIC_ORIGIN=https://your-domain.example MUJOCO_GL=cgl caffeinate -i .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+cloudflared tunnel cleanup robotester
+cloudflared tunnel delete robotester
 ```
 
-On Linux, leave out `caffeinate -i` and use a suitable `MUJOCO_GL` value.
+Then delete its DNS record and Access application in Cloudflare.
 
-6. In a second terminal, start the tunnel:
+## Run the tests
+
+These tests use no API keys and no credits.
+
+The result is the `OK` or `FAILED` line. On macOS, Python can print `Segmentation fault` while closing the simulator after a line that says `OK`. The tests still passed.
 
 ```bash
-cloudflared tunnel --config ~/.cloudflared/robotester.yml run
+cd ~/Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test/backend
+uv pip install --python .venv/bin/python httpx
 ```
 
-7. In a private browser window, confirm that the domain asks for a login before showing the website.
+<details>
+<summary><strong>macOS</strong></summary>
 
-The site is online only while the computer is awake, connected and running both commands. Everyone who logs in shares one simulator and the owner's Dream-1 credits. If a network cannot resolve a new domain, try Chrome's **Use secure DNS** setting with Cloudflare (1.1.1.1), or another network.
+```bash
+DREAM_VISION=off DREAM_GATEWAY_URL=https://127.0.0.1:9 MUJOCO_GL=cgl .venv/bin/python -m unittest test_dream_client_log test_evaluation test_outcome test_video_judge
+cd ../../SortFlow
+MUJOCO_GL=cgl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest test_capacity test_collision_audit test_env test_livefeed test_parallel_bench test_recording test_roundtrip_log test_sortflow test_terminal_input
+```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+```bash
+DREAM_VISION=off DREAM_GATEWAY_URL=https://127.0.0.1:9 MUJOCO_GL=egl .venv/bin/python -m unittest test_dream_client_log test_evaluation test_outcome test_video_judge
+cd ../../SortFlow
+MUJOCO_GL=egl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest test_capacity test_collision_audit test_env test_livefeed test_parallel_bench test_recording test_roundtrip_log test_sortflow test_terminal_input
+```
+
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Run this in **Ubuntu**:
+
+```bash
+DREAM_VISION=off DREAM_GATEWAY_URL=https://127.0.0.1:9 MUJOCO_GL=egl .venv/bin/python -m unittest test_dream_client_log test_evaluation test_outcome test_video_judge
+cd ../../SortFlow
+MUJOCO_GL=egl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest test_capacity test_collision_audit test_env test_livefeed test_parallel_bench test_recording test_roundtrip_log test_sortflow test_terminal_input
+```
+
+</details>
+
+## Troubleshooting
+
+| Problem | Fix |
+| --- | --- |
+| `command not found: brew`, `node` or `uv` | Close and reopen the terminal, then repeat Step 2 |
+| `No module named uvicorn` | Run Step 4 and start the backend from the `backend` folder |
+| `No such file or directory` | Run the full `cd ~/Team7_DreamLabs_Hacklab_Berlin/...` command from that step |
+| Port 8000, 5173 or 8020 is in use | Stop the other server. On macOS or Linux, `lsof -i :8000` shows what is using it |
+| Website says **Reconnecting** | Start the backend, then refresh |
+| Camera or OpenGL error on Linux or WSL2 | Use `MUJOCO_GL=osmesa` and confirm the Step 2 graphics libraries are installed |
+| `http://127.0.0.1:5173` does not open on Windows | Keep both Ubuntu windows open. In PowerShell, run `wsl --update` and `wsl --shutdown`, then start again |
+| Run fails with a key or credit error | Check `~/.dreamlabs/credentials` and your [Dream Labs billing](https://platform.dreamlabs.ai/billing) |
+| Dream-1 reports no capacity | The run waits and retries. Use fewer parallel runs or try later |
+| Offline judge says not installed | Complete Step 7 and restart the backend |
+| Claude judge is unavailable | Export `ANTHROPIC_API_KEY` in the backend terminal and restart it |
+| Claude judge shows a credit error | Add credits in the [Claude Console](https://platform.claude.com) |
+| Domain does not resolve | Wait for Cloudflare to show **Active**. In Chrome, try **Use secure DNS** with Cloudflare, or another network |
+| Cloudflare error `1033` or `530` | The tunnel is not running. Start it from B6 |
+| Cloudflare error `502` | The backend is not running on port 8020. Start it from B6 |
+| Domain opens but live view does not connect | Set `DREAM_PUBLIC_ORIGIN` to your exact `https://` domain and restart the backend |
+| The page looks out of date | Run `npm run build` in `frontend`, restart the servers, and refresh |
+| `task_videos` is too large | Delete old folders in `backend/task_videos/` that you no longer need |
+
+## Costs, security and limitations
+
+**Costs**
+
+- Every live, parallel and suggestion run uses Dream Labs credits. The website estimates about **$0.07 per 120-second run** and shows the maximum before you start. Check [Dream Labs billing](https://platform.dreamlabs.ai/billing) for current prices.
+- The Claude judge uses Anthropic credits for each judged attempt.
+- The Offline judge, tests and Cloudflare's free plan do not use those credits.
+
+**Security**
+
+- Keep API keys out of Git, screenshots and chat messages.
+- Dream-1 credentials stay in `~/.dreamlabs/credentials`.
+- Run data stays in ignored folders on your computer.
+- On a custom domain, anyone you approve can spend your credits.
+- Rotate a key immediately if it is exposed.
+
+**Limitations**
+
+- One request runs at a time, with up to 9 runs, or up to 8 for suggestion tests.
+- Only the YAM robot can run. Other arms are listed until they have simulator actuators, cameras and a measured tool center point.
+- Automatic success checks cover putting a movable object in the bowl or on the plate.
+- Small benchmarks can vary a lot from run to run, so repeat results before drawing conclusions.
+- Video judges can be wrong, and neither proves what Dream-1 internally understood.
+- STL uploads are limited to 60 MB and 1.5 million triangles. Hollow objects behave as solid.
+- Everyone on a hosted site shares one simulator.
+- The custom-domain option goes offline when the computer sleeps, loses internet or stops the services.
+
+## Project structure
+
+```text
+Team7_DreamLabs_Hacklab_Berlin/
+├── README.md
+├── SortFlow/                         Parallel workers, success checks, logs and recording
+├── Website/                          Reference material and screenshots
+└── dreamlabs_integration_test/
+    ├── EVALUATION.md                 Detailed scoring rules
+    ├── frontend/                     React and TypeScript website
+    └── backend/
+        ├── main.py                   API, simulator control and live stream
+        ├── outcome.py                Run sessions and parallel workers
+        ├── environments.py           Shuffled and styled scenes
+        ├── scene_saves.py            Saved starting scenes
+        ├── suggestions.py            One-change test scenes
+        ├── judges.py                 Judge choices and task prompts
+        ├── video_judge.py            Claude video judge
+        ├── vision/                   Offline OWLv2 judge
+        └── evaluation/               Scoring, reports and benchmarks
+```
+
+```text
+Browser
+   │ HTTP and WebSocket
+   ▼
+FastAPI backend ───► scoring, reports and saved benchmarks
+   ├─ live MuJoCo simulator
+   ├─ hidden worker processes for parallel runs
+   └─ selected video judge: Offline or Claude
+   │
+   ▼
+Dream-1 API (the key stays on the backend computer)
+```
 
 ## API
+
+With the backend running locally, full API docs are at `http://127.0.0.1:8000/docs`.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
@@ -282,69 +812,28 @@ The site is online only while the computer is awake, connected and running both 
 | `GET` | `/api/tasks/{task_id}/status` | Run status |
 | `POST` | `/api/tasks/{task_id}/cancel` | Stop a run |
 | `GET` | `/api/tasks/{task_id}/video/{clip}` | Run video |
+| `GET` | `/api/judges` | Available judges |
+| `POST` | `/api/judges/preview` | Preview a judge's task prompts |
 | `GET`, `POST` | `/api/evaluation/batches` | List or start benchmarks |
 | `PATCH` | `/api/evaluation/batches/{batch_id}` | Rename a benchmark |
-| `GET` | `/api/reports/tasks/{task_id}?format=json\|html` | Attempt report |
 | `GET` | `/api/reports/runs/{run_id}?format=json\|html` | Final run report |
 | `GET` | `/api/reports/batches/{batch_id}?format=json\|html` | Benchmark report |
-| `POST` | `/api/reports/runs/{run_id}/analyze-videos` | Analyse an older run's videos |
-| `GET` | `/api/reports/runs/{run_id}/suggestion-tests` | Test plan, progress and results |
-| `POST` | `/api/reports/runs/{run_id}/suggestion-tests` | Start selected tests |
+| `GET`, `POST` | `/api/reports/runs/{run_id}/suggestion-tests` | Suggestion plan, progress, results and start |
 | `WS` | `/ws/live` | Live state and camera frames |
 
-## Tests
-
-These tests use no API key and no credits:
-
-```bash
-cd dreamlabs_integration_test/backend
-uv pip install --python .venv/bin/python httpx
-DREAM_VISION=off DREAM_GATEWAY_URL=https://127.0.0.1:9 MUJOCO_GL=cgl .venv/bin/python -m unittest test_video_judge test_evaluation test_outcome
-cd ../../SortFlow
-MUJOCO_GL=cgl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest test_capacity test_parallel_bench test_recording
-```
-
-Use `MUJOCO_GL=egl` on headless Linux.
-
-## Costs and limitations
-
-- The video judge uses Anthropic API credits for each judged attempt and sends its video frames to Anthropic.
-- Every live, parallel and suggestion run uses Dream Labs credits. The website estimates about $0.07 for a 120-second run and shows the most a request can cost. Check the [Billing page](https://platform.dreamlabs.ai/billing) for current prices.
-- One request runs at a time, with up to 9 runs, or up to 8 for suggestion tests.
-- Only the YAM robot can run. Other arms are listed until they have simulator actuators, cameras and a measured tool center point.
-- Automatic success checks cover putting a movable object in the bowl or on the plate.
-- Small benchmarks can vary a lot from run to run. Repeat results before drawing conclusions.
-- STL uploads are limited to 60 MB and 1.5 million triangles. Hollow objects behave as solid because MuJoCo uses a convex collision shape.
-- A saved layout lasts only while the backend runs.
-
-## Troubleshooting
-
-| Problem | Fix |
-| --- | --- |
-| `No module named uvicorn` | Run the install step and use `.venv/bin/python` from `backend` |
-| Port 8000, 5173 or 8020 is in use | Stop the other server using that port |
-| Website says **Reconnecting** | Start the backend, then refresh |
-| Task fails with a key or credit error | Check `~/.dreamlabs/credentials` and your Dream Labs balance |
-| Dream-1 reports no capacity | The run waits and retries. Use fewer parallel runs or try later |
-| Claude judge is not available | Set `ANTHROPIC_API_KEY` in the backend terminal and restart it |
-| Offline judge is not available | Install the optional Offline judge |
-| Domain does not open in Chrome | Check that the backend and tunnel are running, then try Cloudflare secure DNS |
-| Page differs from this README | Restart the servers after pulling, rebuild if hosted, and refresh |
-| `task_videos` is large | Delete old run folders you no longer need |
-
-## Project history
+## Project history and team
 
 | Branch | What it added |
 | --- | --- |
 | `Deniston` | Website, live MuJoCo stream, scene editing, STL import and timers |
 | `ashiq-integration-v2` | SortFlow parallel runs, run tabs, recording and scene environments |
-| `Deniston+improved_report` | Evaluation engine, reports, benchmark history, vision check and fair timing |
-| `Deniston+Final_Report` | Shared scenes, combined videos, playback speeds, scene comparison, parallel 3D editing and per-run timers |
+| `Deniston+improved_report` | Evaluation engine, reports, benchmark history and fair timing |
+| `Deniston+Final_Report` | Shared scenes, combined videos, playback speeds, comparisons and per-run timers |
 | `suggestion_testing` | One-change tests, controls, test viewer and before/after results |
-| `web-integration` | Custom-domain hosting through Cloudflare Tunnel and this README |
+| `web-integration` | Custom-domain hosting through Cloudflare Tunnel |
 | `umair-video-judge` | Claude video judge |
-| `Umair+Deniston_code_combined` | Web interface with a choice of Offline or Claude judge |
-| `Deniston-+-Ashiq-code-combined` | Per-run Dream-1 logs, saved start scenes and run-card log tabs |
-| `Final_RoboTester_Website` | Final combined version deployed to robotester.services |
+| `Umair+Deniston_code_combined` | Choice of Offline or Claude judge |
+| `Deniston-+-Ashiq-code-combined` | Per-run Dream-1 logs and saved start scenes |
+| `Final_RoboTester_Website` | Final combined version |
 
-**Team:** Deniston (website and simulator integration), Umair (evaluation, scoring, reports and video judge) and Ashiq (robot, CLI and execution).
+**Team:** Deniston (website and simulator integration), Umair (evaluation, reports and video judge) and Ashiq (robot, CLI and execution).

@@ -1870,7 +1870,7 @@ def list_judges():
     offline_ready = os.environ.get("DREAM_VISION") != "off" and vision_checks.python.exists()
     claude_ready = video_judge.has_credentials()
     reasons = {
-        "offline": None if offline_ready else "The offline vision model is not installed.",
+        "offline": None if offline_ready else "Runs and scoring still work. Install the offline vision model to analyse videos.",
         "claude": None if claude_ready else "Set ANTHROPIC_API_KEY in the backend terminal.",
     }
     ready = {"offline": offline_ready, "claude": claude_ready}

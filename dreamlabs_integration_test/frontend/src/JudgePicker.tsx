@@ -14,8 +14,8 @@ export function JudgePicker({ judge, judges, onChange, disabled }: { judge: Judg
         Judge
         <select aria-label="Judge" value={judge} disabled={disabled} onChange={(event) => onChange(event.target.value as JudgeId)}>
           {judges.map((item) => (
-            <option key={item.id} value={item.id} disabled={!item.available}>
-              {item.name}{item.available ? "" : " (not available)"}
+            <option key={item.id} value={item.id} disabled={!item.available && item.id !== "offline"}>
+              {item.name}{item.available ? "" : item.id === "offline" ? " (video check not installed)" : " (not available)"}
             </option>
           ))}
         </select>

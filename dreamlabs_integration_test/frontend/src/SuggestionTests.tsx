@@ -302,7 +302,7 @@ export function SuggestionTests({ runId, locked, renderRun, viewer, judge, judge
         {running ? (
           <button className="danger" onClick={() => void stop()}>Stop tests</button>
         ) : (
-          <button className="primary test-run-button" disabled={!data.ready || locked || starting || !picked.length || judges.find((item) => item.id === judge)?.available === false} onClick={() => void start()}>
+          <button className="primary test-run-button" disabled={!data.ready || locked || starting || !picked.length || (judge === "claude" && judges.find((item) => item.id === "claude")?.available === false)} onClick={() => void start()}>
             {data.ready ? `Run ${picked.length} selected test${picked.length === 1 ? "" : "s"} · up to $${cost.toFixed(2)}` : "Run tests"}
           </button>
         )}

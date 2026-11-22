@@ -506,8 +506,7 @@ export default function App() {
       .then((data) => {
         setJudges(data.judges);
         const current = data.judges.find((item) => item.id === judge);
-        const usable = data.judges.find((item) => item.available);
-        if (current && !current.available && usable) chooseJudge(usable.id);
+        if (judge === "claude" && current && !current.available) chooseJudge("offline");
       })
       .catch(() => undefined);
   }, [connected]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1064,7 +1063,7 @@ export default function App() {
               {running ? (
                 <button className="danger" disabled={task?.finalizing} onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop</button>
               ) : (
-                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady || judges.find((item) => item.id === judge)?.available === false} onClick={() => { setLastRequest(request); void run("Task started", () => api("/api/tasks/execute", request)); }}>
+                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady || (judge === "claude" && judges.find((item) => item.id === "claude")?.available === false)} onClick={() => { setLastRequest(request); void run("Task started", () => api("/api/tasks/execute", request)); }}>
                   {extras.length ? `Run ${extras.length + 1} tasks` : "Run task"}
                 </button>
               )}
