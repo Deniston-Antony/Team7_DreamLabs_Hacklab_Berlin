@@ -60,12 +60,15 @@ class LivefeedTest(unittest.TestCase):
 
     def test_a_reader_that_never_reads_does_not_slow_the_run(self):
         """With nobody reading, the pipe fills and the writer thread waits, but the simulation keeps running."""
+        started = time.monotonic()
+        self.run_steps(150)
+        without_feed = time.monotonic() - started
         read_fd, write_fd = os.pipe()
         feed = livefeed.attach(self.env, os.fdopen(write_fd, "wb", buffering=0), every=1)
         started = time.monotonic()
         self.run_steps(150)
         took = time.monotonic() - started
-        self.assertLess(took, 8, "the simulation waited for the pipe")
+        self.assertLess(took, without_feed * 1.5 + 1, "the simulation waited for the pipe")
         os.close(read_fd)  # the writer gets a broken pipe and ends
         feed.sender.close(timeout=0.5)
 

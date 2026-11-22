@@ -85,7 +85,7 @@ Run data is saved locally in `backend/evaluation_data/` and `backend/task_videos
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-git clone -b Umair+Deniston_code_combined https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
+git clone -b Final_RoboTester_Website https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
 cd Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test
 
 cd backend
@@ -344,5 +344,7 @@ Use `MUJOCO_GL=egl` on headless Linux.
 | `web-integration` | Custom-domain hosting through Cloudflare Tunnel and this README |
 | `umair-video-judge` | Claude video judge |
 | `Umair+Deniston_code_combined` | Web interface with a choice of Offline or Claude judge |
+| `Deniston-+-Ashiq-code-combined` | Per-run Dream-1 logs, saved start scenes and run-card log tabs |
+| `Final_RoboTester_Website` | Final combined version deployed to robotester.services |
 
 **Team:** Deniston (website and simulator integration), Umair (evaluation, scoring, reports and video judge) and Ashiq (robot, CLI and execution).
