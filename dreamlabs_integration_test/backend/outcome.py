@@ -33,7 +33,7 @@ MAX_ATTEMPTS = 9  # attempts in all, over every task of a request: the live one 
 STAGGER_S = 1.5  # between worker starts, so they do not open their Dream sessions in one burst
 CLIP = re.compile(r"^(attempt-[1-9][0-9]*|grid)$")  # the video names the API serves
 POLL_S = 0.5
-WORKER_STARTUP_S = 30  # time a hidden attempt may take to load before its own movement clock starts
+WORKER_STARTUP_S = 30  # time a hidden attempt may take to load before its own clock starts
 STOP_GRACE_S = 10  # how long a stopped worker may take to close its video and report before it is killed
 
 
@@ -75,6 +75,11 @@ class Watching:
                         self.frames[livefeed.kind_name(kind)] = payload
                         self.seq += 1
 
+    def timer_seconds(self):
+        """This run's movement, decision and wait time, as the worker last reported."""
+        with self.lock:
+            return float(self.status.get("timer_seconds") or 0.0)
+
 
 class Workers:
     """Headless attempts, each with its own task, started one after another and collected at the end."""
@@ -91,6 +96,7 @@ class Workers:
         """
         self.folder, self.jobs, self.procs, self.outputs, self.objects = folder, jobs, [], {}, objects
         self.watching = {job["attempt"]: Watching(job) for job in jobs}
+        self.view_path = folder / "view.json"
         self.model_path, self.state_path = folder / "scene.mjb", folder / "scene.npz"
         mujoco.mj_saveModel(env.model, str(self.model_path))
         np.savez(self.state_path, qpos=env.data.qpos, qvel=env.data.qvel, ctrl=env.data.ctrl)
@@ -136,6 +142,12 @@ class Workers:
             job["goal"]["target"],
             "--record",
             str(self.folder / f"attempt-{job['attempt']}.mp4"),
+            "--attempt",
+            str(job["attempt"]),
+            "--view-file",
+            str(self.view_path),
+            "--final-state",
+            str(self.folder / f"attempt-{job['attempt']}.final.npz"),
         ] + (
             [
                 "--evidence",
@@ -169,6 +181,10 @@ class Workers:
                 target=self.watching[job["attempt"]].read, args=(os.fdopen(read_fd, "rb"),), daemon=True
             ).start()
             time.sleep(STAGGER_S)
+
+    def progress(self):
+        """The longest timer any hidden run has reached."""
+        return max((watching.timer_seconds() for watching in self.watching.values()), default=0.0)
 
     def _drain(self, index, timeout):
         """Wait for one worker to exit (killing it after `timeout`), and keep its output for collect()."""
@@ -240,19 +256,20 @@ class Workers:
 class Session:
     """One request's recording and hidden attempts: start it before dc.main, call finish() after."""
 
-    def __init__(self, task, env, goals, environments=None, objects=None):
+    def __init__(self, task, env, goals, environments=None, objects=None, clock=None):
         """Start recording the live attempt and, when asked and possible, every hidden attempt.
         @param task The task dictionary: task_id, max_seconds and `plan`, a list of {"instruction", "attempts"}.
         @param env The backend's simulation environment.
         @param goals One goal per plan entry ({"object", "target"} from main.parse_goal, or None when the
             instruction cannot be checked), in the same order.
-        @param environments Optional list of environments.Environment, one per hidden run in order: each
-            hidden run starts from its own scene (shuffled positions, another style). None starts every hidden
-            run from a copy of the live scene.
+        @param environments Optional list of environments.Environment for scenes 2, 3, ...: the n-th run of every
+            task starts from scene n, so tasks can be compared on identical layouts. Scene 1 is the live scene.
         @param objects Scene objects the hidden attempts record as evaluation evidence; None records none.
+        @param clock The live run's clock.
         """
         global current
         self.task, self.env, self.finished, self.workers = task, env, False, None
+        self.clock, self.held, self.live_passed = clock, 0.0, None
         self.plan = [
             {"instruction": p["instruction"], "attempts": int(p.get("attempts", 1)), "goal": g}
             for p, g in zip(task["plan"], goals)
@@ -262,24 +279,55 @@ class Session:
         notes = []
         self.jobs, number = [], 2
         for index, entry in enumerate(self.plan):
-            hidden = entry["attempts"] - (1 if index == 0 else 0)
+            first_run = 1 if index == 0 else 0  # task 1's first run is the live run, in scene 1
+            hidden = entry["attempts"] - first_run
             if hidden and entry["goal"] is None:
                 notes.append(f"Task {index + 1} cannot be checked, so its extra attempts were skipped.")
                 entry["attempts"] -= hidden
                 continue
-            for _ in range(hidden):
+            for run in range(first_run, entry["attempts"]):
                 self.jobs.append(
-                    {"instruction": entry["instruction"], "goal": entry["goal"], "attempt": number, "index": index}
+                    {
+                        "instruction": entry["instruction"],
+                        "goal": entry["goal"],
+                        "attempt": number,
+                        "index": index,
+                        "scene_number": run + 1,
+                    }
                 )
                 number += 1
         if notes:
             task["attempts_note"] = " ".join(notes)
-        for position, job in enumerate(self.jobs):
-            job["environment"] = environments[position] if environments and position < len(environments) else None
+        for job in self.jobs:
+            position = job["scene_number"] - 2
+            job["environment"] = environments[position] if environments and 0 <= position < len(environments) else None
         self.workers = Workers(task, env, self.jobs, self.folder, objects) if self.jobs else None
         self.recorder = recording.attach(env, self.folder / "attempt-1.mp4")
         self.started = env.data.time
         current = self  # last, so the page never sees a half-built session
+
+    def progress(self):
+        """The run's timer: the longest movement, decision and wait time so far, then the time held to the full limit."""
+        live = self.clock.used() if self.clock else 0.0
+        hidden = self.workers.progress() if self.workers else 0.0
+        return min(float(self.task["max_seconds"]), max(live, hidden, self.held))
+
+    def _hold(self, result, records):
+        """Keep the run open until the full time has passed, after every finished run has left Dream-1."""
+        limit = float(self.task["max_seconds"])
+        reached = self.progress()
+        if reached <= 0 or reached >= limit or self.task.get("cancel_requested"):
+            return
+        if result.get("status") == "FAILED" and all(record.get("error") for record in records):
+            return
+        self.task["holding"] = True
+        started = time.monotonic()
+        while not self.task.get("cancel_requested"):
+            self.held = min(limit, reached + time.monotonic() - started)
+            if self.held >= limit:
+                break
+            time.sleep(0.1)
+        self.task["holding"] = False
 
     def finish(self, result):
         """Close the video, collect the hidden attempts and add `videos` and the attempt results to the result.
@@ -287,12 +335,14 @@ class Session:
             describe the live attempt and are left as they are.
         """
         self.recorder.close()
-        self.finished = True
         live_ok = result.get("outcome") == "SUCCESS"
+        self.live_passed = True if live_ok else False if result.get("outcome") == "FAILURE" or result.get("status") == "FAILED" else None
+        self.finished = True
         results = [
             {
                 "attempt": 1,
                 "task": 1,
+                "scene": 1,
                 "where": "live",
                 "success": live_ok,
                 "sim_seconds": round(self.env.data.time - self.started, 1) if live_ok else None,
@@ -318,6 +368,7 @@ class Session:
                 {
                     "attempt": job["attempt"],
                     "task": job["index"] + 1,
+                    "scene": job["scene_number"],
                     "where": "hidden",
                     "success": bool(record.get("success")),
                     "stopped": bool(record.get("stopped")),
@@ -327,13 +378,14 @@ class Session:
                     "env": job["environment"].label if job.get("environment") is not None else None,
                 }
             )
+        self._hold(result, records)
         self.task["finalizing"] = True
         entries = []
         for r in results:
             clip = self.folder / f"attempt-{r['attempt']}.mp4"
             if clip.is_file() and recording.readable(clip):  # a run killed mid-write leaves an unplayable file
                 goal = self.plan[r["task"] - 1]["goal"]
-                what = describe(goal) if goal and len(self.plan) > 1 else f"attempt {r['attempt']}"
+                what = f"{describe(goal)} scene {r['scene']}" if goal and len(self.plan) > 1 else f"attempt {r['attempt']}"
                 seconds = f" {r['sim_seconds']:.0f} s" if r.get("sim_seconds") is not None else ""
                 verdict = f"OK{seconds}" if r["success"] else "STOPPED" if r.get("stopped") else "FAIL"
                 label = f"{what} #{r['attempt']}: {verdict}"
@@ -365,18 +417,23 @@ class Session:
 
     def states(self):
         """Every attempt's status, for the page's dropdown.
-        @return List of dicts: attempt, task, where, label and state. The state is `starting`, `running`,
-            `succeeded`, `failed`, `error` or `ended` (a worker that stopped without reporting).
+        @return List of dicts: attempt, task, where, label, state, timer_s and limit_s. The state is `starting`,
+            `running`, `succeeded`, `failed`, `error` or `ended` (a worker that stopped without reporting).
         """
+        limit = float(self.task["max_seconds"])
         label = lambda entry: describe(entry["goal"]) if entry["goal"] else entry["instruction"][:30]  # noqa: E731
         out = [
             {
                 "attempt": 1,
                 "task": 1,
+                "scene": 1,
                 "where": "live",
                 "label": label(self.plan[0]),
                 "env": "Live scene",
                 "state": "finished" if self.finished else "running",
+                "passed": self.live_passed,
+                "timer_s": round(self.clock.used(), 1) if self.clock else 0.0,
+                "limit_s": limit,
             }
         ]
         for position, job in enumerate(self.jobs):
@@ -390,10 +447,13 @@ class Session:
                 {
                     "attempt": job["attempt"],
                     "task": job["index"] + 1,
+                    "scene": job["scene_number"],
                     "where": "hidden",
                     "label": label(self.plan[job["index"]]),
                     "env": job["environment"].label if job.get("environment") is not None else "Copy of live scene",
                     "state": state,
+                    "timer_s": round(watching.timer_seconds(), 1),
+                    "limit_s": limit,
                 }
             )
         return out
@@ -433,12 +493,43 @@ def attempt_states():
     if current is not None and current.workers is not None:
         return current.states()
     if previews and previews["envs"]:
-        ready = [{"attempt": 1, "task": 1, "where": "live", "label": "", "env": "Live scene", "state": "ready"}]
+        ready = [{"attempt": 1, "task": 1, "scene": 1, "where": "live", "label": "", "env": "Live scene", "state": "ready"}]
         return ready + [
-            {"attempt": e.attempt, "task": 1, "where": "hidden", "label": "", "env": e.label, "state": "ready"}
+            {"attempt": e.attempt, "task": 1, "scene": e.attempt, "where": "hidden", "label": "", "env": e.label, "state": "ready"}
             for e in previews["envs"]
         ]
     return []
+
+
+def publish_view(attempt, camera, view):
+    """Tell the running parallel runs which run is watched and where the 3D camera is."""
+    session = current
+    if session is None or session.workers is None:
+        return
+    path = session.workers.view_path
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps({"attempt": attempt, "camera": camera, **view}))
+        os.replace(temporary, path)
+    except OSError:
+        pass
+
+
+def has_workers():
+    """Whether the run tabs are showing a request's parallel runs, rather than prepared scenes."""
+    return current is not None and current.workers is not None
+
+
+def final_scene(attempt):
+    """(model path, saved final state) of a finished parallel run, or None while it is running or has no state."""
+    session = current
+    if session is None or session.workers is None:
+        return None
+    for job in session.jobs:
+        if job["attempt"] == attempt:
+            path = session.folder / f"attempt-{attempt}.final.npz"
+            return (job["scene"][0], path) if path.is_file() else None
+    return None
 
 
 def worker_frame(attempt, camera):

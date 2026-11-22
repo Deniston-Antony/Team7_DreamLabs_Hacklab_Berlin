@@ -23,6 +23,8 @@ class EvidenceCapture:
         self.startup_steps = startup_steps
         self.steps = 0
         self.model_calls = None
+        self.decision_seconds = None
+        self.wait_seconds = None
         self.started = time.monotonic()
         self.bodies = {name: env.model.body(name).id for name in self.object_ids}
         self.names = {body_id: name for name, body_id in self.bodies.items()}
@@ -213,6 +215,8 @@ class EvidenceCapture:
             trajectory=self.trajectory,
             max_heights=self.max_heights,
             duration_seconds=round(actions * CONTROL_STEP_S, 2),
+            decision_seconds=self.decision_seconds,
+            wait_seconds=self.wait_seconds,
             wall_seconds=round(time.monotonic() - self.started, 2),
             action_count=actions,
             model_calls=self.model_calls,

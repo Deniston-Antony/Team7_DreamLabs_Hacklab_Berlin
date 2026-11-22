@@ -9,6 +9,7 @@ from pathlib import Path
 from .batch import aggregate, summarize_run
 from .config import DEFAULT_CONFIG, ScoringConfig
 from .evaluator import evaluate_task
+from .insights import analyze_run, compare_scenes
 from .models import Evidence, TaskDefinition, TaskResult
 from .reports import run_report, task_report
 
@@ -120,8 +121,20 @@ class EvaluationStore:
             record = self.records.get(task_id)
             if record is None:
                 return
-            record[1].vision = vision
-            self._save(*record)
+            task, evidence, _ = record
+            evidence.vision = vision
+            result = evaluate_task(task, evidence, self.config)  # perception is read from the finished video analysis
+            self.records[task_id] = (task, evidence, result)
+            self._save(task, evidence, result)
+
+    def run_clips(self, run_id: str):
+        """(attempt, outcome, label) of each attempt in a run, for building a combined video."""
+        with self.lock:
+            records = self._run_records(run_id)
+        return [
+            (task.attempt, result.outcome, f"attempt {task.attempt} scene {task.scene_number or task.attempt}: {result.outcome.replace('_', ' ').lower()}")
+            for task, _, result in records
+        ]
 
     def has_run(self, run_id: str) -> bool:
         with self.lock:
@@ -133,8 +146,13 @@ class EvaluationStore:
         if not records:
             return None
         summary = summarize_run([(task, result, evidence.execution_status) for task, evidence, result in records])
-        grid = any("grid" in (evidence.run_videos or evidence.videos) for _, evidence, _ in records)
-        return run_report(summary, [task_report(*record) for record in records], f"/api/tasks/{run_id}/video/grid" if grid else None)
+        clips = {name for _, evidence, _ in records for name in (evidence.run_videos or evidence.videos)}
+        grid = "grid" in clips or len(clips - {"grid"}) >= 2
+        insights = analyze_run(records)
+        comparison = compare_scenes(records)
+        summary["recommendations"] = [item["action"] for item in insights["findings"]]
+        report = run_report(summary, [task_report(*record) for record in records], f"/api/tasks/{run_id}/video/grid" if grid else None)
+        return {**report, "insights": insights, "comparison": comparison}
 
     def batches(self):
         with self.lock:

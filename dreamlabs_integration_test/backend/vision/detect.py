@@ -29,11 +29,29 @@ def prompt(object_id):
     return f"a photo of a {' '.join(words) or 'object'}"
 
 
-def detect(model, processor, path, objects):
+def choose_device(model, processor):
+    if torch.backends.mps.is_available():
+        try:
+            model.to("mps")
+            probe = processor(text=[["a photo of an object"]], images=Image.new("RGB", (64, 64)), return_tensors="pt").to("mps")
+            with torch.no_grad():
+                model(**probe)
+            return "mps"
+        except Exception:
+            model.to("cpu")
+    if torch.cuda.is_available():
+        model.to("cuda")
+        return "cuda"
+    return "cpu"
+
+
+def detect(model, processor, device, path, objects):
     image = Image.open(path).convert("RGB")
-    inputs = processor(text=[[prompt(name) for name in objects]], images=image, return_tensors="pt")
+    inputs = processor(text=[[prompt(name) for name in objects]], images=image, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
+    outputs.logits = outputs.logits.cpu()
+    outputs.pred_boxes = outputs.pred_boxes.cpu()
     # OWLv2 pads images to a square, so boxes scale by the longer side.
     side = max(image.size)
     found = processor.post_process_object_detection(outputs, threshold=0.01, target_sizes=torch.tensor([[side, side]]))[0]
@@ -56,19 +74,22 @@ def main(job_path, output_path):
     job = json.load(open(job_path))
     processor = Owlv2Processor.from_pretrained(MODEL, use_fast=False)
     model = Owlv2ForObjectDetection.from_pretrained(MODEL).eval()
+    device = choose_device(model, processor)
     cache = {}
-    results = {}
+
+    def run(path, objects):
+        with open(path, "rb") as handle:
+            key = (hashlib.sha256(handle.read()).hexdigest(), tuple(objects))
+        if key not in cache:
+            cache[key] = detect(model, processor, device, path, objects)
+        return cache[key]
+
+    results, timelines = {}, {}
     for item in job["items"]:
-        cameras = {}
-        for camera, path in item["frames"].items():
-            with open(path, "rb") as handle:
-                key = (hashlib.sha256(handle.read()).hexdigest(), tuple(item["objects"]))
-            if key not in cache:
-                cache[key] = detect(model, processor, path, item["objects"])
-            cameras[camera] = cache[key]
-        results[item["task_id"]] = cameras
+        results[item["task_id"]] = {camera: run(path, item["objects"]) for camera, path in item["frames"].items()}
+        timelines[item["task_id"]] = [run(path, item["objects"]) for path in item.get("video_frames", [])]
     with open(output_path, "w") as handle:
-        json.dump({"model": MODEL, "threshold": THRESHOLD, "results": results}, handle)
+        json.dump({"model": MODEL, "threshold": THRESHOLD, "device": device, "results": results, "timelines": timelines}, handle)
 
 
 if __name__ == "__main__":

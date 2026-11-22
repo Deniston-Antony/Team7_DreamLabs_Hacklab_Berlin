@@ -57,10 +57,6 @@ def missing_evidence(task: TaskDefinition, evidence: Evidence) -> list[str]:
         missing.append("Action count and duration")
     if evidence.model_calls is None:
         missing.append("Dream-1 call count")
-    note = "Direct Dream-1 perception output (the API returns actions only, so perception is inferred from gripper motion)"
-    if evidence.model_output_keys:
-        note += f"; extra model fields seen: {', '.join(evidence.model_output_keys)}"
-    missing.append(note)
     return missing
 
 
@@ -95,13 +91,13 @@ def object_correctness(task: TaskDefinition, evidence: Evidence, verification: l
 def efficiency_fraction(task: TaskDefinition, evidence: Evidence, config: ScoringConfig, goal: float | None) -> tuple[float | None, str]:
     if evidence.duration_seconds is None:
         return None, "Execution duration is unavailable."
-    ratio = evidence.duration_seconds / max(task.max_duration_seconds, 1e-6)
+    ratio = (evidence.duration_seconds + (evidence.decision_seconds or 0.0)) / max(task.max_duration_seconds, 1e-6)
     if ratio <= config.efficient_time_fraction:
         speed = 1.0
     else:
         span = max(1 - config.efficient_time_fraction, 1e-6)
         speed = max(0.2, 1 - 0.8 * (ratio - config.efficient_time_fraction) / span)
-    return speed * (goal or 0.0), f"Used {ratio * 100:.0f}% of the time limit; credit scales with goal completion."
+    return speed * (goal or 0.0), f"Movement and decisions used {ratio * 100:.0f}% of the time limit; credit scales with goal completion."
 
 
 def component_fractions(task, evidence, config, verification, analysis, goal):
@@ -225,7 +221,10 @@ def scene_understanding(task, evidence, verification, analysis):
 
 
 def perception_entry(task: TaskDefinition, evidence: Evidence) -> dict[str, str]:
-    source = "Inferred from gripper motion; Dream-1 does not return its detections"
+    video = (evidence.vision or {}).get("video")
+    if video and video.get("status"):
+        return coverage_entry(video["status"], video["detail"], "Run video analysed with OWLv2")
+    source = "Inferred from gripper motion"
     if not task.criteria or not evidence.approach:
         return coverage_entry("NOT_MEASURED", "No gripper-motion evidence is available.", "unavailable")
     target = task.criteria[0].object_id

@@ -13,6 +13,7 @@ SUMMARY_FIELDS = (
     "first_started_at",
     "last_started_at",
     "total_runs",
+    "task_ranking",
     "runs",
     "total_tasks",
     "successful",

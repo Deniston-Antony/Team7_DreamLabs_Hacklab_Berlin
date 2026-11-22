@@ -99,6 +99,23 @@ def summarize_run(rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[st
 
 
 def aggregate(batch_id: str, rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[str, Any]:
+    by_instruction: dict[str, list[TaskResult]] = {}
+    for task, result, _ in rows:
+        by_instruction.setdefault(task.instruction, []).append(result)
+    task_ranking = sorted(
+        (
+            {
+                "instruction": instruction,
+                "attempts": len(items),
+                "successes": sum(item.outcome == "SUCCESS" for item in items),
+                "average_score": round(mean([item.score for item in items if item.score is not None]), 2)
+                if any(item.score is not None for item in items)
+                else None,
+            }
+            for instruction, items in by_instruction.items()
+        ),
+        key=lambda item: (item["average_score"] is None, -(item["average_score"] or 0), -item["successes"]),
+    )
     grouped: dict[str, list[tuple[TaskDefinition, TaskResult, str]]] = {}
     for row in rows:
         grouped.setdefault(row[0].run, []).append(row)
@@ -137,6 +154,7 @@ def aggregate(batch_id: str, rows: list[tuple[TaskDefinition, TaskResult, str]])
         "first_started_at": min(started) if started else None,
         "last_started_at": max(started) if started else None,
         "total_runs": len(runs),
+        "task_ranking": task_ranking,
         "runs": runs,
         "total_tasks": total,
         "successful": outcomes["SUCCESS"],

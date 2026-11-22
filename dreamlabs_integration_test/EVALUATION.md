@@ -70,16 +70,26 @@ Only the most serious incident per object is scored, which prevents one collisio
 | `GET` | `/api/reports/batches/{batch_id}?format=json\|html` | Full benchmark report |
 | `GET` | `/api/reports/batches/{batch_id}/summary` | Website summary |
 
+## Shared scenes and comparison
+
+Every task runs once in each scene, and the n-th run of every task uses the same starting layout. The Final report verifies those positions, then compares tasks and scenes in a score table and lists the best task, best scene, hardest scene and where to improve.
+
+Run recommendations come from each attempt's stored data: where it failed, closest distance, lift, contact time, distance to the goal, movement time, disturbances and video analysis.
+
+## Video perception
+
+Dream-1 returns actions, not its detections. After a run, OWLv2 samples 10 frames from each attempt's video and tracks which objects moved. This is shown as **Perception (from video)**, is not scored, and describes observed behaviour rather than the model's internal understanding. On 36 object checks from real runs, it matched MuJoCo's movement data in 35.
+
 ## Timing and Dream-1 capacity
 
-The time limit is **robot movement time**. Every attempt moves for that long unless it succeeds first. Loading, Dream-1 thinking pauses and waiting for a free seat do not use it, so real time is longer than the limit.
+The time limit counts **robot movement, Dream-1 decision time and waiting for a free Dream-1 seat**. Every attempt runs for that long unless it succeeds first. A finished attempt leaves Dream-1, but the website waits for the full time before creating videos and reports. Only loading is outside the limit. Reports show movement, decision, wait and total time for each attempt. The efficiency score uses movement and decision time, so a busy server does not lower Dream-1's score.
 
-When Dream-1 reports no capacity, the attempt holds still and retries with increasing delays for up to 90 seconds. Attempts also start 1.5 seconds apart.
+When Dream-1 reports no capacity, the attempt holds still and retries with increasing delays for up to 90 seconds or until its time limit ends. Attempts also start 1.5 seconds apart.
 
 ## Limitations
 
-- Dream-1's API returns arm actions, not detections or attention maps. **Perception (inferred)** uses which object the gripper reached first. It is evidence of behaviour, is not scored, and does not prove what the model recognised.
-- The vision check uses OWLv2 on the first frame of each camera. It is unscored, runs locally after the task, and checks the camera view rather than Dream-1's understanding. On 108 simulator checks it reached 94% agreement with MuJoCo visibility, with 6 missed objects and no false detections.
+- Dream-1's API returns arm actions, not detections or attention maps, so video perception is evidence of behaviour and does not prove what the model recognised.
+- The vision check runs locally after the task and is not scored. On 108 first-frame simulator checks it reached 94% agreement with MuJoCo visibility, with 6 missed objects and no false detections.
 - Contacts are sampled at control steps, so very brief contacts can be missed.
 - Uploaded STL collisions use a convex shape.
 - A small number of runs does not establish statistically meaningful performance.

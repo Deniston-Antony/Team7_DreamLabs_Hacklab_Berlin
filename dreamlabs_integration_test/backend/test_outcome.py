@@ -278,6 +278,8 @@ class OutcomeTest(unittest.TestCase):
             self.assertEqual(task["attempt_results"][1]["success"], True)
             states = outcome.attempt_states()
             self.assertEqual([w["state"] for w in states], ["finished", "succeeded"])
+            self.assertEqual([w["limit_s"] for w in states], [20.0, 20.0], "every run has its own timer against the limit")
+            self.assertTrue(all(0 <= w["timer_s"] <= 20 for w in states))
         finally:
             outcome.SORTFLOW = self.keep[2]
 

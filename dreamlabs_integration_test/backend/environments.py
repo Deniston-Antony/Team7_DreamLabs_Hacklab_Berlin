@@ -13,21 +13,27 @@ simulator thread.
 
 import io
 import math
+import threading
 from collections import OrderedDict
 
+import cv2
 import mujoco
 import numpy as np
 from PIL import Image
 
 MODES = ("same", "shuffle", "shuffle_style")  # copy of the live scene; shuffled positions; shuffled + other styles
 CAMERAS = ("top", "left", "right")
+FREE_VIEW = "free"
+VIEWS = (*CAMERAS, FREE_VIEW)
 RENDER_WIDTH, RENDER_HEIGHT, RENDER_CROP_TOP = 640, 480, 60  # as yam_env.YamEnv.images renders
 SETTLE_STEPS = 20  # control steps (25 physics steps each) to let shuffled objects come to rest
 DROP_SETTLE_STEPS = 4  # control steps after a drop, as the live scene does
 PHYSICS_PER_CONTROL = 25
 JPEG_QUALITY = 70
 MAX_RENDERERS = 6  # cached offscreen renderers, one per compiled model; the oldest is closed first
-_renderers = OrderedDict()  # id(model) -> (model, mujoco.Renderer)
+_local = threading.local()  # each thread keeps its own renderers, since GL contexts are thread-bound
+HIGHLIGHT_RGB = (255, 120, 0)
+free_view = None  # set by the backend: returns {"lookat", "distance", "azimuth", "elevation"}
 
 
 class EditError(Exception):
@@ -42,11 +48,38 @@ def camera_ray(model, data, camera, u, v):
     """The ray through pixel (u, v) of a fixed camera's cropped image, as yam_env renders it.
     @return (origin, unit direction).
     """
+    if camera == FREE_VIEW:
+        view = current_view()
+        azimuth, elevation = math.radians(view["azimuth"]), math.radians(view["elevation"])
+        forward = np.array([math.cos(elevation) * math.cos(azimuth), math.cos(elevation) * math.sin(azimuth), math.sin(elevation)])
+        right = np.cross(forward, [0, 0, 1])
+        right /= np.linalg.norm(right)
+        up = np.cross(right, forward)
+        focal = (RENDER_HEIGHT / 2) / math.tan(math.radians(model.vis.global_.fovy) / 2)
+        direction = forward + right * (u - RENDER_WIDTH / 2) / focal + up * (RENDER_HEIGHT / 2 - v - RENDER_CROP_TOP) / focal
+        return np.array(view["lookat"]) - view["distance"] * forward, direction / np.linalg.norm(direction)
     camera_id = model.camera(camera).id
     focal = (RENDER_HEIGHT / 2) / math.tan(math.radians(model.cam_fovy[camera_id]) / 2)
     local = np.array([(u - RENDER_WIDTH / 2) / focal, -(v + RENDER_CROP_TOP - RENDER_HEIGHT / 2) / focal, -1.0])
     direction = data.cam_xmat[camera_id].reshape(3, 3) @ local
     return data.cam_xpos[camera_id].copy(), direction / np.linalg.norm(direction)
+
+
+def current_view():
+    """The website's 3D camera."""
+    if free_view is not None:
+        return free_view()
+    return {"lookat": [0, -0.02, 0.78], "distance": 1.25, "azimuth": -90, "elevation": -35}
+
+
+def free_camera():
+    """A MuJoCo camera at the website's current 3D view."""
+    view = current_view()
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+    camera.lookat[:] = view["lookat"]
+    camera.distance, camera.azimuth, camera.elevation = view["distance"], view["azimuth"], view["elevation"]
+    return camera
 
 
 def at_height(origin, direction, z):
@@ -82,6 +115,7 @@ class Environment:
         self.version = 0  # bumped on every change, so the page knows to fetch a new picture
         self.selected = None
         self.grab = None
+        self.free_key = None
         self.snapshot = self.objects()  # the object table, read by the page's thread while edits run on the sim's
 
     @property
@@ -158,9 +192,17 @@ class Environment:
     def _changed(self, cameras=CAMERAS):
         """Mark the environment as edited by hand and render the given cameras again."""
         self.edited = True
-        self.previews.update(render_previews(self.model, self.data, cameras))
         self.snapshot = self.objects()
+        self._redraw(cameras)
+
+    def _redraw(self, cameras=CAMERAS):
+        """Render the given cameras with the current selection outlined."""
+        self.previews.update(render_previews(self.model, self.data, cameras, self.selected))
         self.version += 1
+
+    def render_free(self):
+        """Render this scene from the website's 3D camera."""
+        self.previews.update(render_previews(self.model, self.data, (FREE_VIEW,), self.selected))
 
     def pick(self, camera, u, v):
         """Select the object under pixel (u, v) of a camera and, when it is movable, start dragging it.
@@ -182,6 +224,7 @@ class Environment:
                     if np.linalg.norm(self.data.body(nearest).xpos[:2] - point[:2]) < 0.035:
                         name = nearest
         self.grab, self.selected = None, name
+        self._redraw((camera,) if camera in CAMERAS else ())
         if name is None:
             return {"object_id": None, "movable": False}
         if name not in self.rules.get("movable", ()):
@@ -211,7 +254,7 @@ class Environment:
         x, y = point[:2] + self.grab["offset"]
         x_range, y_range = self.rules.get("drag_x", (-0.35, 0.35)), self.rules.get("drag_y", (-0.20, 0.25))
         self._set_pose(self.grab["object_id"], [float(np.clip(x, *x_range)), float(np.clip(y, *y_range)), self.grab["z"]])
-        self._changed((camera,))  # only the camera being dragged on, so dragging stays smooth
+        self._changed((camera,) if camera in CAMERAS else ())  # only the camera being dragged on, so it stays smooth
 
     def drop(self):
         """Let go of the grabbed object; it goes back when it would overlap another object.
@@ -250,6 +293,7 @@ class Environment:
         if name is not None and name not in self.rules.get("managed", ()):
             raise EditError(f"no object named {name!r}", 404)
         self.selected = name
+        self._redraw()
 
     def shuffle(self, rng=None):
         """Move this environment's movable objects to a new random layout."""
@@ -355,6 +399,9 @@ def shuffle_layout(model, data, movable, fixed, rng, x_range, y_range, spacing):
 
 def _renderer(model):
     """A cached offscreen renderer for a model; creating one per picture would make dragging slow."""
+    if not hasattr(_local, "renderers"):
+        _local.renderers = OrderedDict()  # id(model) -> (model, mujoco.Renderer)
+    _renderers = _local.renderers
     key = id(model)
     if key in _renderers and _renderers[key][0] is model:
         _renderers.move_to_end(key)
@@ -368,16 +415,39 @@ def _renderer(model):
     return renderer
 
 
-def render_previews(model, data, cameras=CAMERAS):
+def _outline(renderer, model, data, view, image, name):
+    """A copy of an image with one object outlined; the outline is only for the website's view."""
+    body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+    if body < 0:
+        return image
+    geoms = np.flatnonzero(model.body_rootid[model.geom_bodyid] == body)
+    renderer.enable_segmentation_rendering()
+    try:
+        renderer.update_scene(data, camera=view)
+        segmentation = renderer.render()[RENDER_CROP_TOP : RENDER_HEIGHT - RENDER_CROP_TOP]
+    finally:
+        renderer.disable_segmentation_rendering()
+    mask = (segmentation[..., 1] == mujoco.mjtObj.mjOBJ_GEOM) & np.isin(segmentation[..., 0], geoms)
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    outlined = image.copy()
+    cv2.drawContours(outlined, contours, -1, HIGHLIGHT_RGB, 2, cv2.LINE_AA)
+    return outlined
+
+
+def render_previews(model, data, cameras=CAMERAS, highlight=None):
     """JPEGs of cameras for a state, cropped as the live view is.
-    @param cameras Which cameras; all three by default.
+    @param cameras Which cameras; all three by default. "free" is the website's 3D view.
+    @param highlight An object to outline, or None.
     @return Camera name -> JPEG bytes.
     """
     renderer = _renderer(model)
     previews = {}
     for camera in cameras:
-        renderer.update_scene(data, camera=camera)
+        view = free_camera() if camera == FREE_VIEW else camera
+        renderer.update_scene(data, camera=view)
         image = renderer.render()[RENDER_CROP_TOP : RENDER_HEIGHT - RENDER_CROP_TOP]
+        if highlight:
+            image = _outline(renderer, model, data, view, image, highlight)
         buffer = io.BytesIO()
         Image.fromarray(image).save(buffer, format="JPEG", quality=JPEG_QUALITY)
         previews[camera] = buffer.getvalue()

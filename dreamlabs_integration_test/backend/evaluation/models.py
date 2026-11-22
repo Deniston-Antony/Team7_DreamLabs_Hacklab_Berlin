@@ -65,6 +65,8 @@ class TaskDefinition(BaseModel):
     run_id: str | None = None
     attempt: int = 1
     where: Literal["live", "hidden"] = "live"
+    scene_number: int | None = None
+    scene_label: str | None = None
 
     @property
     def run(self) -> str:
@@ -82,6 +84,8 @@ class Evidence(BaseModel):
     trajectory: dict[str, list[list[float]]] = Field(default_factory=dict)
     max_heights: dict[str, float] = Field(default_factory=dict)
     duration_seconds: float | None = None
+    decision_seconds: float | None = None
+    wait_seconds: float | None = None
     wall_seconds: float | None = None
     action_count: int | None = None
     model_calls: int | None = None

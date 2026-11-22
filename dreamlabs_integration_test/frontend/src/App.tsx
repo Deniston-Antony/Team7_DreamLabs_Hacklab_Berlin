@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import { BenchmarksPage } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
+import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
 
 type SceneObject = {
   object_id: string;
@@ -17,6 +18,7 @@ type Task = {
   status: "RUNNING" | "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED";
   max_seconds: number;
   elapsed_s: number;
+  run_timer_s?: number | null;
   error: string | null;
   outcome: "SUCCESS" | "FAILURE" | "NOT_EVALUATED" | null;
   result_message: string | null;
@@ -31,6 +33,7 @@ type Task = {
   waiting_for_attempts?: boolean;
   finalizing?: boolean;
   waiting_for_capacity?: boolean;
+  holding?: boolean;
   evaluation?: EvaluationRef | null;
   evaluation_error?: string | null;
 };
@@ -45,6 +48,7 @@ type TaskResult = {
 type AttemptResult = {
   attempt: number;
   task?: number;
+  scene?: number;
   where: "live" | "hidden";
   success: boolean;
   sim_seconds: number | null;
@@ -56,16 +60,20 @@ type AttemptResult = {
 type WorkerState = {
   attempt: number;
   task: number;
+  scene?: number;
   where: "live" | "hidden";
   label: string;
   env?: string;
   state: "ready" | "starting" | "running" | "finished" | "succeeded" | "failed" | "error" | "ended" | "stopped";
+  passed?: boolean | null;
+  timer_s?: number;
+  limit_s?: number;
 };
 type Live = {
   layout_saved?: boolean;
   attempt?: number;
   workers?: WorkerState[];
-  phase: "idle" | "running" | "waiting_for_dream";
+  phase: "idle" | "running" | "waiting_for_dream" | "waiting_for_runs" | "holding" | "saving";
   scene_id: string;
   selected: string | null;
   task: Task | null;
@@ -101,6 +109,9 @@ const PHASE_LABEL: Record<Live["phase"], string> = {
   idle: "Idle",
   running: "Executing",
   waiting_for_dream: "Waiting for Dream-1",
+  waiting_for_runs: "Waiting for parallel runs",
+  holding: "Waiting for full time",
+  saving: "Saving videos and reports",
 };
 const TASK_LABEL: Record<Task["status"], string> = {
   RUNNING: "Running",
@@ -142,12 +153,41 @@ function goalName(label: string) {
   return label.includes(">") ? label.split(">").map(nice).join(" → ") : label;
 }
 
+function runTone(state: WorkerState["state"], passed?: boolean | null) {
+  if (state === "starting" || state === "running") return "running";
+  if (state === "succeeded" || passed === true) return "succeeded";
+  if (state === "failed" || state === "error" || passed === false) return "failed";
+  return "stopped";
+}
+
+function shownState(worker: WorkerState): WorkerState["state"] {
+  if (worker.state !== "finished") return worker.state;
+  return worker.passed === true ? "succeeded" : worker.passed === false ? "failed" : "finished";
+}
+
+function RunProgress({ seconds, limit, tone }: { seconds: number; limit: number; tone: string }) {
+  const share = limit > 0 ? Math.min(100, Math.max(0, (seconds / limit) * 100)) : 0;
+  const percent = Math.floor(share);
+  return (
+    <span className={`run-progress ${tone}`}>
+      <span className="run-progress-text">
+        <span>{clock(seconds)} / {clock(limit)}</span>
+        <span>{percent}%</span>
+      </span>
+      <span className="run-progress-track" role="progressbar" aria-label="Run time used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+        <span className="run-progress-fill" style={{ width: `${share}%` }} />
+      </span>
+    </span>
+  );
+}
+
 function runName(attempt: number) {
   return attempt === 1 ? "Live run" : `Parallel run ${attempt}`;
 }
 
 function AttemptsPanel({ task }: { task: Task }) {
   const videos = useRef<HTMLDivElement | null>(null);
+  const [allSpeed, setAllSpeed] = useState(1);
   if (task.waiting_for_attempts) {
     return <div className="panel">Live run finished. Waiting for {task.attempts - 1} parallel run{task.attempts > 2 ? "s" : ""} to complete…</div>;
   }
@@ -185,7 +225,12 @@ function AttemptsPanel({ task }: { task: Task }) {
             results.length > 0 && <span className="muted"> {task.attempts_succeeded} of {task.attempts} runs succeeded</span>
           )}
         </h2>
-        {clips.length > 1 && <button onClick={playTogether}>Play all together</button>}
+        {clips.length > 1 && (
+          <span className="all-speed">
+            <SpeedButtons speed={allSpeed} onChange={setAllSpeed} label="Speed for all videos" />
+            <button onClick={playTogether}>Play all together</button>
+          </span>
+        )}
       </div>
       {suite && (
         <ul className="task-results">
@@ -205,9 +250,10 @@ function AttemptsPanel({ task }: { task: Task }) {
           const state = result ? (result.success ? "passed" : result.stopped ? "stopped" : "failed") : "";
           return (
             <figure key={name} className={state}>
-              <video controls loop muted playsInline preload="metadata" src={url(name)} />
+              <VideoPlayer src={url(name)} loop groupSpeed={allSpeed} />
               <figcaption>
                 <strong>{runName(number)}</strong>
+                {result?.scene ? ` · Scene ${result.scene}` : ""}
                 {result && goalOf(result) ? ` · ${goalOf(result)}` : ""}
                 {result?.env ? ` · ${result.env}` : ""}
                 {result ? `: ${summary(result)}` : ""}
@@ -245,8 +291,8 @@ export default function App() {
   const [uploadKey, setUploadKey] = useState(0);
   const [instruction, setInstruction] = useState("put apple into the bowl");
   const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
-  const [totalRuns, setTotalRuns] = useState(1); // every task's runs together; task 1 gets what the others leave
-  const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
+  const [scenesPerTask, setScenesPerTask] = useState(1); // every task runs once in each of these shared scenes
+  const [extras, setExtras] = useState<{ text: string }[]>([]);
   const [lastRequest, setLastRequest] = useState<Record<string, unknown> | null>(null);
   const [envMode, setEnvMode] = useState<"same" | "shuffle" | "shuffle_style">("same");
   const [seed, setSeed] = useState(() => Math.floor(Math.random() * 100000));
@@ -366,7 +412,7 @@ export default function App() {
       }
     };
     const onWheel = (event: WheelEvent) => {
-      if (cameraRef.current !== "free" || attemptRef.current !== 1) return;
+      if (cameraRef.current !== "free") return;
       event.preventDefault();
       const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
       zoom.current.delta += event.deltaY * unit * (event.ctrlKey ? 4 : 1);
@@ -386,47 +432,35 @@ export default function App() {
   const selectedPosition = selectedObject?.position.join(",");
   const task = live?.task ?? null;
   const running = task?.status === "RUNNING";
-  const extraRuns = extras.reduce((sum, extra) => sum + extra.attempts, 0);
-  const totalAttempts = totalRuns;
-  const attempts = totalRuns - extraRuns; // task 1's runs: always at least 1
-  const changeTotal = (value: number) => {
-    const total = Math.min(MAX_ATTEMPTS, Math.max(extras.length + 1, Math.floor(value) || 1));
-    let deficit = extraRuns + 1 - total; // runs to take back from the other tasks, last task first
-    const next = [...extras];
-    for (let i = next.length - 1; i >= 0 && deficit > 0; i--) {
-      const give = Math.min(deficit, next[i].attempts - 1);
-      next[i] = { ...next[i], attempts: next[i].attempts - give };
-      deficit -= give;
-    }
-    setExtras(next);
-    setTotalRuns(total);
-  };
-  const changeTaskRuns = (index: number, value: number) => {
-    const most = extras[index].attempts + attempts - 1; // it can take task 1's runs, down to 1
-    const runs = Math.min(most, Math.max(1, Math.floor(value) || 1));
-    setExtras(extras.map((e, i) => (i === index ? { ...e, attempts: runs } : e)));
-  };
+  const taskCount = extras.length + 1;
+  const mostScenes = Math.max(1, Math.floor(MAX_ATTEMPTS / taskCount));
+  const sceneCount = Math.min(scenesPerTask, mostScenes);
+  const totalAttempts = taskCount * sceneCount;
+  const attempts = sceneCount;
+  const changeScenes = (value: number) => setScenesPerTask(Math.min(mostScenes, Math.max(1, Math.floor(value) || 1)));
   const addTask = () => {
-    if (attempts <= 1) setTotalRuns(totalRuns + 1); // task 1 has none to spare: the total grows
-    setExtras([...extras, { text: "", attempts: 1 }]);
+    const next = taskCount + 1;
+    setScenesPerTask(Math.min(sceneCount, Math.max(1, Math.floor(MAX_ATTEMPTS / next))));
+    if (sceneCount > 1 && envMode === "same") setEnvMode("shuffle");
+    setExtras([...extras, { text: "" }]);
   };
   const suiteReady = extras.every((extra) => extra.text.trim()) && totalAttempts <= MAX_ATTEMPTS;
   const variation = totalAttempts > 1 ? { environments: envMode, seed } : {};
   const request: Record<string, unknown> = extras.length
-    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts: e.attempts }))], max_seconds: maxSeconds, ...variation }
+    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts }))], max_seconds: maxSeconds, ...variation }
     : { instruction, max_seconds: maxSeconds, attempts, ...variation };
   const layoutSaved = live?.layout_saved ?? false;
   useEffect(() => {
     // Show the parallel runs' environments (shuffled positions, other styles) in the run tabs before the run.
     if (running || !connected) return;
-    const count = totalAttempts - 1;
+    const count = sceneCount - 1; // the live scene is scene 1
     const timer = window.setTimeout(() => {
       api("/api/environments", { count, mode: envMode, seed }).catch((error) =>
         setStatus({ text: error instanceof Error ? error.message : String(error), error: true }),
       );
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [envMode, seed, totalAttempts, connected]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [envMode, seed, sceneCount, connected]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const resetScene = () => {
     if (running && !window.confirm("Stop every run and reset the scene?")) return;
@@ -443,7 +477,7 @@ export default function App() {
   const locked = busy || running || dragging;
   const position = { x: pose.x, y: pose.y, z: pose.z };
   const where = editingRun ? ` in ${runName(viewAttempt).toLowerCase()}` : "";
-  const canDrag = (viewAttempt === 1 ? camera === "top" || camera === "free" : editingRun && camera === "top") && !running && !busy;
+  const canDrag = (viewAttempt === 1 || editingRun) && (camera === "top" || camera === "free") && !running && !busy;
 
   useEffect(() => {
     if (!selectedPosition) return;
@@ -508,7 +542,7 @@ export default function App() {
   };
 
   const startDrag = async (event: PointerEvent<HTMLImageElement>) => {
-    if (event.ctrlKey && viewAttempt === 1) {
+    if (event.ctrlKey) {
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
       Object.assign(orbit.current, { active: true, x: event.clientX, y: event.clientY });
@@ -645,13 +679,14 @@ export default function App() {
           <div className="panel viewer">
             <nav className="run-tabs" aria-label="Runs">
               <div className="run-tabs-title">Runs</div>
-              <label className="run-count" title="Shared out over the tasks in the Tasks panel">Total runs
-                <input aria-label="Total runs" type="number" min={extras.length + 1} max={MAX_ATTEMPTS} value={totalRuns} disabled={running} onChange={(event) => changeTotal(Number(event.target.value))} />
+              <label className="run-count" title="Every task runs once in each scene, with objects in the same places">Scenes per task
+                <input aria-label="Scenes per task" type="number" min={1} max={mostScenes} value={sceneCount} disabled={running} onChange={(event) => changeScenes(Number(event.target.value))} />
               </label>
-              <label className="run-count" title="Every run moves for this long unless it succeeds first. Dream-1 thinking and loading are not counted.">Robot movement time per run (s)
+              <div className="run-total">{taskCount} task{taskCount > 1 ? "s" : ""} × {sceneCount} scene{sceneCount > 1 ? "s" : ""} = {totalAttempts} run{totalAttempts > 1 ? "s" : ""}</div>
+              <label className="run-count" title="Counts robot movement, Dream-1 decision time and waiting for a free Dream-1 seat. Loading is not counted.">Time limit per run (s)
                 <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Math.min(MAX_TASK_SECONDS, Math.max(5, Number(event.target.value) || 5)))} />
               </label>
-              {totalAttempts > 1 && (
+              {sceneCount > 1 && (
                 <label className="run-count">Start scenes
                   <select aria-label="Parallel run environments" value={envMode} disabled={running} onChange={(event) => setEnvMode(event.target.value as typeof envMode)}>
                     <option value="same">Copies of the live scene</option>
@@ -667,12 +702,23 @@ export default function App() {
                   aria-pressed={viewAttempt === worker.attempt}
                   onClick={() => chooseAttempt(worker.attempt)}
                 >
-                  <span className="run-tab-name">{runName(worker.attempt)}</span>
+                  <span className="run-tab-name">{worker.state === "ready" ? `Scene ${worker.scene ?? worker.attempt}` : runName(worker.attempt)}</span>
+                  {worker.state !== "ready" && worker.scene && <span className="run-tab-env">Scene {worker.scene}</span>}
                   {worker.label && <span className="run-tab-goal">{goalName(worker.label)}</span>}
                   {worker.env && <span className="run-tab-env">{worker.env}</span>}
-                  <span className={`run-tab-state ${worker.state}`}>
-                    {workers.length > 1 ? RUN_STATE_LABEL[worker.state] : connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Offline"}
+                  <span className={`run-tab-state ${shownState(worker)}`}>
+                    {workers.length > 1 ? RUN_STATE_LABEL[shownState(worker)] : connected ? PHASE_LABEL[live?.phase ?? "idle"] : "Offline"}
                   </span>
+                  {worker.state !== "ready" && (workers.length > 1 || task) && (
+                    <RunProgress
+                      seconds={workers.length > 1 ? worker.timer_s ?? 0 : task?.run_timer_s ?? 0}
+                      limit={workers.length > 1 ? worker.limit_s ?? maxSeconds : task?.max_seconds ?? maxSeconds}
+                      tone={runTone(
+                        worker.state,
+                        workers.length > 1 ? worker.passed : task?.outcome === "SUCCESS" ? true : task?.outcome === "FAILURE" || task?.status === "FAILED" ? false : null,
+                      )}
+                    />
+                  )}
                 </button>
               ))}
             </nav>
@@ -699,10 +745,10 @@ export default function App() {
                 src={frameUrl}
                 draggable={false}
                 onContextMenu={(event) => event.preventDefault()}
-                onPointerDown={viewAttempt === 1 || editingRun ? startDrag : undefined}
-                onPointerMove={viewAttempt === 1 || editingRun ? moveDrag : undefined}
-                onPointerUp={viewAttempt === 1 || editingRun ? endDrag : undefined}
-                onPointerCancel={viewAttempt === 1 || editingRun ? endDrag : undefined}
+                onPointerDown={startDrag}
+                onPointerMove={moveDrag}
+                onPointerUp={endDrag}
+                onPointerCancel={endDrag}
               />
             ) : (
               <div className="main-view" />
@@ -710,9 +756,9 @@ export default function App() {
             </div>
             <p className="hint">
               {editingRun
-                ? `Editing ${runName(viewAttempt).toLowerCase()}'s starting scene: drag objects in the overhead view, or use the object table and Move, Rotate, Shuffle. The live scene does not change.`
+                ? `Editing ${runName(viewAttempt).toLowerCase()}'s scene${taskCount > 1 ? " for every task" : ""}: click and drag objects in the overhead or 3D view. Ctrl + drag rotates the 3D view, and two fingers zoom.`
                 : viewAttempt > 1
-                ? `Viewing ${runName(viewAttempt).toLowerCase()}: camera view only (overhead and wrist cameras). The object table shows the live run.`
+                ? "Ctrl + drag rotates this run's 3D view, and two fingers zoom. Objects can be moved before a run; press Reset scene to edit its start scene."
                 : camera === "free"
                 ? "Click an object to select it, drag to move it. Ctrl + drag to orbit, scroll to zoom."
                 : camera === "top"
@@ -827,24 +873,19 @@ export default function App() {
           <div className="panel">
             <h2>Tasks</h2>
             <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
-            <div className="hint">
-              Task 1 runs: <strong>{attempts}</strong>
-              {extras.length > 0 ? " (what is left of the total)" : ""}. Set the total and the movement time in the Runs list.
-            </div>
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
-                <input aria-label={`Task ${index + 2}`} placeholder="e.g. put orange into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
-                <input aria-label={`Runs for task ${index + 2}`} title="Runs for this task: taken from task 1's runs" type="number" min={1} max={extra.attempts + attempts - 1} value={extra.attempts} disabled={running} onChange={(event) => changeTaskRuns(index, Number(event.target.value))} />
+                <input aria-label={`Task ${index + 2}`} placeholder="e.g. put orange into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { text: event.target.value } : e)))} />
                 <button disabled={running} onClick={() => setExtras(extras.filter((_, i) => i !== index))} aria-label={`Remove task ${index + 2}`} title="Remove task">×</button>
               </div>
             ))}
             <div className="row" style={{ marginTop: 8 }}>
-              <button disabled={running || (attempts <= 1 && totalRuns >= MAX_ATTEMPTS)} onClick={addTask}>Add task</button>
+              <button disabled={running || taskCount >= MAX_ATTEMPTS} onClick={addTask}>Add task</button>
             </div>
             <div className="hint">
-              {extras.length + 1} task{extras.length ? "s" : ""} · {totalAttempts} parallel run{totalAttempts > 1 ? "s" : ""} (max {MAX_ATTEMPTS}) · up to ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)} in credits
+              {taskCount} task{taskCount > 1 ? "s" : ""} × {sceneCount} scene{sceneCount > 1 ? "s" : ""} = {totalAttempts} run{totalAttempts > 1 ? "s" : ""} (max {MAX_ATTEMPTS}) · up to ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)}
             </div>
-            {totalAttempts > 1 && (
+            {sceneCount > 1 && (
               <div className="env-controls">
                 {envMode !== "same" && (
                   <div className="row">
@@ -854,15 +895,16 @@ export default function App() {
                     <button disabled={running} onClick={() => setSeed(Math.floor(Math.random() * 100000))}>New layouts</button>
                   </div>
                 )}
-                <p className="hint">Each parallel run starts from its own scene, shown in its Runs tab. Open a tab to move objects or shuffle that run only; Reset scene puts every run back.</p>
+                <p className="hint">{taskCount > 1 ? "Every task uses the same scenes, with objects in the same places." : "Each run starts from its own scene."} Open a Scene tab to move objects or shuffle it. Reset scene puts every scene back.</p>
               </div>
             )}
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
-            {running && task?.waiting_for_capacity && <p className="hint">Dream-1 is busy. Waiting for a free seat; the robot holds still and its movement time is paused.</p>}
-            {running && !task?.waiting_for_capacity && !task?.finalizing && !task?.waiting_for_attempts && !task?.elapsed_s && <p className="hint">Starting. The timer counts robot movement from Dream-1's first action.</p>}
-            {running && task?.waiting_for_attempts && <p className="hint">Live attempt finished. Hidden attempts are finishing their full movement time.</p>}
+            {running && task?.waiting_for_capacity && <p className="hint">Dream-1 is busy. Waiting for a free seat. The robot holds still and this time counts toward the limit.</p>}
+            {running && !task?.waiting_for_capacity && !task?.finalizing && !task?.waiting_for_attempts && !task?.elapsed_s && <p className="hint">Starting. The timer counts movement, Dream-1 decisions and waiting for Dream-1.</p>}
+            {running && task?.waiting_for_attempts && <p className="hint">Live run finished and left Dream-1. Parallel runs are still moving.</p>}
+            {running && task?.holding && <p className="hint">All runs have finished and disconnected from Dream-1. Waiting for the full time; press Stop to generate the report now.</p>}
             {task?.finalizing && <p className="hint">Robots stopped. Saving videos and reports...</p>}
             <div className="row">
               {running ? (
