@@ -854,7 +854,7 @@ export default function App() {
                     aria-controls="run-log-tab"
                     aria-label={`Dream-1 log of ${runName(worker.attempt).toLowerCase()}`}
                   >
-                    {logAttempt === worker.attempt ? "Hide log" : "Log"}
+                    Log
                   </button>
                 )}
                 </div>
