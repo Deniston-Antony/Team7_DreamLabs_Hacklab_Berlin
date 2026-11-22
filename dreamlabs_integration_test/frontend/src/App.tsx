@@ -618,6 +618,9 @@ export default function App() {
               <label className="run-count">Runs for this task
                 <input aria-label="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS - (totalAttempts - attempts)} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS - (totalAttempts - attempts), Math.max(1, Number(event.target.value) || 1)))} />
               </label>
+              <label className="run-count" title="Applies to every run of every task">Time limit per run (s)
+                <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Math.min(MAX_TASK_SECONDS, Math.max(5, Number(event.target.value) || 5)))} />
+              </label>
               {totalAttempts > 1 && (
                 <label className="run-count">Start scenes
                   <select aria-label="Parallel run environments" value={envMode} disabled={running} onChange={(event) => setEnvMode(event.target.value as typeof envMode)}>
@@ -799,10 +802,7 @@ export default function App() {
           <div className="panel">
             <h2>Tasks</h2>
             <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
-            <label style={{ marginTop: 8 }}>Time limit per run (seconds)
-              <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
-            </label>
-            <p className="hint">Set how many runs this task gets in the Runs list next to the camera view.</p>
+            <p className="hint">Runs for this task and the time limit (shared by every run) are in the Runs list next to the camera view.</p>
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
                 <input aria-label={`Task ${index + 2}`} placeholder="e.g. put orange into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
