@@ -40,6 +40,9 @@ def stop_on_sigterm():
     signal.signal(signal.SIGTERM, handler)
 
 
+import capacity  # noqa: E402
+
+
 RESULT = "RESULT "  # a worker's last stdout line starts with this, followed by its JSON record
 MAX_WORKERS = 16
 STAGGER_S = 1.0  # seconds between the first workers' starts, so they do not open their sessions in one burst
@@ -58,30 +61,35 @@ def write_evidence(capture, path, record):
     os.replace(temporary, path)
 
 
-def capture_evidence(env, objects, dream_control):
-    """Record the simulator evidence the website's evaluator reads: every step's object poses and the model calls.
+def capture_evidence(env, objects, dream_control, clock, frames_dir):
+    """Record evaluator evidence, count robot movement, and make Dream-1 calls wait for a free seat.
     @return The EvidenceCapture, or None when the backend's evaluation package cannot be imported.
     """
+    capture = None
     try:
         from evaluation.evidence import EvidenceCapture
 
-        capture = EvidenceCapture(env, objects, (dream_control.FRAMES - 1) * dream_control.FRAME_EVERY_STEPS + 1)
+        capture = EvidenceCapture(
+            env, objects, (dream_control.FRAMES - 1) * dream_control.FRAME_EVERY_STEPS + 1, frames_dir
+        )
     except Exception as exc:
         print(f"Evidence capture unavailable: {exc}", file=sys.stderr, flush=True)
-        return None
     rendered = env.images
 
     def images():
         result = rendered()
-        capture.on_step()
+        if capture:
+            capture.on_step(result)
+        clock.tick()
         return result
 
     env.images = images
     opened = dream_control.open_policy
 
     def open_policy(config, key):
-        client = opened(config, key)
-        capture.watch_model_calls(client)
+        client = capacity.CapacityClient(opened(config, key), clock)
+        if capture:
+            capture.watch_model_calls(client)
         return client
 
     dream_control.open_policy = open_policy
@@ -104,7 +112,7 @@ def run_worker(
 ):
     """Run one trial in this process: up to `tries` attempts, each from a reset scene.
     @param task The prompt, such as "put orange into the bowl"; it must name an item and a bowl or plate.
-    @param seconds Wall-clock limit per attempt.
+    @param seconds Robot movement time per attempt when `evidence` is given, else a wall-clock limit.
     @param actions Rows executed per response, 1 to 48.
     @param tries Attempts allowed; the trial succeeds if any attempt does.
     @param runner Stands in for dream_control.main in tests; None uses the real one.
@@ -131,7 +139,8 @@ def run_worker(
     item, target = spec
     Watcher = GoalWatcher if goal else SuccessWatcher
     runner = runner or dream_control.main
-    argv = ["--task", task, "--headless", "--quiet", "--seconds", str(seconds), "--actions", str(actions)]
+    run_seconds = capacity.wall_limit(seconds) if evidence else seconds
+    argv = ["--task", task, "--headless", "--quiet", "--seconds", str(run_seconds), "--actions", str(actions)]
     if model:
         argv += ["--model", model]
     env = YamEnv()
@@ -162,6 +171,8 @@ def run_worker(
 
         feed = stream_to(env, live)  # after the recording, so it is closed before it
     capture = None
+    hooked = False
+    clock = capacity.AttemptClock(seconds, threading.Event()) if evidence else None
     record = {"task": task, "success": False, "success_try": None, "tries_used": 0, "sim_seconds": None, "error": None}
     closest = float("inf")
     started = time.monotonic()
@@ -169,11 +180,16 @@ def run_worker(
     try:
         for attempt in range(1, tries + 1):
             reset()
-            if evidence and capture is None:
-                capture = capture_evidence(env, evidence[1], dream_control)
+            if evidence and capture is None and not hooked:
+                hooked = True
+                capture = capture_evidence(
+                    env, evidence[1], dream_control, clock, str(evidence[0]).removesuffix(".evidence.json") + ".frames"
+                )
             record["tries_used"] = attempt
             for refusals in range(3):  # a retryable refusal (no capacity, say) is asked again, at most twice
                 done = threading.Event()
+                if clock:
+                    clock.stop = done
                 watcher = Watcher(env, item, target, done)
                 watcher.start()
                 error = None
@@ -205,6 +221,8 @@ def run_worker(
         if watcher is not None:
             closest = min(closest, watcher.min_distance)
     finally:
+        if clock:
+            clock.close()
         if capture:
             try:
                 write_evidence(capture, evidence[0], record)

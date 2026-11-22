@@ -109,3 +109,27 @@ tr.run-row { cursor: pointer; }
 .env-controls .row { align-items: flex-end; gap: 8px; margin-top: 6px; }
 .run-count { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: #4b545c; margin-bottom: 4px; }
 .run-count input, .run-count select { width: 100%; }
+.layout[hidden] { display: none; }
+.page-tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid #dfe3e6; }
+.page-tabs button { padding: 8px 14px; border: 0; border-bottom: 3px solid transparent; border-radius: 4px 4px 0 0; background: transparent; font-weight: 600; }
+.page-tabs button.active { border-bottom-color: #1f5fbf; color: #1f5fbf; }
+.report-prompt { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.benchmark-page { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; align-items: start; }
+.benchmark-list { position: sticky; top: 12px; display: grid; gap: 6px; max-height: calc(100vh - 24px); overflow-y: auto; }
+.benchmark-row { position: relative; }
+.benchmark-open { width: 100%; display: grid; gap: 2px; padding: 9px 62px 9px 9px; text-align: left; font-size: 12px; color: #4d5660; overflow-wrap: anywhere; }
+.benchmark-edit { position: absolute; top: 5px; right: 5px; padding: 2px 6px; font-size: 11px; }
+.benchmark-rename { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; padding: 7px; border: 1px solid #1f5fbf; border-radius: 5px; }
+.benchmark-rename input { grid-column: 1 / -1; width: 100%; }
+.benchmark-open strong { color: #1c2024; font-size: 13px; }
+.benchmark-row.active .benchmark-open { border-color: #1f5fbf; background: #e8f0fc; }
+.vision-frames { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 8px 0; }
+.vision-frames figure { margin: 0; }
+.vision-frames figcaption { margin-top: 3px; font-size: 12px; text-align: center; color: #555d66; }
+.vision-frame { position: relative; line-height: 0; }
+.vision-frame img { width: 100%; display: block; border-radius: 4px; }
+.vision-frame span { position: absolute; box-sizing: border-box; border: 2px solid #1f8fff; pointer-events: none; }
+.vision-frame span.target { border-color: #ff7800; }
+.vision-frame em { position: absolute; left: -2px; bottom: 100%; padding: 1px 3px; background: #1f8fff; color: #fff; font: 9px/1.2 system-ui; white-space: nowrap; }
+.vision-frame span.target em { background: #ff7800; }
+@media (max-width: 900px) { .benchmark-page { grid-template-columns: 1fr; } .benchmark-list { position: static; max-height: none; } .vision-frames { grid-template-columns: 1fr; } }

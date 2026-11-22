@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent } from "react";
-import { ReportsCenter } from "./EvaluationPanels";
+import { BenchmarksPage } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
 
 type SceneObject = {
@@ -29,6 +29,8 @@ type Task = {
   tasks_succeeded?: number;
   attempts_error?: string;
   waiting_for_attempts?: boolean;
+  finalizing?: boolean;
+  waiting_for_capacity?: boolean;
   evaluation?: EvaluationRef | null;
   evaluation_error?: string | null;
 };
@@ -74,11 +76,6 @@ type Live = {
   robot: Record<string, number[]>;
   contacts: number;
 };
-type Sessions = {
-  sessions: { session_id: string; name: string; busy: boolean }[];
-  max_parallel: number;
-  parallel_supported: boolean;
-};
 type Point = { camera: string; u: number; v: number };
 
 const CAMERAS = ["top", "left", "right", "free"];
@@ -95,8 +92,8 @@ const RUN_STATE_LABEL: Record<WorkerState["state"], string> = {
   stopped: "Stopped",
 };
 const MAX_TASK_SECONDS = 200;
-const MAX_ATTEMPTS = 8;
-const CREDITS_PER_ATTEMPT_120S = 0.06;
+const MAX_ATTEMPTS = 9;
+const CREDITS_PER_ATTEMPT_120S = 0.07;
 const FRAME_WIDTH = 640;
 const FRAME_HEIGHT = 360;
 
@@ -232,7 +229,7 @@ function AttemptsPanel({ task }: { task: Task }) {
 export default function App() {
   const [scenes, setScenes] = useState<Option[]>([]);
   const [robots, setRobots] = useState<Option[]>([]);
-  const [sessions, setSessions] = useState<Sessions | null>(null);
+  const [page, setPage] = useState<"simulator" | "benchmarks">("simulator");
   const [live, setLive] = useState<Live | null>(null);
   const [connected, setConnected] = useState(false);
   const [frameUrl, setFrameUrl] = useState("");
@@ -258,7 +255,7 @@ export default function App() {
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
   const attemptRef = useRef(1);
-  const drag = useRef<{ active: boolean; sending: boolean; next: Point | null; target: string }>({ active: false, sending: false, next: null, target: "" });
+  const drag = useRef<{ active: boolean; pressed: boolean; sending: boolean; next: Point | null; target: string }>({ active: false, pressed: false, sending: false, next: null, target: "" });
   const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
   const zoom = useRef({ sending: false, delta: 0 });
   const viewRef = useRef<HTMLDivElement | null>(null);
@@ -322,14 +319,12 @@ export default function App() {
 
   useEffect(() => {
     run("Connected to the local simulator", async () => {
-      const [sceneList, robotList, sessionList] = await Promise.all([
+      const [sceneList, robotList] = await Promise.all([
         api<{ scene_id: string; name: string }[]>("/api/scenes"),
         api<{ robot_id: string; name: string; executable: boolean }[]>("/api/robots"),
-        api<Sessions>("/api/sessions"),
       ]);
       setScenes(sceneList.map((scene) => ({ id: scene.scene_id, name: scene.name })));
       setRobots(robotList.map((robot) => ({ id: robot.robot_id, name: robot.name, executable: robot.executable })));
-      setSessions(sessionList);
     });
   }, [run]);
 
@@ -526,6 +521,7 @@ export default function App() {
     const pointerId = event.pointerId;
     const point = framePoint(event);
     event.preventDefault();
+    drag.current.pressed = true;
     try {
       drag.current.target = target; // the run being edited, fixed for this whole drag
       const picked = await api<{ object_id: string | null; movable: boolean }>(target ? `${target}/pick` : "/api/view/pick", point);
@@ -535,6 +531,11 @@ export default function App() {
       }
       if (!picked.movable) {
         setStatus({ text: `Selected ${picked.object_id}. It is fixed, so it cannot be dragged.`, error: false });
+        return;
+      }
+      if (!drag.current.pressed) {
+        await api(target ? `${target}/drop` : "/api/view/drop", {});
+        setStatus({ text: `Selected ${picked.object_id}`, error: false });
         return;
       }
       element.setPointerCapture(pointerId);
@@ -568,6 +569,7 @@ export default function App() {
       return;
     }
     const state = drag.current;
+    state.pressed = false;
     if (!state.active) return;
     state.active = false;
     while (state.sending) await new Promise((resolve) => window.setTimeout(resolve, 15));
@@ -633,7 +635,12 @@ export default function App() {
     <main>
       <h1>Dream-1 Simulation Console</h1>
       <p className="note">Plan, run and evaluate Dream-1 tasks in the local YAM simulator.</p>
-      <div className="layout">
+      <nav className="page-tabs" aria-label="Pages">
+        <button className={page === "simulator" ? "active" : ""} onClick={() => setPage("simulator")}>Simulator</button>
+        <button className={page === "benchmarks" ? "active" : ""} onClick={() => setPage("benchmarks")}>Benchmarks</button>
+      </nav>
+      {page === "benchmarks" && <BenchmarksPage latestRunId={task?.evaluation ? task.task_id : ""} locked={running} />}
+      <div className="layout" hidden={page !== "simulator"}>
         <section>
           <div className="panel viewer">
             <nav className="run-tabs" aria-label="Runs">
@@ -641,7 +648,7 @@ export default function App() {
               <label className="run-count" title="Shared out over the tasks in the Tasks panel">Total runs
                 <input aria-label="Total runs" type="number" min={extras.length + 1} max={MAX_ATTEMPTS} value={totalRuns} disabled={running} onChange={(event) => changeTotal(Number(event.target.value))} />
               </label>
-              <label className="run-count" title="Applies to every run of every task">Time limit per run (s)
+              <label className="run-count" title="Every run moves for this long unless it succeeds first. Dream-1 thinking and loading are not counted.">Robot movement time per run (s)
                 <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Math.min(MAX_TASK_SECONDS, Math.max(5, Number(event.target.value) || 5)))} />
               </label>
               {totalAttempts > 1 && (
@@ -715,7 +722,13 @@ export default function App() {
             </div>
           </div>
           {task && <AttemptsPanel key={task.task_id} task={task} />}
-          <ReportsCenter latestRunId={task?.evaluation ? task.task_id : ""} error={task?.evaluation_error} locked={running} />
+          {task?.evaluation && (
+            <div className="panel report-prompt">
+              <span>This task's report is ready.</span>
+              <button className="primary" onClick={() => setPage("benchmarks")}>Open report</button>
+            </div>
+          )}
+          {task?.evaluation_error && <div className="panel"><div className="status error">{task.evaluation_error}</div></div>}
           <div className="panel">
             <h2>Scene objects {editingRun ? <span className="muted">{runName(viewAttempt)}</span> : <span className="muted">{live?.contacts ?? 0} contacts</span>}</h2>
             <table>
@@ -753,17 +766,6 @@ export default function App() {
           </div>
         </section>
         <aside>
-          <div className="panel">
-            <h2>Simulations</h2>
-            {sessions?.sessions.map((session) => (
-              <div className="session" key={session.session_id}>
-                <strong>{session.name}</strong>
-                <span>{running ? "Running" : "Active"}</span>
-              </div>
-            ))}
-            <button disabled title="Multiple simulations are planned">Add simulation (coming soon)</button>
-            <p className="hint">One simulation runs at a time for now.</p>
-          </div>
           <div className="panel">
             <h2>Setup</h2>
             <div className="row">
@@ -827,7 +829,7 @@ export default function App() {
             <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
             <div className="hint">
               Task 1 runs: <strong>{attempts}</strong>
-              {extras.length > 0 ? " (what is left of the total)" : ""}. Set the total and the time limit in the Runs list.
+              {extras.length > 0 ? " (what is left of the total)" : ""}. Set the total and the movement time in the Runs list.
             </div>
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
@@ -858,9 +860,13 @@ export default function App() {
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
+            {running && task?.waiting_for_capacity && <p className="hint">Dream-1 is busy. Waiting for a free seat; the robot holds still and its movement time is paused.</p>}
+            {running && !task?.waiting_for_capacity && !task?.finalizing && !task?.waiting_for_attempts && !task?.elapsed_s && <p className="hint">Starting. The timer counts robot movement from Dream-1's first action.</p>}
+            {running && task?.waiting_for_attempts && <p className="hint">Live attempt finished. Hidden attempts are finishing their full movement time.</p>}
+            {task?.finalizing && <p className="hint">Robots stopped. Saving videos and reports...</p>}
             <div className="row">
               {running ? (
-                <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop</button>
+                <button className="danger" disabled={task?.finalizing} onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop</button>
               ) : (
                 <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady} onClick={() => { setLastRequest(request); void run("Task started", () => api("/api/tasks/execute", request)); }}>
                   {extras.length ? `Run ${extras.length + 1} tasks` : "Run task"}

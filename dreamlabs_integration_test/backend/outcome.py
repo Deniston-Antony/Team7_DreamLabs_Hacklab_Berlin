@@ -24,15 +24,16 @@ SORTFLOW = Path(__file__).resolve().parents[2] / "SortFlow"
 # Appended, so `dream_control` and `yam_env` stay the ones main.py already imported from the installed example.
 if str(SORTFLOW) not in sys.path:
     sys.path.append(str(SORTFLOW))
+import capacity  # noqa: E402
 import livefeed  # noqa: E402
 import recording  # noqa: E402
 
 VIDEOS = Path(__file__).resolve().parent / "task_videos"
-MAX_ATTEMPTS = 8  # attempts in all, over every task of a request: the live one plus at most 7 workers
-STAGGER_S = 0.5  # between worker starts, so they do not open their Dream sessions in one burst
+MAX_ATTEMPTS = 9  # attempts in all, over every task of a request: the live one plus at most 8 workers
+STAGGER_S = 1.5  # between worker starts, so they do not open their Dream sessions in one burst
 CLIP = re.compile(r"^(attempt-[1-9][0-9]*|grid)$")  # the video names the API serves
 POLL_S = 0.5
-WAIT_AFTER_LIVE_S = 90  # how long past the time limit a worker may take to report
+WORKER_STARTUP_S = 30  # time a hidden attempt may take to load before its own movement clock starts
 STOP_GRACE_S = 10  # how long a stopped worker may take to close its video and report before it is killed
 
 
@@ -97,6 +98,9 @@ class Workers:
             environment = job.get("environment")
             job["scene"] = environment.save(folder) if environment is not None else (self.model_path, self.state_path)
         self.seconds = str(task["max_seconds"])
+        self.deadline = (
+            time.monotonic() + capacity.wall_limit(task["max_seconds"]) + WORKER_STARTUP_S + len(jobs) * STAGGER_S
+        )
         self.env = dict(os.environ)
         if sys.platform.startswith("linux"):
             self.env.setdefault("MUJOCO_GL", "egl")  # no window for a worker
@@ -222,10 +226,15 @@ class Workers:
                 self.stop()
                 return None
             time.sleep(POLL_S)
-        for proc in self.procs:
-            if proc.poll() is None:  # past the deadline: it will not report any more
-                proc.kill()
-        return self.collect()
+        overdue = any(proc.poll() is None for proc in self.procs)
+        if overdue:
+            self.stop()  # lets each late worker finish its video and evidence
+        records = self.collect()
+        if overdue:
+            for record in records:
+                if record.get("stopped"):
+                    record.update(stopped=False, error=None)
+        return records
 
 
 class Session:
@@ -289,7 +298,7 @@ class Session:
                 "sim_seconds": round(self.env.data.time - self.started, 1) if live_ok else None,
             }
         ]
-        ended = result.get("status") in ("CANCELLED", "FAILED")
+        ended = result.get("status") == "CANCELLED"  # a failed live run leaves the parallel runs to finish
         results[0]["stopped"] = result.get("status") == "CANCELLED"
         records = []
         if self.workers and ended:
@@ -298,7 +307,7 @@ class Session:
         elif self.workers:
             self.task["waiting_for_attempts"] = True
             records = self.workers.results(
-                self.task["max_seconds"] + WAIT_AFTER_LIVE_S, lambda: bool(self.task.get("cancel_requested"))
+                max(0.0, self.workers.deadline - time.monotonic()), lambda: bool(self.task.get("cancel_requested"))
             )
             self.task["waiting_for_attempts"] = False
             if records is None:
@@ -318,6 +327,7 @@ class Session:
                     "env": job["environment"].label if job.get("environment") is not None else None,
                 }
             )
+        self.task["finalizing"] = True
         entries = []
         for r in results:
             clip = self.folder / f"attempt-{r['attempt']}.mp4"
