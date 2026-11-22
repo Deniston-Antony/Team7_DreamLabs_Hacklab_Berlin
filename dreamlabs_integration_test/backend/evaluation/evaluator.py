@@ -221,6 +221,10 @@ def scene_understanding(task, evidence, verification, analysis):
 
 
 def perception_entry(task: TaskDefinition, evidence: Evidence) -> dict[str, str]:
+    judge = evidence.video_judge or {}
+    if judge.get("verdict") in ("PASS", "FAIL", "UNSURE"):
+        status = "NOT_MEASURED" if judge["verdict"] == "UNSURE" else judge["verdict"]
+        return coverage_entry(status, judge.get("reason") or "The video judge gave no reason.", "Run video judged by Claude")
     video = (evidence.vision or {}).get("video")
     if video and video.get("status"):
         return coverage_entry(video["status"], video["detail"], "Run video analysed with OWLv2")

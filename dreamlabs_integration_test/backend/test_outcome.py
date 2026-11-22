@@ -288,6 +288,25 @@ class OutcomeTest(unittest.TestCase):
         finally:
             outcome.SORTFLOW = self.keep[2]
 
+    def test_the_chosen_judge_sets_the_prompt_sent_to_dream(self):
+        from unittest import mock
+
+        seen = []
+        stand_in = model(apple_into_bowl=True, steps=20)
+
+        def run(argv, **kwargs):
+            seen.append(argv[0])
+            return stand_in(argv, **kwargs)
+
+        main.dc.main = run
+        self.client.post("/api/scene/reset")
+        with mock.patch.object(main.video_judge, "has_credentials", return_value=False):
+            refused = self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20, "judge": "claude"})
+        self.assertEqual(refused.status_code, 409)
+        reply = self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "max_seconds": 20, "judge": "offline"})
+        self.wait(reply.json()["task_id"])
+        self.assertEqual(seen, ["--task=put red apple into the white bowl"])
+
     def test_a_worker_that_stops_without_reporting_is_shown_as_ended(self):
         """No final status and no frames from a worker that dies at once: its dropdown entry says ended."""
         outcome.SORTFLOW = self.fake_workers("raise SystemExit(3)")

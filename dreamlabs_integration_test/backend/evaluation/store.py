@@ -63,6 +63,8 @@ class EvaluationStore:
                 data = json.loads(path.read_text())
                 task = TaskDefinition.model_validate(data["task"])
                 evidence = Evidence.model_validate(data["evidence"])
+                if (evidence.video_judge or {}).get("verdict") == "RUNNING":
+                    evidence.video_judge = {"verdict": "ERROR", "reason": "The backend restarted before this video was judged."}
                 result = TaskResult.model_validate(data["result"])
             except (OSError, ValueError, KeyError) as error:
                 self.load_errors.append(f"{path.name}: {type(error).__name__}")
@@ -140,6 +142,17 @@ class EvaluationStore:
             task, evidence, _ = record
             evidence.vision = vision
             result = evaluate_task(task, evidence, self.config)  # perception is read from the finished video analysis
+            self.records[task_id] = (task, evidence, result)
+            self._save(task, evidence, result)
+
+    def attach_video_judge(self, task_id: str, verdict: dict):
+        with self.lock:
+            record = self.records.get(task_id)
+            if record is None:
+                return
+            task, evidence, _ = record
+            evidence.video_judge = verdict
+            result = evaluate_task(task, evidence, self.config)  # the unscored perception note reads the verdict
             self.records[task_id] = (task, evidence, result)
             self._save(task, evidence, result)
 

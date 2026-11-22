@@ -7,6 +7,7 @@ import mujoco
 import numpy as np
 
 import environments
+from judges import task_prompt
 from evaluation.refinement import candidates, test_slots
 
 STEPS_M = (0.10, 0.08, 0.06, 0.04)
@@ -163,11 +164,12 @@ def apply_change(scene, item, seconds, by_attempt):
     return None
 
 
-def build_tests(folder, records, rules):
+def build_tests(folder, records, rules, judge="offline"):
     """Plan a run's tests from its saved scenes.
     @param folder The run's video folder, holding its saved scenes.
     @param records The run's (task, evidence, result) records.
     @param rules {"x", "y", "spacing", "clearance"} for where objects may be placed.
+    @param judge The video judge whose task prompt the tests use.
     @return {"tests", "untested", "problem"}; each test keeps its model path and state arrays.
     """
     by_attempt = {record[0].attempt: record for record in records}
@@ -194,10 +196,15 @@ def build_tests(folder, records, rules):
             return None, None
         return scene, files[0]
 
-    def record(item, scene, model_path, change, instruction, seconds):
+    def prompt_for(item, clearer=False):
+        written = by_attempt[item["source_attempt"]][0].instruction
+        return task_prompt(written, {"object": item["target"], "target": item["destination"]}, judge, clearer)
+
+    def record(item, scene, model_path, change, instruction, seconds, prompt):
         return {
             **{key: item[key] for key in ("kind", "label", "suggestion", "source_attempt", "source_scene", "target", "destination")},
             "instruction": instruction,
+            "prompt": prompt,
             "change": change,
             "max_seconds": seconds,
             "objects": [entry.object_id for entry in scene.snapshot.objects],
@@ -225,8 +232,11 @@ def build_tests(folder, records, rules):
         made = apply_change(scene, item, seconds, by_attempt)
         if made is None:
             continue
+        prompt = prompt_for(item, item["kind"] == "clearer_name")
+        if item["kind"] == "clearer_name" and prompt == prompt_for(item):
+            continue  # this judge's prompt already names the object clearly, so there is nothing to change
         used.add((item["source_attempt"], item["kind"]))
-        changes.append(record(item, scene, model_path, *made))
+        changes.append(record(item, scene, model_path, *made, prompt))
     if not changes:
         problem = "This older run did not save its starting scenes." if missing_scene else "None of this run's suggestions can be applied automatically."
         return {"tests": [], "untested": [], "problem": problem}
@@ -237,7 +247,7 @@ def build_tests(folder, records, rules):
         scene, model_path = open_scene(item)
         seconds = by_attempt[attempt][0].max_duration_seconds
         control = {**item, "kind": "control", "label": "Unchanged control", "suggestion": "No change: this measures normal run-to-run variation."}
-        controls.append(record(control, scene, model_path, "No change", by_attempt[attempt][0].instruction, seconds))
+        controls.append(record(control, scene, model_path, "No change", by_attempt[attempt][0].instruction, seconds, prompt_for(item)))
     tests = controls + changes
     for number, item in enumerate(tests, 1):
         item["test"] = number

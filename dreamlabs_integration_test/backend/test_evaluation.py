@@ -5,7 +5,8 @@ from pathlib import Path
 from evaluation import Evidence, TaskDefinition, evaluate_task, parse_instruction
 from evaluation.batch import aggregate
 from evaluation.insights import analyze_run, compare_groups, compare_scenes, failure_finding
-from evaluation.refinement import compare_tests
+from evaluation.refinement import compare_tests, judge_verdict
+from judges import task_prompt
 from evaluation.models import ContactEvent, Criterion, Environment, ObjectState, Snapshot
 from evaluation.reports import batch_html, task_html, task_report
 from evaluation.store import EvaluationStore
@@ -245,6 +246,35 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(store.batch_report(store.current_batch)["total_tasks"], 1)
             self.assertEqual(len(store.suggestion_results("source")), 1)
             self.assertEqual(store.run_report("tests")["refinement_of"], "source")
+
+    def test_video_judge_is_saved_without_changing_the_score(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = EvaluationStore(Path(folder))
+            item = task("put apple into the bowl", "j1").model_copy(update={"batch_id": store.current_batch, "run_id": "judge"})
+            before = store.submit(item, evidence(IN_BOWL, task_id="j1")).score
+            store.attach_video_judge("j1", {"verdict": "FAIL", "confidence": 0.9, "reason": "The apple is beside the bowl.", "agrees_with_sim": False})
+            report = store.run_report("judge")
+            self.assertEqual(report["attempts"][0]["result"]["score"], before)
+            self.assertEqual(report["attempts"][0]["result"]["scene_understanding"]["perception"]["status"], "FAIL")
+            self.assertTrue(any("disagrees" in row["title"] for row in report["insights"]["findings"]))
+            self.assertIn("Video judge", task_html(store.report("j1")))
+            store.attach_video_judge("j1", {"verdict": "RUNNING"})
+            self.assertEqual(EvaluationStore(Path(folder)).records["j1"][1].video_judge["verdict"], "ERROR")
+
+    def test_offline_movement_is_not_shown_as_task_success(self):
+        moved = evidence({}, final_contacts=[]).model_copy(update={"vision": {"status": "done", "video": {"status": "PASS", "target": "apple", "moved_objects": ["apple"]}}})
+        self.assertEqual(judge_verdict(moved), "Target moved")
+        still = moved.model_copy(update={"vision": {"status": "done", "video": {"status": "PARTIAL", "target": "apple", "moved_objects": []}}})
+        self.assertEqual(judge_verdict(still), "Target did not move")
+
+    def test_each_judge_builds_its_own_prompt(self):
+        goal = {"object": "apple", "target": "bowl"}
+        self.assertEqual(task_prompt("put apple into the bowl", goal, "offline"), "put red apple into the white bowl")
+        self.assertEqual(task_prompt("put apple into the bowl", goal, "claude"), "put apple into the bowl and let go so it rests there")
+        kept = task_prompt("put apple into the bowl without moving the banana", goal, "offline")
+        self.assertIn("without moving the banana", kept)
+        self.assertEqual(task_prompt("wave at the camera", None, "claude"), "wave at the camera")
+        self.assertEqual(task_prompt("put apple into the bowl and release it", goal, "claude"), "put apple into the bowl and release it")
 
     def test_instruction_parsing(self):
         parsed = parse_instruction("Put the apple in the bowl without moving the cup", IDS)

@@ -252,3 +252,9 @@ tr.run-row { cursor: pointer; }
 .dream-log-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
 .dream-log-head h3 { margin: 0; font-size: 13px; }
 .dream-log-toggle { flex: 0 0 auto; padding: 3px 10px; font-size: 12px; }
+.judge-picker { margin-bottom: 8px; }
+.judge-picker label { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: #39414a; }
+.judge-picker select { flex: 1; min-width: 0; font-weight: 500; }
+.judge-picker .hint { margin: 4px 0 0; }
+.prompt-preview { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; padding: 7px 9px; border: 1px solid #dfe3e6; border-radius: 5px; background: #f7f9fb; font-size: 12px; color: #39414a; overflow-wrap: anywhere; }
+.test-prompt { display: block; margin-top: 2px; color: #5f6871; font-size: 11px; }

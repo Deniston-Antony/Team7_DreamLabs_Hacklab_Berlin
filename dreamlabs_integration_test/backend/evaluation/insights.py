@@ -82,6 +82,8 @@ def attempt_facts(task: TaskDefinition, evidence: Evidence, result: TaskResult) 
         ]
         nearest = min(others) if others else None
     video = (evidence.vision or {}).get("video") or {}
+    judge = evidence.video_judge or {}
+    judged = judge.get("verdict") in ("PASS", "FAIL", "UNSURE")
     return {
         "attempt": task.attempt,
         "task_id": task.task_id,
@@ -109,9 +111,11 @@ def attempt_facts(task: TaskDefinition, evidence: Evidence, result: TaskResult) 
         "timer_s": None if evidence.duration_seconds is None else round(evidence.duration_seconds + (evidence.decision_seconds or 0.0) + (evidence.wait_seconds or 0.0), 2),
         "model_calls": evidence.model_calls,
         "disturbances": [incident.explanation for incident in result.incidents],
-        "video_status": video.get("status"),
-        "video_detail": video.get("detail"),
-        "video_moved": video.get("moved_objects"),
+        "video_status": judge["verdict"] if judged else video.get("status"),
+        "video_detail": judge.get("reason") if judged else video.get("detail"),
+        "video_moved": None if judged else video.get("moved_objects"),
+        "judge_verdict": judge["verdict"] if judged else None,
+        "judge_agrees": judge.get("agrees_with_sim") if judged else None,
     }
 
 
@@ -272,7 +276,16 @@ def analyze_run(records: list[Record]) -> dict[str, Any]:
                 "Keep this limit if the successes finish well before it. Raise it only if successes finish near the limit.",
             )
         )
-    wrong_video = [row for row in facts if row["video_status"] == "FAIL"]
+    disagreed = [row for row in facts if row["judge_agrees"] is False]
+    if disagreed:
+        findings.append(
+            finding(
+                "The video judge disagrees with the simulator",
+                "; ".join(f"Attempt {row['attempt']}: simulator {'passed' if row['stage'] == 'success' else 'did not pass'} it, video judge says {row['judge_verdict']}. {row['video_detail']}" for row in disagreed[:3]),
+                "Watch these videos before trusting their scores.",
+            )
+        )
+    wrong_video = [row for row in facts if row["video_status"] == "FAIL" and row["video_moved"] is not None]
     if wrong_video:
         findings.append(
             finding(

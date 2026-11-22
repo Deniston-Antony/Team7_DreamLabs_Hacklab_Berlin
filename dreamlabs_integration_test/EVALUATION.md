@@ -84,9 +84,14 @@ Each test starts from the failed attempt's saved scene and makes one change: mov
 
 Tests are stored with the run but do not change its benchmark score. They do not retrain Dream-1, and each change is tried once, so repeat a promising result before relying on it.
 
-## Video perception
+## Video judges
 
-Dream-1 returns actions, not its detections. After a run, OWLv2 samples 10 frames from each attempt's video and tracks which objects moved. This is shown as **Perception (from video)**, is not scored, and describes observed behaviour rather than the model's internal understanding. On 36 object checks from real runs, it matched MuJoCo's movement data in 35.
+Each run uses the judge selected on the website. The judge also decides the task prompt sent to Dream-1, and reports show that prompt.
+
+- **Offline judge:** OWLv2 samples 10 frames from each attempt's video and tracks which objects moved. Its prompt uses camera-visible names, such as `put red apple into the white bowl`.
+- **Claude judge:** `video_judge.py` sends 8 frames from each attempt's video to Claude, half from the final 15%. Claude returns Pass, Fail or Unsure with a confidence and reason, and a disagreement with the simulator is flagged. Its prompt asks the robot to let go, such as `put apple into the bowl and let go so it rests there`.
+
+Neither judge changes the score. Both describe visible behaviour rather than Dream-1's internal understanding. In suggestion tests, the unchanged control uses the selected judge's prompt, so each change can still be compared with the control.
 
 ## Timing and Dream-1 capacity
 
@@ -97,12 +102,13 @@ When Dream-1 reports no capacity, the attempt holds still and retries with incre
 ## Limitations
 
 - Dream-1's API returns arm actions, not detections or attention maps, so video perception is evidence of behaviour and does not prove what the model recognised.
-- The vision check runs locally after the task and is not scored. On 108 first-frame simulator checks it reached 94% agreement with MuJoCo visibility, with 6 missed objects and no false detections.
+- The Claude judge needs an Anthropic credential and uses API credits. The offline judge needs its local model. Either can be wrong, so review flagged videos.
+- Prompts differ by judge, so scores from different judges are not a clean model comparison without a control.
 - Contacts are sampled at control steps, so very brief contacts can be missed.
 - Uploaded STL collisions use a convex shape.
 - A small number of runs does not establish statistically meaningful performance.
 
-Install the optional vision model from `backend`:
+Install the optional offline judge from `backend`:
 
 ```bash
 uv venv --python 3.12 .vision-venv

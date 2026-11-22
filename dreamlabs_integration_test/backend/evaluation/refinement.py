@@ -48,12 +48,35 @@ def test_slots(attempts: int) -> tuple[int, int]:
     return slots, 2 if slots >= 6 else 1
 
 
+def judge_pending(evidence) -> bool:
+    return (evidence.video_judge or {}).get("verdict") == "RUNNING" or (evidence.vision or {}).get("status") == "running"
+
+
+def judge_verdict(evidence) -> str | None:
+    """What the run's video judge said. The offline judge reports movement, so it never claims the task passed."""
+    if judge_pending(evidence):
+        return "RUNNING"
+    if evidence.video_judge:
+        return evidence.video_judge.get("verdict")
+    vision = evidence.vision or {}
+    video = vision.get("video") or {}
+    if video.get("status") == "PASS":
+        return "Target moved"
+    if video.get("status") == "FAIL":
+        return "Wrong object moved"
+    if video.get("status") == "PARTIAL":
+        return "Target and others moved" if video.get("target") in (video.get("moved_objects") or []) else "Target did not move"
+    if video.get("status"):
+        return "Not measured"
+    return None if vision.get("status") == "done" else vision.get("status")
+
+
 def blocked_reason(records: list[Record]) -> str | None:
     if not records:
         return "This run has no report yet."
     if any(task.refinement_of for task, _, _ in records):
         return "This run is already a suggestion test."
-    if any((evidence.vision or {}).get("status") == "running" for _, evidence, _ in records):
+    if any(judge_pending(evidence) for _, evidence, _ in records):
         return "The benchmark is still analysing this run's videos."
     if any(evidence.execution_status == "CANCELLED" for _, evidence, _ in records):
         return "This run was stopped early. Run it to the end before testing suggestions."
@@ -117,8 +140,9 @@ def group_stats(rows: list[dict[str, Any]], score: str, success: str) -> dict[st
 def compare_tests(source_records: list[Record], test_records: list[Record]) -> dict[str, Any]:
     """Compare each test with the attempt it came from, after removing the change seen in the unchanged control."""
     before = {task.attempt: result for task, _, result in source_records}
+    original_prompts = {task.attempt: task.robot_prompt or task.instruction for task, _, _ in source_records}
     rows = []
-    for task, _, result in sorted(test_records, key=lambda record: record[0].attempt):
+    for task, evidence, result in sorted(test_records, key=lambda record: record[0].attempt):
         origin = before.get(task.source_attempt)
         rows.append(
             {
@@ -129,6 +153,9 @@ def compare_tests(source_records: list[Record], test_records: list[Record]) -> d
                 "change": task.test_change,
                 "suggestion": task.test_suggestion,
                 "instruction": task.instruction,
+                "judge": task.judge,
+                "prompt": task.robot_prompt or task.instruction,
+                "judge_verdict": judge_verdict(evidence),
                 "source_attempt": task.source_attempt,
                 "before_score": origin.score if origin else None,
                 "before_outcome": origin.outcome if origin else None,
@@ -166,7 +193,12 @@ def compare_tests(source_records: list[Record], test_records: list[Record]) -> d
         recommendation = f"No suggestion beat the unchanged control, which itself gained {control_gain:g} points. Treat these differences as run-to-run variation."
     else:
         recommendation = "No suggestion clearly helped in this test."
+    note = "Each suggestion was tried once, so repeat a promising change before relying on it. A change can make the task easier without improving Dream-1 itself."
+    if any(row["kind"] == "control" and row["prompt"] != original_prompts.get(row["source_attempt"]) for row in rows):
+        note += " These tests used a different task prompt from the original attempt. The control used the same new prompt, so compare each change with the control."
     return {
+        "judge": next((row["judge"] for row in rows if row["judge"]), None),
+        "judging": any(judge_pending(evidence) for _, evidence, _ in test_records),
         "before": group_stats(changes, "before_score", "before_success"),
         "after": group_stats(changes, "after_score", "after_success"),
         "control": group_stats([row for row in rows if row["kind"] == "control"], "after_score", "after_success"),
@@ -174,5 +206,5 @@ def compare_tests(source_records: list[Record], test_records: list[Record]) -> d
         "rows": rows,
         "best_attempt": helped[0]["attempt"] if helped else None,
         "recommendation": recommendation,
-        "note": "Each suggestion was tried once, so repeat a promising change before relying on it. A change can make the task easier without improving Dream-1 itself.",
+        "note": note,
     }

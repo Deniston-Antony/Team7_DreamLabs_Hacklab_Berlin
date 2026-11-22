@@ -72,6 +72,8 @@ class TaskDefinition(BaseModel):
     test_kind: str | None = None
     test_change: str | None = None
     test_suggestion: str | None = None
+    judge: Literal["offline", "claude"] | None = None
+    robot_prompt: str | None = None
 
     @property
     def run(self) -> str:
@@ -101,7 +103,8 @@ class Evidence(BaseModel):
     model_output_keys: list[str] = Field(default_factory=list)
     frames: dict[str, str] = Field(default_factory=dict)
     visible_pixels: dict[str, dict[str, int]] = Field(default_factory=dict)
-    vision: dict[str, Any] | None = None
+    vision: dict[str, Any] | None = None  # the earlier OWLv2 check, kept so saved reports still show it
+    video_judge: dict[str, Any] | None = None
     hidden_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 

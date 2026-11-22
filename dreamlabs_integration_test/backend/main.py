@@ -11,6 +11,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 
 import cv2
 import dream_examples
@@ -18,6 +19,7 @@ import dream_ik
 import mujoco
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -28,6 +30,8 @@ import outcome  # noqa: E402
 import capacity  # noqa: E402
 import dream_client_log  # noqa: E402
 import roundtrip_log  # noqa: E402  (SortFlow's; outcome puts SortFlow on the path)
+import video_judge  # noqa: E402
+import judges  # noqa: E402
 import evaluation  # noqa: E402
 import environments  # noqa: E402
 import scene_saves  # noqa: E402
@@ -45,6 +49,9 @@ STREAM_PERIOD_S = 0.1
 JPEG_QUALITY = 70
 WAITING_AFTER_S = 0.3
 ALLOWED_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
+PUBLIC_ORIGIN = os.environ.get("DREAM_PUBLIC_ORIGIN", "").rstrip("/")  # the hosted address, behind its login
+if PUBLIC_ORIGIN:
+    ALLOWED_ORIGINS.add(PUBLIC_ORIGIN)
 MAX_TASK_SECONDS = 200
 DEFAULT_TASK_SECONDS = 120
 SUGGESTION_COST_PER_120S = 0.07  # the website's displayed estimate
@@ -786,6 +793,9 @@ class ViewPoint(BaseModel):
     v: float = Field(ge=0, le=RENDER_HEIGHT - 2 * RENDER_CROP_TOP)
 
 
+JudgeName = Literal["offline", "claude"]
+
+
 class SubTask(BaseModel):
     instruction: str = Field(min_length=1, max_length=500)
     attempts: int = Field(default=1, ge=1, le=outcome.MAX_ATTEMPTS)
@@ -800,10 +810,17 @@ class ExecuteTask(BaseModel):
     # What the parallel runs start from: a copy of the live scene, shuffled positions, or shuffled + other styles.
     environments: str = Field(default="same", pattern="^(same|shuffle|shuffle_style)$")
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    judge: JudgeName | None = None  # None keeps the instruction exactly as written, for API callers
 
 
 class SuggestionChoice(BaseModel):
     tests: list[int] = Field(min_length=1, max_length=8)
+    judge: JudgeName = "offline"
+
+
+class JudgePreview(BaseModel):
+    judge: JudgeName
+    instructions: list[str] = Field(min_length=1, max_length=outcome.MAX_ATTEMPTS)
 
 
 class PrepareEnvironments(BaseModel):
@@ -1097,6 +1114,8 @@ def task_definition(task):
         unresolved=parsed.unresolved,
         max_duration_seconds=task["max_seconds"],
         started_at=task["started_at"],
+        judge=task.get("judge"),
+        robot_prompt=next((entry.get("prompt") for entry in task.get("plan", []) if entry["instruction"] == task["instruction"]), None),
         run_id=task["task_id"],
         scene_number=1,
         scene_label="Scene 1: live layout",
@@ -1158,7 +1177,8 @@ def evaluate_run(task, definition, capture, result):
             }
         )
         evaluations.submit(attempt, proof)
-    vision_checks.submit(task["task_id"], folder)
+    if task.get("judge") != "claude":
+        vision_checks.submit(task["task_id"], folder)
     run = evaluations.run_report(task["task_id"])["run"]
     return {
         "outcome": run["outcome"],
@@ -1217,7 +1237,7 @@ def run_task(task, stop):
         session = outcome.Session(task, sim.env, goals, envs, sim.managed(), clock)
         try:
             dc.main(
-                [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(capacity.wall_limit(task["max_seconds"]))],
+                [f"--task={task['plan'][0].get('prompt') or task['instruction']}", "--headless", "--quiet", "--seconds", str(capacity.wall_limit(task["max_seconds"]))],
                 shared_env=sim.env,
                 stop_event=stop,
             )
@@ -1279,6 +1299,41 @@ def run_task(task, stop):
         active_dream_log = None
         dream_client_log.release(client_log)
         task.update(result, finished_at=finished_at)
+        if task.get("judge") == "claude":  # judged in the background while the robot is free for the next task
+            judge_videos(task)
+
+
+def judge_videos(task, only=None):
+    """Send a finished run's videos to the video judge and save each verdict in its attempt's report."""
+    try:
+        ids = {record[0].attempt: record[0].task_id for record in evaluations.run_records(task["task_id"])}
+        if only is not None:
+            ids = {number: value for number, value in ids.items() if number in only}
+        for task_id in ids.values():
+            evaluations.attach_video_judge(task_id, {"verdict": "RUNNING"})
+
+        def save(number, verdict):
+            if number in ids:
+                evaluations.attach_video_judge(ids[number], verdict)
+
+        def finish(state):
+            judged = {int(item["video"].split("-")[1]) for item in state.get("attempts", [])}
+            for number, task_id in ids.items():
+                if number not in judged:
+                    evaluations.attach_video_judge(task_id, {"verdict": "SKIPPED", "reason": state.get("reason") or "this attempt has no saved video"})
+
+        video_judge.submit(task, outcome.VIDEOS, on_attempt=save, on_done=finish, only=only)
+        if task["video_judge"]["status"] == "SKIPPED":
+            finish(task["video_judge"])
+    except Exception as error:  # a judging problem must never affect the robot run or its score
+        task["video_judge"] = {"status": "ERROR", "reason": f"{type(error).__name__}: {error}", "attempts": []}
+
+
+def video_judgements(limit=5):
+    """The newest finished tasks' video verdicts, so they stay on screen while the robot runs the next task."""
+    judged = [t for t in tasks.values() if t.get("video_judge")]
+    judged.sort(key=lambda t: t.get("finished_at") or 0, reverse=True)
+    return [{"task_id": t["task_id"], "instruction": t["instruction"], **t["video_judge"]} for t in judged[:limit]]
 
 
 def task_view(task):
@@ -1694,8 +1749,15 @@ async def execute_task(body: ExecuteTask):
         raise HTTPException(422, f"{total} attempts in all; the limit is {outcome.MAX_ATTEMPTS}.")
     if active_task is not None:
         raise HTTPException(409, "A task is already running.")
+    if body.judge == "claude" and not video_judge.has_credentials():
+        raise HTTPException(409, "The Claude judge needs ANTHROPIC_API_KEY in the backend terminal.")
+    goals = await on_sim(plan_goals, plan)
+    if active_task is not None:
+        raise HTTPException(409, "A task is already running.")
+    for entry, goal in zip(plan, goals):
+        entry["prompt"] = judges.task_prompt(entry["instruction"], goal, body.judge) if body.judge else entry["instruction"]
     if len(plan) > 1:  # a suite judges every task, so each must be one the checker understands
-        unchecked = [n for n, goal in enumerate(await on_sim(plan_goals, plan), 1) if goal is None]
+        unchecked = [n for n, goal in enumerate(goals, 1) if goal is None]
         if unchecked:
             lines = "; ".join(f"task {n}: {plan[n - 1]['instruction']!r}" for n in unchecked)
             raise HTTPException(422, f"Cannot check {lines}. Use the form: put <object> into/on the <bowl or plate>.")
@@ -1717,6 +1779,7 @@ async def execute_task(body: ExecuteTask):
         "evaluation_error": None,
         "environments": body.environments,
         "seed": body.seed if body.seed is not None else random.randrange(2**31),
+        "judge": body.judge,
     }
     tasks[task["task_id"]] = task
     active_task = task
@@ -1762,23 +1825,74 @@ def build_combined_video(run_id, path):
 
 @app.post("/api/reports/runs/{run_id}/analyze-videos")
 def analyze_run_videos(run_id: str):
-    """Analyse an older run's videos with the vision model."""
+    """Send a saved run's unjudged videos to the judge that run used."""
     if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
         raise HTTPException(404, "No report exists for this run.")
-    return {"queued": vision_checks.submit(run_id, outcome.VIDEOS / run_id, only_missing=True)}
+    records = evaluations.run_records(run_id)
+    if saved_judge(records) == "offline":
+        return {"queued": vision_checks.submit(run_id, outcome.VIDEOS / run_id, only_missing=True)}
+    if any((evidence.video_judge or {}).get("verdict") == "RUNNING" for _, evidence, _ in records):
+        return {"queued": 0}
+    waiting = {
+        item.attempt
+        for item, evidence, _ in records
+        if evidence.videos and (evidence.video_judge or {}).get("verdict") not in ("PASS", "FAIL", "UNSURE")
+    }
+    if not waiting:
+        return {"queued": 0}
+    saved = {
+        "task_id": run_id,
+        "instruction": records[0][0].instruction,
+        "status": "COMPLETED",
+        "finished_at": time.time(),
+        "plan": [{"instruction": item.instruction, "prompt": item.robot_prompt, "attempts": 1} for item, _, _ in records],
+        "attempt_results": [
+            {"attempt": item.attempt, "task": index, "success": None if result.outcome == "NOT_EVALUABLE" else result.outcome == "SUCCESS"}
+            for index, (item, _, result) in enumerate(records, 1)
+        ],
+    }
+    judge_videos(saved, waiting)
+    return {"queued": 0 if saved["video_judge"]["status"] == "SKIPPED" else len(waiting)}
 
 
 def suggestion_rules():
     return {"x": SHUFFLE_X, "y": SHUFFLE_Y, "spacing": SHUFFLE_SPACING_M, "clearance": dict(FIXED_CLEARANCE_M)}
 
 
-def plan_suggestions(run_id):
-    """A finished run's one-change tests, or why they cannot start."""
+def saved_judge(records):
+    """The judge a saved run used; runs from before the choice existed are read from their evidence."""
+    named = next((record[0].judge for record in records if record[0].judge), None)
+    return named or ("claude" if any(record[1].video_judge for record in records) else "offline")
+
+
+@app.get("/api/judges")
+def list_judges():
+    offline_ready = os.environ.get("DREAM_VISION") != "off" and vision_checks.python.exists()
+    claude_ready = video_judge.has_credentials()
+    reasons = {
+        "offline": None if offline_ready else "The offline vision model is not installed.",
+        "claude": None if claude_ready else "Set ANTHROPIC_API_KEY in the backend terminal.",
+    }
+    ready = {"offline": offline_ready, "claude": claude_ready}
+    return {"judges": [{"id": key, **value, "available": ready[key], "reason": reasons[key]} for key, value in judges.JUDGES.items()]}
+
+
+@app.post("/api/judges/preview")
+async def preview_judge_prompts(body: JudgePreview):
+    if active_task is not None:
+        raise HTTPException(409, "A task is running.")
+    plan = [{"instruction": text.strip(), "attempts": 1} for text in body.instructions]
+    goals = await on_sim(plan_goals, plan)
+    return {"prompts": [judges.task_prompt(entry["instruction"], goal, body.judge) if entry["instruction"] else "" for entry, goal in zip(plan, goals)]}
+
+
+def plan_suggestions(run_id, judge="offline"):
+    """A finished run's one-change tests for a judge, or why they cannot start."""
     records = evaluations.run_records(run_id)
     reason = evaluation.refinement.blocked_reason(records)
     if reason:
         return {"tests": [], "untested": [], "problem": reason}
-    return suggestions.build_tests(outcome.VIDEOS / run_id, records, suggestion_rules())
+    return suggestions.build_tests(outcome.VIDEOS / run_id, records, suggestion_rules(), judge)
 
 
 def run_suggestions(task, stop, tests):
@@ -1810,6 +1924,8 @@ def run_suggestions(task, stop, tests):
         active_task = None
         active_stop = None
         task.update(result, finished_at=finished_at)
+        if result.get("status") == "COMPLETED" and task.get("judge") == "claude":
+            judge_videos(task)
 
 
 def evaluate_suggestions(task, tests, result):
@@ -1839,10 +1955,13 @@ def evaluate_suggestions(task, tests, result):
                 "test_kind": test["kind"],
                 "test_change": test["change"],
                 "test_suggestion": test["suggestion"],
+                "judge": task.get("judge"),
+                "robot_prompt": test["prompt"],
             }
         )
         evaluations.submit(definition, proof)
-    vision_checks.submit(task["task_id"], folder)
+    if task.get("judge") != "claude":
+        vision_checks.submit(task["task_id"], folder)
     run = evaluations.run_report(task["task_id"])["run"]
     return {
         "outcome": run["outcome"],
@@ -1855,18 +1974,19 @@ def evaluate_suggestions(task, tests, result):
 
 
 @app.get("/api/reports/runs/{run_id}/suggestion-tests")
-async def suggestion_tests(run_id: str):
+async def suggestion_tests(run_id: str, judge: JudgeName = "offline"):
     if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
         raise HTTPException(404, "No report exists for this run.")
     results = evaluations.suggestion_results(run_id)
+    source_judge = saved_judge(evaluations.run_records(run_id))
     if active_task is not None:
         mine = active_task.get("refinement_of") == run_id
         running = {"task_id": active_task["task_id"], "phase": live_phase()} if mine else None
         reason = "Suggestion tests are running." if mine else "Wait for the current run to finish."
-        return {"ready": False, "reason": reason, "tests": active_task.get("tests", []) if mine else [], "untested": [], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": running, "results": results}
-    plan = await asyncio.to_thread(plan_suggestions, run_id)
+        return {"ready": False, "reason": reason, "tests": active_task.get("tests", []) if mine else [], "untested": [], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": running, "results": results, "source_judge": source_judge}
+    plan = await asyncio.to_thread(plan_suggestions, run_id, judge)
     tests = [suggestions.public(test) for test in plan["tests"]]
-    return {"ready": bool(tests), "reason": plan["problem"], "tests": tests, "untested": plan["untested"], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": None, "results": results}
+    return {"ready": bool(tests), "reason": plan["problem"], "tests": tests, "untested": plan["untested"], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": None, "results": results, "source_judge": source_judge}
 
 
 @app.post("/api/reports/runs/{run_id}/suggestion-tests", status_code=202)
@@ -1876,7 +1996,9 @@ async def start_suggestion_tests(run_id: str, body: SuggestionChoice):
         raise HTTPException(404, "No report exists for this run.")
     if active_task is not None:
         raise HTTPException(409, "A task is already running.")
-    plan = await asyncio.to_thread(plan_suggestions, run_id)
+    if body.judge == "claude" and not video_judge.has_credentials():
+        raise HTTPException(409, "The Claude judge needs ANTHROPIC_API_KEY in the backend terminal.")
+    plan = await asyncio.to_thread(plan_suggestions, run_id, body.judge)
     if plan["problem"] or not plan["tests"]:
         raise HTTPException(409, plan["problem"] or "There is nothing to test.")
     if active_task is not None:
@@ -1890,7 +2012,7 @@ async def start_suggestion_tests(run_id: str, body: SuggestionChoice):
     task = {
         "task_id": uuid.uuid4().hex[:12],
         "instruction": f"Suggestion tests for {source.instruction}",
-        "plan": [{"instruction": test["instruction"], "attempts": 1} for test in tests],
+        "plan": [{"instruction": test["instruction"], "prompt": test["prompt"], "attempts": 1} for test in tests],
         "max_seconds": max(test["max_seconds"] for test in tests),
         "status": "RUNNING",
         "started_at": time.time(),
@@ -1906,6 +2028,7 @@ async def start_suggestion_tests(run_id: str, body: SuggestionChoice):
         "environments": "same",
         "seed": 0,
         "suggestion_test": True,
+        "judge": body.judge,
         "refinement_of": run_id,
         "tests": public,
     }
@@ -2003,6 +2126,7 @@ async def live(socket: WebSocket):
                     "selected": sim.selected,
                     "phase": live_phase(),
                     "task": task_view(task),
+                    "video_judgements": video_judgements(),
                     "objects": feed.objects,
                     **outcome.viewed_objects(attempt),
                     "robot": feed.robot,
@@ -2021,3 +2145,8 @@ async def live(socket: WebSocket):
         pass
     finally:
         receiver.cancel()
+
+
+WEBSITE = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if PUBLIC_ORIGIN and WEBSITE.is_dir():  # hosted: one address serves the built website and the API
+    app.mount("/", StaticFiles(directory=WEBSITE, html=True), name="website")
