@@ -3,8 +3,10 @@ from .evaluator import evaluate_task
 from .evidence import EvidenceCapture
 from .instructions import parse_instruction
 from .models import Evidence, TaskDefinition, TaskResult
+from . import refinement
 from .routes import create_router
 from .store import EvaluationStore
+from .vision import VisionQueue
 
 __all__ = [
     "DEFAULT_CONFIG",
@@ -14,6 +16,7 @@ __all__ = [
     "ScoringConfig",
     "TaskDefinition",
     "TaskResult",
+    "VisionQueue",
     "create_router",
     "evaluate_task",
     "parse_instruction",

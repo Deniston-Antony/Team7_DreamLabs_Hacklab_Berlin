@@ -19,6 +19,7 @@ from PIL import Image
 
 CAMERAS = ("top", "left", "right")
 STATUS = 0
+FREE = 4
 HEADER = struct.Struct(">BI")
 EVERY = 4  # send one frame in this many renders: dream_control renders every 50 ms step, so 5 frames per second
 QUALITY = 70
@@ -27,7 +28,9 @@ STATUS_EVERY_S = 0.5
 
 def kind_name(kind):
     """The camera name of a frame kind, or "status" for kind 0."""
-    return "status" if kind == STATUS else CAMERAS[kind - 1]
+    if kind == STATUS:
+        return "status"
+    return "free" if kind == FREE else CAMERAS[kind - 1]
 
 
 def pack(kind, payload):
@@ -107,13 +110,15 @@ class Sender(threading.Thread):
 class Attached:
     """A Sender fed by an environment's own camera renders."""
 
-    def __init__(self, env, stream, every=EVERY):
+    def __init__(self, env, stream, every=EVERY, free=None):
         """Start streaming `env`'s three cameras.
         @param env Simulation environment whose images() is wrapped.
         @param stream A binary file object opened for writing.
         @param every Send one frame in this many renders.
+        @param free Optional callable returning an RGB image of the 3D view, or None when nobody is watching it.
         """
         self.env, self.sender, self.every = env, Sender(stream), every
+        self.free = free
         self.renders, self.last_status, self.state, self.extra = 0, 0.0, "running", {}
         original = env.images
         self._wrapped_before = "images" in env.__dict__
@@ -124,6 +129,9 @@ class Attached:
             if self.renders % self.every == 1:
                 for index, name in enumerate(CAMERAS, 1):
                     self.sender.put(index, result[name])
+                view = self.free() if self.free else None
+                if view is not None:
+                    self.sender.put(FREE, view)
             now = time.monotonic()
             if now - self.last_status >= STATUS_EVERY_S:
                 self.last_status = now
@@ -148,11 +156,12 @@ class Attached:
         self.sender.close()
 
 
-def attach(env, stream, every=EVERY):
+def attach(env, stream, every=EVERY, free=None):
     """Stream an environment's cameras to a pipe until the returned object's close().
     @param env Simulation environment.
     @param stream A binary file object opened for writing.
     @param every Send one frame in this many renders.
+    @param free Optional callable returning an RGB image of the 3D view.
     @return An Attached; call status() with the outcome and close() when the run ends.
     """
-    return Attached(env, stream, every)
+    return Attached(env, stream, every, free)

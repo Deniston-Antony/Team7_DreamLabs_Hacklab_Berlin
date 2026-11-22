@@ -8,3 +8,5 @@ frontend/dist/
 backend/task_videos/
 backend/evaluation_data/
 backend/scene_saves/
+backend/.vision-venv/
+backend/.vision-cache/

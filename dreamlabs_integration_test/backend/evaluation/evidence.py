@@ -1,7 +1,9 @@
 import time
+from pathlib import Path
 
 import mujoco
 import numpy as np
+from PIL import Image
 
 from .models import ContactEvent, Environment, Evidence, ObjectState, Snapshot
 
@@ -15,12 +17,14 @@ CORNERS = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)
 
 
 class EvidenceCapture:
-    def __init__(self, env, object_ids, startup_steps):
+    def __init__(self, env, object_ids, startup_steps, frames_dir=None):
         self.env = env
         self.object_ids = list(object_ids)
         self.startup_steps = startup_steps
         self.steps = 0
         self.model_calls = None
+        self.decision_seconds = None
+        self.wait_seconds = None
         self.started = time.monotonic()
         self.bodies = {name: env.model.body(name).id for name in self.object_ids}
         self.names = {body_id: name for name, body_id in self.bodies.items()}
@@ -36,6 +40,9 @@ class EvidenceCapture:
         self.min_tcp_distance: dict[str, float] = {}
         self.first_reached: dict[str, float] = {}
         self.model_output_keys: set[str] = set()
+        self.frames_dir = Path(frames_dir) if frames_dir else None
+        self.frames: dict[str, str] = {}
+        self.visible_pixels: dict[str, dict[str, int]] = {}
         self.initial, _ = self._settled("initial")
         self.max_heights = {item.object_id: item.position[2] for item in self.initial.objects}
 
@@ -78,7 +85,33 @@ class EvidenceCapture:
             pairs.add(tuple(sorted((a, b))))
         return pairs
 
-    def on_step(self):
+    def _save_frames(self, images):
+        m, d = self.env.model, self.env.data
+        renderer = self.env.renderer
+        self.frames_dir.mkdir(parents=True, exist_ok=True)
+        frames, pixels = {}, {}
+        for camera, image in images.items():
+            Image.fromarray(image).save(self.frames_dir / f"{camera}.jpg", quality=92)
+            frames[camera] = f"{self.frames_dir.name}/{camera}.jpg"
+            renderer.enable_segmentation_rendering()
+            try:
+                renderer.update_scene(d, camera=camera)
+                segmentation = renderer.render()[60:420]
+            finally:
+                renderer.disable_segmentation_rendering()
+            geoms = segmentation[..., 0][segmentation[..., 1] == mujoco.mjtObj.mjOBJ_GEOM]
+            pixels[camera] = {
+                name: int(np.isin(geoms, np.flatnonzero(m.body_rootid[m.geom_bodyid] == body_id)).sum())
+                for name, body_id in self.bodies.items()
+            }
+        self.frames, self.visible_pixels = frames, pixels
+
+    def on_step(self, images=None):
+        if images is not None and self.frames_dir is not None and not self.frames:
+            try:
+                self._save_frames(images)
+            except Exception:  # a vision-frame problem must never stop the robot run
+                self.frames_dir = None
         d = self.env.data
         self.steps += 1
         now = float(d.time)
@@ -182,6 +215,8 @@ class EvidenceCapture:
             trajectory=self.trajectory,
             max_heights=self.max_heights,
             duration_seconds=round(actions * CONTROL_STEP_S, 2),
+            decision_seconds=self.decision_seconds,
+            wait_seconds=self.wait_seconds,
             wall_seconds=round(time.monotonic() - self.started, 2),
             action_count=actions,
             model_calls=self.model_calls,
@@ -196,4 +231,6 @@ class EvidenceCapture:
                 "first_reached_s": self.first_reached,
             },
             model_output_keys=sorted(self.model_output_keys),
+            frames=self.frames,
+            visible_pixels=self.visible_pixels,
         )

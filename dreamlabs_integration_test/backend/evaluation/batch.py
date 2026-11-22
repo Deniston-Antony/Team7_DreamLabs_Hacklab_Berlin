@@ -42,9 +42,23 @@ def summarize_run(rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[st
         outcome = "PARTIAL_SUCCESS"
     else:
         outcome = "FAILURE"
+    instructions = list(dict.fromkeys(task.instruction for task, _, _ in ordered))
+    title = first.instruction if len(instructions) == 1 else f"{len(instructions)} tasks: " + " · ".join(instructions)
+    task_groups = []
+    for instruction in instructions:
+        mine = [result for task, result, _ in ordered if task.instruction == instruction]
+        points = [result.score for result in mine if result.score is not None]
+        task_groups.append(
+            {
+                "instruction": instruction,
+                "attempts": len(mine),
+                "succeeded": sum(result.outcome == "SUCCESS" for result in mine),
+                "average_score": round(mean(points), 2) if points else None,
+            }
+        )
     advice = []
     if len(ordered) > 1 and evaluable:
-        advice.append(f"{successes} of {len(evaluable)} scored attempts succeeded for '{first.instruction}'.")
+        advice.append(f"{successes} of {len(evaluable)} scored attempts succeeded for '{title}'.")
         if 0 < successes < len(evaluable):
             best = max((row for row in ordered if row[1].score is not None), key=lambda row: row[1].score)
             advice.append(f"Compare attempt {best[0].attempt} with the failed attempts to see which approach worked.")
@@ -53,7 +67,8 @@ def summarize_run(rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[st
     return {
         "run_id": first.run,
         "batch_id": first.batch_id,
-        "instruction": first.instruction,
+        "instruction": title,
+        "task_groups": task_groups,
         "scene_id": first.scene_id,
         "robot_id": first.robot_id,
         "started_at": first.started_at,
@@ -69,6 +84,8 @@ def summarize_run(rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[st
                 "attempt": task.attempt,
                 "where": task.where,
                 "task_id": task.task_id,
+                "instruction": task.instruction,
+                "scene_id": task.scene_id,
                 "execution_status": status,
                 "outcome": result.outcome,
                 "score": result.score,
@@ -82,6 +99,23 @@ def summarize_run(rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[st
 
 
 def aggregate(batch_id: str, rows: list[tuple[TaskDefinition, TaskResult, str]]) -> dict[str, Any]:
+    by_instruction: dict[str, list[TaskResult]] = {}
+    for task, result, _ in rows:
+        by_instruction.setdefault(task.instruction, []).append(result)
+    task_ranking = sorted(
+        (
+            {
+                "instruction": instruction,
+                "attempts": len(items),
+                "successes": sum(item.outcome == "SUCCESS" for item in items),
+                "average_score": round(mean([item.score for item in items if item.score is not None]), 2)
+                if any(item.score is not None for item in items)
+                else None,
+            }
+            for instruction, items in by_instruction.items()
+        ),
+        key=lambda item: (item["average_score"] is None, -(item["average_score"] or 0), -item["successes"]),
+    )
     grouped: dict[str, list[tuple[TaskDefinition, TaskResult, str]]] = {}
     for row in rows:
         grouped.setdefault(row[0].run, []).append(row)
@@ -120,6 +154,7 @@ def aggregate(batch_id: str, rows: list[tuple[TaskDefinition, TaskResult, str]])
         "first_started_at": min(started) if started else None,
         "last_started_at": max(started) if started else None,
         "total_runs": len(runs),
+        "task_ranking": task_ranking,
         "runs": runs,
         "total_tasks": total,
         "successful": outcomes["SUCCESS"],

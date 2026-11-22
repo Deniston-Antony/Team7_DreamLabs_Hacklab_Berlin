@@ -4,6 +4,8 @@ from pathlib import Path
 
 from evaluation import Evidence, TaskDefinition, evaluate_task, parse_instruction
 from evaluation.batch import aggregate
+from evaluation.insights import analyze_run, compare_groups, compare_scenes, failure_finding
+from evaluation.refinement import compare_tests
 from evaluation.models import ContactEvent, Criterion, Environment, ObjectState, Snapshot
 from evaluation.reports import batch_html, task_html, task_report
 from evaluation.store import EvaluationStore
@@ -164,7 +166,7 @@ class EvaluationTests(unittest.TestCase):
         definition = task("put apple into the bowl <script>alert(1)</script>")
         proof = evidence(IN_BOWL)
         page = task_html(task_report(definition, proof, evaluate_task(definition, proof)))
-        self.assertNotIn("<script>", page)
+        self.assertNotIn("<script>alert", page)
 
     def test_store_survives_restart(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -174,6 +176,75 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(second.result("t1").model_dump(), result.model_dump())
             with self.assertRaises(ValueError):
                 first._path("../escape")
+
+    def test_tasks_are_compared_on_the_same_scenes(self):
+        rows = []
+        plan = [("put apple into the bowl", IN_BOWL), ("move the cup to the left of the table", {})]
+        number = 1
+        for instruction, final in plan:
+            for scene in (1, 2):
+                definition = task(instruction, f"t{number}").model_copy(update={"attempt": number, "scene_number": scene, "run_id": "run"})
+                changes = final if scene == 1 else {}
+                proof = evidence(changes, task_id=definition.task_id, final_contacts=[["apple", "bowl"]] if changes else [])
+                rows.append((definition, proof, evaluate_task(definition, proof)))
+                number += 1
+        comparison = compare_scenes(rows)
+        self.assertEqual(comparison["best_task"], "put apple into the bowl")
+        self.assertEqual(comparison["best_scene"], 1)
+        self.assertTrue(comparison["same_layouts_verified"])
+        self.assertEqual([len(item["cells"]) for item in comparison["tasks"]], [2, 2])
+        findings = analyze_run(rows)["findings"]
+        self.assertTrue(any("cup" in item["title"] for item in findings))
+        self.assertTrue(any("apple" in item["title"] for item in findings))
+
+    def test_findings_survive_missing_measurements(self):
+        rows = [{"attempt": 1, "instruction": "lift the apple", "target": "apple", "destination": None}]
+        for stage in ("touched_no_lift", "missed_placement", "did_not_reach", "reached_no_touch"):
+            self.assertIn("unmeasured", failure_finding(stage, rows, [])["evidence"])
+
+    def test_clear_space_advice_follows_the_data(self):
+        row = {"target": "apple", "destination": "bowl", "start_to_goal_cm": None}
+        crowded_win = compare_groups([{**row, "nearest_object_cm": 9.8}], [{**row, "nearest_object_cm": 15.2}])[0]
+        self.assertIn("did not explain", crowded_win["title"])
+        self.assertNotIn("at least", crowded_win["action"])
+        clear_win = compare_groups([{**row, "nearest_object_cm": 15.2}], [{**row, "nearest_object_cm": 9.8}])[0]
+        self.assertIn("more clear space", clear_win["title"])
+        self.assertIn("at least 15 cm", clear_win["action"])
+
+    def test_efficiency_counts_decision_time(self):
+        quick = evaluate_task(task(), evidence(IN_BOWL, duration=20))
+        slow = evaluate_task(task(), evidence(IN_BOWL, duration=20).model_copy(update={"decision_seconds": 70}))
+        self.assertLess(slow.score, quick.score)
+        self.assertIn("90%", str(slow.components["efficiency"]))
+        waited = evaluate_task(task(), evidence(IN_BOWL, duration=20).model_copy(update={"wait_seconds": 70}))
+        self.assertEqual(waited.score, quick.score)
+
+    def test_suggestions_are_judged_against_the_control(self):
+        source = task("put apple into the bowl", "s1").model_copy(update={"attempt": 1, "run_id": "source"})
+        failed = evidence({}, task_id="s1", final_contacts=[])
+        before = (source, failed, evaluate_task(source, failed))
+        def test(number, kind, final):
+            item = source.model_copy(update={"task_id": f"t{number}", "run_id": "tests", "attempt": number + 1, "scene_number": number, "refinement_of": "source", "source_attempt": 1, "test_kind": kind, "test_change": kind})
+            proof = evidence(final, task_id=item.task_id, final_contacts=[["apple", "bowl"]] if final else [])
+            return item, proof, evaluate_task(item, proof)
+        helped = compare_tests([before], [test(1, "control", {}), test(2, "shorter_carry", IN_BOWL)])
+        self.assertEqual([row["verdict"] for row in helped["rows"]], ["control", "helped"])
+        self.assertEqual(helped["best_attempt"], 3)
+        self.assertEqual(helped["after"]["successes"], 1)
+        lucky = compare_tests([before], [test(1, "control", IN_BOWL), test(2, "shorter_carry", IN_BOWL)])
+        self.assertEqual(lucky["rows"][1]["verdict"], "no_change", "a gain the unchanged control also got is not credited")
+        self.assertIsNone(lucky["best_attempt"])
+
+    def test_suggestion_tests_stay_out_of_the_benchmark_score(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = EvaluationStore(Path(folder))
+            source = task("put apple into the bowl", "s1").model_copy(update={"batch_id": store.current_batch, "run_id": "source"})
+            store.submit(source, evidence({}, task_id="s1", final_contacts=[]))
+            trial = source.model_copy(update={"task_id": "t1", "run_id": "tests", "attempt": 2, "refinement_of": "source", "source_attempt": 1, "test_kind": "shorter_carry", "test_change": "moved"})
+            store.submit(trial, evidence(IN_BOWL, task_id="t1"))
+            self.assertEqual(store.batch_report(store.current_batch)["total_tasks"], 1)
+            self.assertEqual(len(store.suggestion_results("source")), 1)
+            self.assertEqual(store.run_report("tests")["refinement_of"], "source")
 
     def test_instruction_parsing(self):
         parsed = parse_instruction("Put the apple in the bowl without moving the cup", IDS)

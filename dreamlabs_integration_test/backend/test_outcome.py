@@ -9,6 +9,7 @@ endpoints are the real ones. Run from this folder with the backend's dependencie
 import os
 import tempfile
 
+os.environ.setdefault("DREAM_VISION", "off")
 os.environ.setdefault("DREAM_EVALUATION_DATA", tempfile.mkdtemp(prefix="dream-evaluation-tests-"))
 
 import textwrap
@@ -279,6 +280,8 @@ class OutcomeTest(unittest.TestCase):
             self.assertEqual(task["attempt_results"][1]["success"], True)
             states = outcome.attempt_states()
             self.assertEqual([w["state"] for w in states], ["finished", "succeeded"])
+            self.assertEqual([w["limit_s"] for w in states], [20.0, 20.0], "every run has its own timer against the limit")
+            self.assertTrue(all(0 <= w["timer_s"] <= 20 for w in states))
         finally:
             outcome.SORTFLOW = self.keep[2]
 
@@ -770,7 +773,7 @@ class OutcomeTest(unittest.TestCase):
 
     def test_bad_requests_are_refused(self):
         """Too many attempts, and video names that try to leave the folder, are refused."""
-        reply = self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "attempts": 9})
+        reply = self.client.post("/api/tasks/execute", json={"instruction": "put apple into the bowl", "attempts": 10})
         self.assertEqual(reply.status_code, 422)
         self.assertEqual(self.client.get("/api/tasks/nope/video/grid").status_code, 404)
         task = self.submit("put apple into the bowl", model(apple_into_bowl=True, steps=400))

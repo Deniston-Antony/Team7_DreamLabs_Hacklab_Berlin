@@ -9,7 +9,9 @@ from pathlib import Path
 from .batch import aggregate, summarize_run
 from .config import DEFAULT_CONFIG, ScoringConfig
 from .evaluator import evaluate_task
+from .insights import analyze_run, compare_scenes
 from .models import Evidence, TaskDefinition, TaskResult
+from .refinement import compare_tests
 from .reports import run_report, task_report
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -25,7 +27,29 @@ class EvaluationStore:
         self.order: list[str] = []
         self.current_batch = f"batch-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         self.load_errors: list[str] = []
+        self.names_path = self.folder / "benchmark_names.meta"
+        self.names: dict[str, str] = self._load_names()
         self._load()
+
+    def _load_names(self) -> dict[str, str]:
+        try:
+            data = json.loads(self.names_path.read_text())
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {key: value for key, value in data.items() if isinstance(key, str) and isinstance(value, str)}
+
+    def rename_batch(self, batch_id: str, name: str) -> str | None:
+        with self.lock:
+            known = batch_id == self.current_batch or any(record[0].batch_id == batch_id for record in self.records.values())
+            if not known:
+                return None
+            self.names[batch_id] = name
+            temporary = self.names_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self.names))
+            os.replace(temporary, self.names_path)
+            return name
 
     def _path(self, task_id: str) -> Path:
         if not SAFE_ID.match(task_id):
@@ -89,6 +113,45 @@ class EvaluationStore:
             key=lambda record: record[0].attempt,
         )
 
+    def run_records(self, run_id: str):
+        with self.lock:
+            return self._run_records(run_id)
+
+    def suggestion_results(self, run_id: str):
+        """Every finished suggestion test of a run, newest first."""
+        with self.lock:
+            source = self._run_records(run_id)
+            names = list(dict.fromkeys(self.records[item][0].run for item in self.order if self.records[item][0].refinement_of == run_id))
+            output = []
+            for name in reversed(names):
+                rows = self._run_records(name)
+                output.append({"run_id": name, "started_at": rows[0][0].started_at, "comparison": compare_tests(source, rows)})
+            return output
+
+    def vision_items(self, run_id: str):
+        with self.lock:
+            return [(task, evidence) for task, evidence, _ in self._run_records(run_id) if evidence.initial_snapshot]
+
+    def attach_vision(self, task_id: str, vision: dict):
+        with self.lock:
+            record = self.records.get(task_id)
+            if record is None:
+                return
+            task, evidence, _ = record
+            evidence.vision = vision
+            result = evaluate_task(task, evidence, self.config)  # perception is read from the finished video analysis
+            self.records[task_id] = (task, evidence, result)
+            self._save(task, evidence, result)
+
+    def run_clips(self, run_id: str):
+        """(attempt, outcome, label) of each attempt in a run, for building a combined video."""
+        with self.lock:
+            records = self._run_records(run_id)
+        return [
+            (task.attempt, result.outcome, f"attempt {task.attempt} scene {task.scene_number or task.attempt}: {result.outcome.replace('_', ' ').lower()}")
+            for task, _, result in records
+        ]
+
     def has_run(self, run_id: str) -> bool:
         with self.lock:
             return any(record[0].run == run_id for record in self.records.values())
@@ -99,12 +162,24 @@ class EvaluationStore:
         if not records:
             return None
         summary = summarize_run([(task, result, evidence.execution_status) for task, evidence, result in records])
-        grid = any("grid" in (evidence.run_videos or evidence.videos) for _, evidence, _ in records)
-        return run_report(summary, [task_report(*record) for record in records], f"/api/tasks/{run_id}/video/grid" if grid else None)
+        clips = {name for _, evidence, _ in records for name in (evidence.run_videos or evidence.videos)}
+        grid = "grid" in clips or len(clips - {"grid"}) >= 2
+        insights = analyze_run(records)
+        comparison = compare_scenes(records)
+        summary["recommendations"] = [item["action"] for item in insights["findings"]]
+        report = run_report(summary, [task_report(*record) for record in records], f"/api/tasks/{run_id}/video/grid" if grid else None)
+        output = {**report, "insights": insights, "comparison": comparison}
+        source = records[0][0].refinement_of
+        if source:
+            with self.lock:
+                original = self._run_records(source)
+            output["refinement_of"] = source
+            output["refinement"] = compare_tests(original, records)
+        return output
 
     def batches(self):
         with self.lock:
-            names = list(dict.fromkeys(self.records[task_id][0].batch_id for task_id in self.order))
+            names = list(dict.fromkeys(self.records[task_id][0].batch_id for task_id in self.order if not self.records[task_id][0].refinement_of))
             if self.current_batch not in names:
                 names.append(self.current_batch)
             output = []
@@ -113,6 +188,7 @@ class EvaluationStore:
                 output.append(
                     {
                         "batch_id": name,
+                        "name": self.names.get(name),
                         "is_current": name == self.current_batch,
                         "first_started_at": report["first_started_at"],
                         "last_started_at": report["last_started_at"],
@@ -122,7 +198,10 @@ class EvaluationStore:
                         "batch_score": report["batch_score"],
                     }
                 )
-            output.sort(key=lambda item: (item["is_current"], item["last_started_at"] or 0), reverse=True)
+            output.sort(key=lambda item: item["first_started_at"] if item["first_started_at"] is not None else float("inf"))
+            for number, item in enumerate(output, 1):
+                item["number"] = number
+            output.reverse()
             return {"current_batch": self.current_batch, "batches": output}
 
     def batch_report(self, batch_id: str):
@@ -130,6 +209,8 @@ class EvaluationStore:
             rows = [
                 (task, result, evidence.execution_status)
                 for task, evidence, result in (self.records[task_id] for task_id in self.order)
-                if task.batch_id == batch_id
+                if task.batch_id == batch_id and not task.refinement_of  # suggestion tests change the setup, so they stay out of the score
             ]
-        return None if not rows and batch_id != self.current_batch else aggregate(batch_id, rows)
+        if not rows and batch_id != self.current_batch:
+            return None
+        return {**aggregate(batch_id, rows), "name": self.names.get(batch_id)}

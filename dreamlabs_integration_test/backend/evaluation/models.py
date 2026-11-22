@@ -65,6 +65,13 @@ class TaskDefinition(BaseModel):
     run_id: str | None = None
     attempt: int = 1
     where: Literal["live", "hidden"] = "live"
+    scene_number: int | None = None
+    scene_label: str | None = None
+    refinement_of: str | None = None
+    source_attempt: int | None = None
+    test_kind: str | None = None
+    test_change: str | None = None
+    test_suggestion: str | None = None
 
     @property
     def run(self) -> str:
@@ -82,6 +89,8 @@ class Evidence(BaseModel):
     trajectory: dict[str, list[list[float]]] = Field(default_factory=dict)
     max_heights: dict[str, float] = Field(default_factory=dict)
     duration_seconds: float | None = None
+    decision_seconds: float | None = None
+    wait_seconds: float | None = None
     wall_seconds: float | None = None
     action_count: int | None = None
     model_calls: int | None = None
@@ -90,6 +99,9 @@ class Evidence(BaseModel):
     run_videos: list[str] = Field(default_factory=list)
     approach: dict[str, Any] | None = None
     model_output_keys: list[str] = Field(default_factory=list)
+    frames: dict[str, str] = Field(default_factory=dict)
+    visible_pixels: dict[str, dict[str, int]] = Field(default_factory=dict)
+    vision: dict[str, Any] | None = None
     hidden_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 

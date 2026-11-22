@@ -2,15 +2,18 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 from .reports import batch_html, run_html, task_html
 from .store import SAFE_ID, EvaluationStore
 
 SUMMARY_FIELDS = (
     "batch_id",
+    "name",
     "first_started_at",
     "last_started_at",
     "total_runs",
+    "task_ranking",
     "runs",
     "total_tasks",
     "successful",
@@ -31,6 +34,10 @@ SUMMARY_FIELDS = (
     "tasks",
     "sample_note",
 )
+
+
+class RenameBatch(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
 
 
 def create_router(store: EvaluationStore) -> APIRouter:
@@ -62,6 +69,15 @@ def create_router(store: EvaluationStore) -> APIRouter:
     @router.post("/api/evaluation/batches")
     def new_batch():
         return {"batch_id": store.new_batch()}
+
+    @router.patch("/api/evaluation/batches/{batch_id}")
+    def rename_batch(batch_id: str, body: RenameBatch):
+        name = " ".join(body.name.split())
+        if not name:
+            raise HTTPException(422, "The benchmark name cannot be empty.")
+        if store.rename_batch(valid(batch_id), name) is None:
+            raise HTTPException(404, "No such benchmark.")
+        return {"batch_id": batch_id, "name": name}
 
     @router.get("/api/reports/tasks/{task_id}")
     def task(task_id: str, format: Literal["json", "html"] = Query(default="json")):

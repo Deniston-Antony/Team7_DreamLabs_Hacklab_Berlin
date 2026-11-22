@@ -1,4 +1,5 @@
 import asyncio
+from collections import OrderedDict
 import copy
 import random
 import math
@@ -24,9 +25,11 @@ sys.path.insert(0, str(Path(list(dream_examples.__path__)[0]) / "yam_mujoco"))
 import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
+import capacity  # noqa: E402
 import evaluation  # noqa: E402
 import environments  # noqa: E402
 import scene_saves  # noqa: E402
+import suggestions  # noqa: E402
 
 DEFAULT_SCENE = "yam_tabletop"
 ROBOT_ID = "yam"
@@ -42,6 +45,7 @@ WAITING_AFTER_S = 0.3
 ALLOWED_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
 MAX_TASK_SECONDS = 200
 DEFAULT_TASK_SECONDS = 120
+SUGGESTION_COST_PER_120S = 0.07  # the website's displayed estimate
 MAX_STL_BYTES = 60 * 1024 * 1024
 MAX_STL_TRIANGLES = 1_500_000
 SIM_MESH_TRIANGLES = 60_000
@@ -238,7 +242,10 @@ class SimAdapter:
         self.type_overrides = {}
         self.goal = None
         self.capture = None
+        self.clock = None
         self.view_lock = threading.Lock()
+        self.view_version = 0
+        self.watched_attempt = 1
         self.free_camera = mujoco.MjvCamera()
         self.free_camera.type = mujoco.mjtCamera.mjCAMERA_FREE
         self.free_camera.lookat[:] = [0, -0.02, 0.78]
@@ -253,8 +260,10 @@ class SimAdapter:
         now = time.monotonic()
         self.feed.last_step = now
         self._check_goal()
+        if self.clock is not None:
+            self.clock.tick()
         if self.capture is not None:
-            self.capture.on_step()
+            self.capture.on_step(images)
         if now - self.last_publish < STREAM_PERIOD_S:
             return
         self.last_publish = now
@@ -309,11 +318,22 @@ class SimAdapter:
         with self.view_lock:
             distance = self.free_camera.distance * math.exp(delta * ZOOM_RATE)
             self.free_camera.distance = float(np.clip(distance, *ZOOM_RANGE))
+            self.view_version += 1
+
+    def free_view_params(self):
+        with self.view_lock:
+            return {
+                "lookat": [float(value) for value in self.free_camera.lookat],
+                "distance": float(self.free_camera.distance),
+                "azimuth": float(self.free_camera.azimuth),
+                "elevation": float(self.free_camera.elevation),
+            }
 
     def orbit(self, dx, dy):
         with self.view_lock:
             self.free_camera.azimuth = (self.free_camera.azimuth - dx * ORBIT_DEG_PER_PIXEL) % 360
             self.free_camera.elevation = float(np.clip(self.free_camera.elevation - dy * ORBIT_DEG_PER_PIXEL, -85, -5))
+            self.view_version += 1
 
     def goal_reached(self, name, target):
         m, d = self.env.model, self.env.data
@@ -780,6 +800,10 @@ class ExecuteTask(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
 
+class SuggestionChoice(BaseModel):
+    tests: list[int] = Field(min_length=1, max_length=8)
+
+
 class PrepareEnvironments(BaseModel):
     count: int = Field(ge=0, le=outcome.MAX_ATTEMPTS - 1)
     mode: str = Field(default="shuffle", pattern="^(same|shuffle|shuffle_style)$")
@@ -793,16 +817,25 @@ sim = pool.submit(SimAdapter, feed).result()
 tasks = {}
 active_task = None
 active_stop = None
+active_clock = None
+environments.free_view = sim.free_view_params
+view_pool = ThreadPoolExecutor(max_workers=1)  # renders finished parallel runs while the simulator thread is busy
+final_scenes = OrderedDict()
+final_frames = OrderedDict()
+grid_lock = threading.Lock()
 app = FastAPI(title="Dream Labs integration test")
 evaluations = evaluation.EvaluationStore(
     Path(os.environ.get("DREAM_EVALUATION_DATA", Path(__file__).resolve().parent / "evaluation_data"))
 )
 app.include_router(evaluation.create_router(evaluations))
+vision_checks = evaluation.VisionQueue(evaluations, Path(__file__).resolve().parent)
 _open_policy = dc.open_policy
 
 
 def open_counted_policy(config, key):
     client = _open_policy(config, key)
+    if active_clock is not None:
+        client = capacity.CapacityClient(client, active_clock)
     if sim.capture is not None:
         sim.capture.watch_model_calls(client)
     return client
@@ -892,7 +925,7 @@ def edited_environments():
 def run_environments(task):
     """The parallel runs' starting scenes: the prepared ones the run tabs show (with the user's edits) when they
     match the request, otherwise new ones; None runs every parallel run from a copy of the live scene."""
-    needed = task["attempts"] - 1
+    needed = max(entry["attempts"] for entry in task["plan"]) - 1  # the n-th run of every task shares scene n
     if needed < 1:
         return None
     shown = outcome.previews
@@ -1060,6 +1093,8 @@ def task_definition(task):
         max_duration_seconds=task["max_seconds"],
         started_at=task["started_at"],
         run_id=task["task_id"],
+        scene_number=1,
+        scene_label="Scene 1: live layout",
     )
 
 
@@ -1077,6 +1112,8 @@ def hidden_evidence(task, number, record, folder):
     try:
         proof = evaluation.Evidence.model_validate_json(path.read_text())
         proof.task_id = attempt_id
+        if proof.execution_status == "CANCELLED" and not task.get("cancel_requested"):
+            proof.execution_status = "TIMED_OUT"
     except (OSError, ValueError):
         status = "FAILED"
         errors = [record["error"]] if record.get("error") else ["The hidden attempt did not return simulator evidence."]
@@ -1105,8 +1142,18 @@ def evaluate_run(task, definition, capture, result):
         proof.videos = [name for name in clips if name == f"attempt-{number}"]
         proof.run_videos = list(videos)
         own = definition_for(task, definition, record.get("task", 1))  # each run is scored against its own task
-        attempt = own.model_copy(update={"task_id": proof.task_id, "attempt": number, "where": "hidden"})
+        attempt = own.model_copy(
+            update={
+                "task_id": proof.task_id,
+                "attempt": number,
+                "where": "hidden",
+                "scene_id": record.get("env") or own.scene_id,
+                "scene_number": record.get("scene") or number,
+                "scene_label": f"Scene {record.get('scene') or number}: {record.get('env') or 'live layout'}",
+            }
+        )
         evaluations.submit(attempt, proof)
+    vision_checks.submit(task["task_id"], folder)
     run = evaluations.run_report(task["task_id"])["run"]
     return {
         "outcome": run["outcome"],
@@ -1132,19 +1179,27 @@ def plan_goals(plan):
 
 
 def run_task(task, stop):
-    global active_task, active_stop
+    global active_task, active_stop, active_clock
     result = {}
     goals = plan_goals(task["plan"])
     goal = goals[0]
     if goal:
         sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
+    clock = capacity.AttemptClock(
+        task["max_seconds"], stop, lambda: task.update(time_limit_reached=True)
+    )
+    active_clock = clock
+    sim.clock = clock
     session = None
     definition = None
     capture = None
     try:
         definition = task_definition(task)
         capture = evaluation.EvidenceCapture(
-            sim.env, sim.managed(), (dc.FRAMES - 1) * dc.FRAME_EVERY_STEPS + 1
+            sim.env,
+            sim.managed(),
+            (dc.FRAMES - 1) * dc.FRAME_EVERY_STEPS + 1,
+            outcome.VIDEOS / task["task_id"] / "attempt-1.frames",
         )
         sim.capture = capture
     except Exception as error:  # scoring must never stop the robot run
@@ -1152,17 +1207,20 @@ def run_task(task, stop):
     try:
         envs = run_environments(task)
         save_scene(task, envs)
-        session = outcome.Session(task, sim.env, goals, envs, sim.managed())
-        dc.main(
-            [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
-            shared_env=sim.env,
-            stop_event=stop,
-        )
+        session = outcome.Session(task, sim.env, goals, envs, sim.managed(), clock)
+        try:
+            dc.main(
+                [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(capacity.wall_limit(task["max_seconds"]))],
+                shared_env=sim.env,
+                stop_event=stop,
+            )
+        except capacity.TimeLimitReached:  # time ran out waiting for a seat: an ordinary timeout
+            pass
         if goal and sim.goal["met"]:
             result["status"] = "COMPLETED"
             result["outcome"] = "SUCCESS"
             result["result_message"] = f"{goal['object'].replace('_', ' ')} is in the {goal['target']}."
-        elif stop.is_set():
+        elif stop.is_set() and not task.get("time_limit_reached"):
             result["status"] = "CANCELLED"
             result["result_message"] = "ended by the user."
         elif goal:
@@ -1174,14 +1232,29 @@ def run_task(task, stop):
             result["outcome"] = "NOT_EVALUATED"
             result["result_message"] = "this instruction cannot be checked automatically."
     except (Exception, SystemExit) as error:
-        result["status"] = "FAILED"
-        result["error"] = f"{type(error).__name__}: {error}"
+        if task.get("cancel_requested"):
+            result["status"] = "CANCELLED"
+            result["result_message"] = "ended by the user."
+        else:
+            result["status"] = "FAILED"
+            result["error"] = f"{type(error).__name__}: {error}"
     finally:
+        sim.clock = None
+        clock.close()
+        result["robot_seconds"] = round(clock.moved(), 1)
+        result["decision_seconds"] = round(clock.decided(), 1)
+        result["wait_seconds"] = round(clock.waited(), 1)
+        result["timer_seconds"] = round(clock.used(), 1)
+        task["timer_seconds"] = result["timer_seconds"]
+        if capture is not None:
+            capture.decision_seconds = round(clock.decided(), 2)
+            capture.wait_seconds = round(clock.waited(), 2)
         sim.goal = None
         sim.capture = None
         try:
             if session is not None:
                 session.finish(result)
+                result["run_seconds"] = round(session.progress(), 1)
         except Exception as error:  # a video or hidden-attempt problem must not leave the task stuck as running
             result["attempts_error"] = f"{type(error).__name__}: {error}"
         task["waiting_for_attempts"] = False
@@ -1194,6 +1267,7 @@ def run_task(task, stop):
         sim.publish()
         active_task = None
         active_stop = None
+        active_clock = None
         task.update(result, finished_at=finished_at)
 
 
@@ -1201,12 +1275,31 @@ def task_view(task):
     if task is None:
         return None
     finished = task["finished_at"] or time.time()
-    return {**task, "elapsed_s": round(max(0.0, finished - task["started_at"]), 1)}
+    clock = active_clock if task is active_task else None
+    session = outcome.current if outcome.current is not None and outcome.current.task is task else None
+    if clock is not None:
+        elapsed = session.progress() if session is not None else clock.used()
+    elif task is active_task and session is not None:
+        elapsed = session.progress()
+    elif task.get("run_seconds") is not None:
+        elapsed = task["run_seconds"]
+    elif task.get("timer_seconds") is not None:
+        elapsed = task["timer_seconds"]
+    else:
+        elapsed = min(max(0.0, finished - task["started_at"]), task["max_seconds"])
+    own = round(clock.used(), 1) if clock is not None else task.get("timer_seconds")
+    return {**task, "elapsed_s": round(elapsed, 1), "run_timer_s": own, "waiting_for_capacity": bool(clock and clock.waiting)}
 
 
 def live_phase():
     if active_task is None:
         return "idle"
+    if active_task.get("finalizing"):
+        return "saving"
+    if active_task.get("holding"):
+        return "holding"
+    if active_task.get("waiting_for_attempts"):
+        return "waiting_for_runs"
     if time.monotonic() - feed.last_step > WAITING_AFTER_S:
         return "waiting_for_dream"
     return "running"
@@ -1354,14 +1447,14 @@ def environment_objects(attempt: int):
 
 @app.post("/api/environments/{attempt}/pick")
 async def environment_pick(attempt: int, body: ViewPoint):
-    if body.camera not in environments.CAMERAS:
-        raise HTTPException(404, "Use the overhead or a wrist camera to pick objects in a parallel run.")
+    if body.camera not in environments.VIEWS:
+        raise HTTPException(404, "unknown camera")
     return await edit_environment(attempt, "pick", body.camera, body.u, body.v)
 
 
 @app.post("/api/environments/{attempt}/drag")
 async def environment_drag(attempt: int, body: ViewPoint):
-    if body.camera not in environments.CAMERAS:
+    if body.camera not in environments.VIEWS:
         raise HTTPException(404, "unknown camera")
     await edit_environment(attempt, "drag", body.camera, body.u, body.v)
     return {"ok": True}
@@ -1451,19 +1544,61 @@ async def upload_stl(request: Request, filename: str = Query(min_length=1, max_l
     return {"object_id": object_id, "original_triangles": original, "triangles": len(faces)}
 
 
+async def view_changed():
+    outcome.publish_view(sim.watched_attempt, sim.watched_view, sim.free_view_params())
+    if active_task is None:
+        await on_sim(sim.publish)
+
+
+def render_final_scene(model_path, state_path):
+    """A finished parallel run's final scene from the 3D camera; runs on view_pool."""
+    key = str(state_path)
+    if key not in final_scenes:
+        model = mujoco.MjModel.from_binary_path(str(model_path))
+        data = mujoco.MjData(model)
+        with np.load(state_path) as state:
+            data.qpos[:], data.qvel[:], data.ctrl[:] = state["qpos"], state["qvel"], state["ctrl"]
+        mujoco.mj_forward(model, data)
+        final_scenes[key] = (model, data)
+        while len(final_scenes) > outcome.MAX_ATTEMPTS:
+            final_scenes.popitem(last=False)
+    final_scenes.move_to_end(key)
+    return environments.render_previews(*final_scenes[key], (FREE_VIEW,))[FREE_VIEW]
+
+
+async def parallel_frame(attempt, camera):
+    """The newest picture of a parallel run, including its 3D view before, during and after the run."""
+    if camera == FREE_VIEW:
+        final = outcome.final_scene(attempt)
+        if final is not None:
+            key = ("final", str(final[1]), sim.view_version)
+            if key not in final_frames:
+                final_frames[key] = await asyncio.get_running_loop().run_in_executor(view_pool, render_final_scene, *final)
+                while len(final_frames) > 8:
+                    final_frames.popitem(last=False)
+            return key, final_frames[key]
+        if active_task is None and not outcome.has_workers():
+            environment = next((e for e in (outcome.previews or {}).get("envs", []) if e.attempt == attempt), None)
+            if environment is not None:
+                key = ("preview-free", attempt, environment.version, sim.view_version)
+                if environment.free_key != key:
+                    await on_sim(environment.render_free)
+                    environment.free_key = key
+                return key, environment.previews.get(FREE_VIEW)
+    return outcome.worker_frame(attempt, camera)
+
+
 @app.post("/api/view/orbit")
 async def view_orbit(body: OrbitView):
     sim.orbit(body.dx, body.dy)
-    if active_task is None:
-        await on_sim(sim.publish)
+    await view_changed()
     return {"ok": True}
 
 
 @app.post("/api/view/zoom")
 async def view_zoom(body: ZoomView):
     sim.zoom(body.delta)
-    if active_task is None:
-        await on_sim(sim.publish)
+    await view_changed()
     return {"ok": True}
 
 
@@ -1497,21 +1632,6 @@ async def view_drag(body: ViewPoint):
 @app.post("/api/view/drop")
 async def view_drop():
     return await change_scene(sim.drop)
-
-
-@app.get("/api/sessions")
-def sessions():
-    return {
-        "active_session": "simulation-1",
-        "sessions": [{"session_id": "simulation-1", "name": "Simulation 1", "scene_id": sim.scene_id, "busy": active_task is not None}],
-        "max_parallel": 1,
-        "parallel_supported": False,
-    }
-
-
-@app.post("/api/sessions")
-def create_session():
-    return unsupported("parallel_simulations", "Multiple simulations are planned but not implemented yet.")
 
 
 @app.post("/api/objects/add")
@@ -1613,13 +1733,196 @@ def cancel_task(task_id: str):
     return tasks[task_id]
 
 
+def build_combined_video(run_id, path):
+    """Create the combined video of an older run the first time it is opened."""
+    with grid_lock:
+        if path.is_file():
+            return
+        entries = []
+        for attempt, result, label in evaluations.run_clips(run_id):
+            clip = path.parent / f"attempt-{attempt}.mp4"
+            if clip.is_file() and outcome.recording.readable(clip):
+                entries.append((clip, label, result == "SUCCESS"))
+        if len(entries) < 2:
+            return
+        temporary = path.with_suffix(".building.mp4")
+        if outcome.recording.grid(entries, temporary):
+            os.replace(temporary, path)
+
+
+@app.post("/api/reports/runs/{run_id}/analyze-videos")
+def analyze_run_videos(run_id: str):
+    """Analyse an older run's videos with the vision model."""
+    if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
+        raise HTTPException(404, "No report exists for this run.")
+    return {"queued": vision_checks.submit(run_id, outcome.VIDEOS / run_id, only_missing=True)}
+
+
+def suggestion_rules():
+    return {"x": SHUFFLE_X, "y": SHUFFLE_Y, "spacing": SHUFFLE_SPACING_M, "clearance": dict(FIXED_CLEARANCE_M)}
+
+
+def plan_suggestions(run_id):
+    """A finished run's one-change tests, or why they cannot start."""
+    records = evaluations.run_records(run_id)
+    reason = evaluation.refinement.blocked_reason(records)
+    if reason:
+        return {"tests": [], "untested": [], "problem": reason}
+    return suggestions.build_tests(outcome.VIDEOS / run_id, records, suggestion_rules())
+
+
+def run_suggestions(task, stop, tests):
+    """Run a plan's tests in parallel and score each against the attempt it came from."""
+    global active_task, active_stop
+    result = {}
+    session = None
+    try:
+        session = outcome.SuggestionSession(task, sim.env, tests)
+        session.finish(result)
+        result["run_seconds"] = round(session.progress(), 1)
+        rows = result.get("attempt_results", [])
+        if task.get("cancel_requested"):
+            result["status"], result["result_message"] = "CANCELLED", "suggestion tests stopped, so no comparison was saved."
+        elif rows and all(row.get("error") for row in rows):
+            result["status"], result["error"] = "FAILED", rows[0]["error"]
+        else:
+            result["status"] = "COMPLETED"
+            result["result_message"] = f"{result.get('attempts_succeeded', 0)} of {len(rows)} tests succeeded. The comparison is in the benchmark report."
+            result["evaluation"] = evaluate_suggestions(task, tests, result)
+    except Exception as error:
+        result["status"], result["error"] = "FAILED", f"{type(error).__name__}: {error}"
+        if session is not None and session.workers is not None:
+            session.workers.stop()
+    finally:
+        result.setdefault("videos", [])
+        task["waiting_for_attempts"] = False
+        finished_at = time.time()
+        active_task = None
+        active_stop = None
+        task.update(result, finished_at=finished_at)
+
+
+def evaluate_suggestions(task, tests, result):
+    videos = result.get("videos", [])
+    clips = [name for name in videos if name != "grid"]
+    folder = outcome.VIDEOS / task["task_id"]
+    sources = {record[0].attempt: record[0] for record in evaluations.run_records(task["refinement_of"])}
+    for row in result.get("attempt_results", []):
+        number = row["attempt"]
+        test = tests[number - 2]
+        proof = hidden_evidence(task, number, row, folder)
+        proof.videos = [name for name in clips if name == f"attempt-{number}"]
+        proof.run_videos = list(videos)
+        definition = sources[test["source_attempt"]].model_copy(
+            update={
+                "task_id": proof.task_id,
+                "run_id": task["task_id"],
+                "attempt": number,
+                "where": "hidden",
+                "instruction": test["instruction"],
+                "max_duration_seconds": test["max_seconds"],
+                "started_at": task["started_at"],
+                "scene_number": test["test"],
+                "scene_label": f"Test {test['test']}: {test['change']}",
+                "refinement_of": task["refinement_of"],
+                "source_attempt": test["source_attempt"],
+                "test_kind": test["kind"],
+                "test_change": test["change"],
+                "test_suggestion": test["suggestion"],
+            }
+        )
+        evaluations.submit(definition, proof)
+    vision_checks.submit(task["task_id"], folder)
+    run = evaluations.run_report(task["task_id"])["run"]
+    return {
+        "outcome": run["outcome"],
+        "score": run["final_score"],
+        "coverage": 100 * run["attempts_scored"] / run["attempts_total"],
+        "batch_id": run["batch_id"],
+        "run_id": run["run_id"],
+        "report_url": f"/api/reports/runs/{run['run_id']}",
+    }
+
+
+@app.get("/api/reports/runs/{run_id}/suggestion-tests")
+async def suggestion_tests(run_id: str):
+    if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
+        raise HTTPException(404, "No report exists for this run.")
+    results = evaluations.suggestion_results(run_id)
+    if active_task is not None:
+        mine = active_task.get("refinement_of") == run_id
+        running = {"task_id": active_task["task_id"], "phase": live_phase()} if mine else None
+        reason = "Suggestion tests are running." if mine else "Wait for the current run to finish."
+        return {"ready": False, "reason": reason, "tests": active_task.get("tests", []) if mine else [], "untested": [], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": running, "results": results}
+    plan = await asyncio.to_thread(plan_suggestions, run_id)
+    tests = [suggestions.public(test) for test in plan["tests"]]
+    return {"ready": bool(tests), "reason": plan["problem"], "tests": tests, "untested": plan["untested"], "cost_per_120s": SUGGESTION_COST_PER_120S, "running": None, "results": results}
+
+
+@app.post("/api/reports/runs/{run_id}/suggestion-tests", status_code=202)
+async def start_suggestion_tests(run_id: str, body: SuggestionChoice):
+    global active_task, active_stop
+    if not evaluation.store.SAFE_ID.match(run_id) or not evaluations.has_run(run_id):
+        raise HTTPException(404, "No report exists for this run.")
+    if active_task is not None:
+        raise HTTPException(409, "A task is already running.")
+    plan = await asyncio.to_thread(plan_suggestions, run_id)
+    if plan["problem"] or not plan["tests"]:
+        raise HTTPException(409, plan["problem"] or "There is nothing to test.")
+    if active_task is not None:
+        raise HTTPException(409, "A task is already running.")
+    wanted = set(body.tests)
+    if not wanted <= {test["test"] for test in plan["tests"]}:
+        raise HTTPException(422, "One of the selected tests is no longer available. Reload the page and choose again.")
+    tests = [test for test in plan["tests"] if test["test"] in wanted]
+    source = evaluations.run_records(run_id)[0][0]
+    public = [suggestions.public(test) for test in tests]
+    task = {
+        "task_id": uuid.uuid4().hex[:12],
+        "instruction": f"Suggestion tests for {source.instruction}",
+        "plan": [{"instruction": test["instruction"], "attempts": 1} for test in tests],
+        "max_seconds": max(test["max_seconds"] for test in tests),
+        "status": "RUNNING",
+        "started_at": time.time(),
+        "finished_at": None,
+        "error": None,
+        "outcome": None,
+        "result_message": None,
+        "attempts": len(tests),
+        "videos": [],
+        "batch_id": source.batch_id,
+        "evaluation": None,
+        "evaluation_error": None,
+        "environments": "same",
+        "seed": 0,
+        "suggestion_test": True,
+        "refinement_of": run_id,
+        "tests": public,
+    }
+    tasks[task["task_id"]] = task
+    active_task = task
+    active_stop = threading.Event()
+    pool.submit(run_suggestions, task, active_stop, tests)
+    return task
+
+
 @app.get("/api/tasks/{task_id}/video/{clip}")
 def task_video(task_id: str, clip: str):
     path = outcome.VIDEOS / task_id / f"{clip}.mp4"
     known = task_id in tasks or evaluations.has_run(task_id)
+    if known and clip == "grid" and not path.is_file():
+        build_combined_video(task_id, path)
     if not known or not outcome.CLIP.match(clip) or not path.is_file():
         raise HTTPException(404, "no such video")
     return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/api/tasks/{task_id}/frames/{attempt}/{camera}")
+def task_frame(task_id: str, attempt: int, camera: str):
+    path = outcome.VIDEOS / task_id / f"attempt-{attempt}.frames" / f"{camera}.jpg"
+    if not evaluations.has_run(task_id) or not 1 <= attempt <= outcome.MAX_ATTEMPTS or camera not in CAMERAS or not path.is_file():
+        raise HTTPException(404, "no such frame")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.websocket("/ws/live")
@@ -1635,9 +1938,12 @@ async def live(socket: WebSocket):
             message = await socket.receive_json()
             if isinstance(message, dict) and message.get("attempt") in range(1, outcome.MAX_ATTEMPTS + 1):
                 selected["attempt"] = message["attempt"]  # 1 is the live simulation; more are hidden workers
+                sim.watched_attempt = message["attempt"]
+                outcome.publish_view(sim.watched_attempt, sim.watched_view, sim.free_view_params())
             if isinstance(message, dict) and message.get("camera") in VIEWS:
                 selected["camera"] = message["camera"]
                 sim.watched_view = message["camera"]
+                outcome.publish_view(sim.watched_attempt, sim.watched_view, sim.free_view_params())
                 if active_task is None:
                     await on_sim(sim.publish)
 
@@ -1647,7 +1953,7 @@ async def live(socket: WebSocket):
     try:
         while not receiver.done():
             attempt = selected["attempt"]
-            seq, frame = outcome.worker_frame(attempt, selected["camera"]) if attempt > 1 else (None, None)
+            seq, frame = await parallel_frame(attempt, selected["camera"]) if attempt > 1 else (None, None)
             current = (seq if attempt > 1 else feed.sequence, selected["camera"], attempt)
             task = active_task or latest
             latest = task
