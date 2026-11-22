@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PointerEvent } from "react";
+import type { PointerEvent, ReactNode } from "react";
 import { BenchmarksPage } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
 import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
@@ -190,6 +190,23 @@ function shownState(worker: WorkerState): WorkerState["state"] {
   return worker.passed === true ? "succeeded" : worker.passed === false ? "failed" : "finished";
 }
 
+/** A run's log over the page: closes on its button, the backdrop or Escape. */
+function LogDialog({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => event.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="log-backdrop" onClick={onClose}>
+      <div className="log-dialog" role="dialog" aria-modal="true" aria-label="Dream-1 log" onClick={(event) => event.stopPropagation()}>
+        <button className="log-close" onClick={onClose} aria-label="Close the log">✕</button>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 function runName(attempt: number) {
   return attempt === 1 ? "Live run" : `Parallel run ${attempt}`;
 }
@@ -300,6 +317,7 @@ export default function App() {
   const [fps, setFps] = useState(0);
   const [camera, setCamera] = useState("top");
   const [viewAttempt, setViewAttempt] = useState(1);
+  const [logAttempt, setLogAttempt] = useState<number | null>(null); // the run whose Dream-1 log is open
   const [dragging, setDragging] = useState(false);
   const [pose, setPose] = useState({ x: 0.05, y: 0, z: 0.8, yaw: 45 });
   const [uploadStatus, setUploadStatus] = useState<Status | null>(null);
@@ -820,8 +838,8 @@ export default function App() {
             </div>
             <nav className="run-strip" aria-label="Runs">
               {(workers.length > 1 ? workers : [{ attempt: 1, task: 1, where: "live", label: "", state: running ? "running" : "finished" } as WorkerState]).map((worker) => (
+                <div key={worker.attempt} className="run-card">
                 <button
-                  key={worker.attempt}
                   className={`run-tab ${viewAttempt === worker.attempt ? "active" : ""}`}
                   aria-pressed={viewAttempt === worker.attempt}
                   onClick={() => chooseAttempt(worker.attempt)}
@@ -845,10 +863,20 @@ export default function App() {
                     />
                   )}
                 </button>
+                {task && !task.suggestion_test && worker.state !== "ready" && (
+                  <button className="run-log-button" onClick={() => setLogAttempt(worker.attempt)} aria-label={`Dream-1 log of ${runName(worker.attempt).toLowerCase()}`}>
+                    Log
+                  </button>
+                )}
+                </div>
               ))}
             </nav>
           </div>
-          {task && !task.suggestion_test && <DreamLogPanel key={`${task.task_id}-${viewAttempt}`} taskId={task.task_id} attempt={viewAttempt} runLabel={runName(viewAttempt)} running={running} />}
+          {task && !task.suggestion_test && logAttempt !== null && (
+            <LogDialog onClose={() => setLogAttempt(null)}>
+              <DreamLogPanel key={`${task.task_id}-${logAttempt}`} taskId={task.task_id} attempt={logAttempt} runLabel={runName(logAttempt)} running={running} />
+            </LogDialog>
+          )}
           {task && <AttemptsPanel key={task.task_id} task={task} />}
           {task?.evaluation && (
             <div className="panel report-prompt">
