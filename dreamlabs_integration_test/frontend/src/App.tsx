@@ -5,6 +5,8 @@ import type { EvaluationRef } from "./EvaluationPanels";
 import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
 import { clock, RunProgress, runTone } from "./RunProgress";
 import type { TestViewerState } from "./SuggestionTests";
+import { DEFAULT_JUDGES, JudgePicker } from "./JudgePicker";
+import type { JudgeId, JudgeOption } from "./JudgePicker";
 
 type SceneObject = {
   object_id: string;
@@ -40,6 +42,8 @@ type Task = {
   evaluation_error?: string | null;
   batch_id?: string;
   suggestion_test?: boolean;
+  judge?: JudgeId;
+  plan?: { instruction: string; prompt?: string | null }[];
   refinement_of?: string;
 };
 type TaskResult = {
@@ -278,6 +282,9 @@ export default function App() {
   const [seed, setSeed] = useState(() => Math.floor(Math.random() * 100000));
   const [status, setStatus] = useState<Status>({ text: "Connecting to the local simulator…", error: false });
   const [busy, setBusy] = useState(false);
+  const [judge, setJudgeChoice] = useState<JudgeId>(() => (localStorage.getItem("robotester-judge") === "claude" ? "claude" : "offline"));
+  const [judges, setJudges] = useState<JudgeOption[]>(DEFAULT_JUDGES);
+  const [prompts, setPrompts] = useState<string[]>([]);
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
   const attemptRef = useRef(1);
@@ -445,8 +452,34 @@ export default function App() {
   const suiteReady = extras.every((extra) => extra.text.trim()) && totalAttempts <= MAX_ATTEMPTS;
   const variation = totalAttempts > 1 ? { environments: envMode, seed } : {};
   const request: Record<string, unknown> = extras.length
-    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts }))], max_seconds: maxSeconds, ...variation }
-    : { instruction, max_seconds: maxSeconds, attempts, ...variation };
+    ? { tasks: [{ instruction, attempts }, ...extras.map((e) => ({ instruction: e.text, attempts }))], max_seconds: maxSeconds, judge, ...variation }
+    : { instruction, max_seconds: maxSeconds, attempts, judge, ...variation };
+  const chooseJudge = useCallback((next: JudgeId) => {
+    setJudgeChoice(next);
+    localStorage.setItem("robotester-judge", next);
+  }, []);
+  useEffect(() => {
+    if (!connected) return;
+    api<{ judges: JudgeOption[] }>("/api/judges")
+      .then((data) => {
+        setJudges(data.judges);
+        const current = data.judges.find((item) => item.id === judge);
+        const usable = data.judges.find((item) => item.available);
+        if (current && !current.available && usable) chooseJudge(usable.id);
+      })
+      .catch(() => undefined);
+  }, [connected]); // eslint-disable-line react-hooks/exhaustive-deps
+  const promptKey = JSON.stringify([instruction, ...extras.map((extra) => extra.text)]);
+  useEffect(() => {
+    if (running || !connected) return;
+    const timer = window.setTimeout(() => {
+      api<{ prompts: string[] }>("/api/judges/preview", { judge, instructions: JSON.parse(promptKey) })
+        .then((data) => setPrompts(data.prompts))
+        .catch(() => setPrompts([]));
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [judge, promptKey, running, connected]);
+  const shownPrompts = running && task?.plan ? task.plan.map((entry) => entry.prompt ?? entry.instruction) : prompts;
   const layoutSaved = live?.layout_saved ?? false;
   useEffect(() => {
     // Show the parallel runs' environments (shuffled positions, other styles) in the run tabs before the run.
@@ -688,7 +721,7 @@ export default function App() {
         <button className={page === "simulator" ? "active" : ""} onClick={() => setPage("simulator")}>Simulator</button>
         <button className={page === "benchmarks" ? "active" : ""} onClick={() => setPage("benchmarks")}>Benchmarks</button>
       </nav>
-      {page === "benchmarks" && <BenchmarksPage latestRunId={task?.refinement_of ?? (task?.evaluation ? task.task_id : "")} latestBatchId={task?.batch_id ?? ""} locked={running} testsActive={running && !!task?.suggestion_test} viewer={testViewer} />}
+      {page === "benchmarks" && <BenchmarksPage latestRunId={task?.refinement_of ?? (task?.evaluation ? task.task_id : "")} latestBatchId={task?.batch_id ?? ""} locked={running} testsActive={running && !!task?.suggestion_test} viewer={testViewer} judge={judge} judges={judges} onJudge={chooseJudge} />}
       <div className="layout" hidden={page !== "simulator"}>
         <section>
           <div className="panel viewer">
@@ -888,6 +921,7 @@ export default function App() {
           </div>
           <div className="panel">
             <h2>Tasks</h2>
+            <JudgePicker judge={running && task?.judge ? task.judge : judge} judges={judges} onChange={chooseJudge} disabled={running} />
             <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
@@ -895,6 +929,12 @@ export default function App() {
                 <button disabled={running} onClick={() => setExtras(extras.filter((_, i) => i !== index))} aria-label={`Remove task ${index + 2}`} title="Remove task">×</button>
               </div>
             ))}
+            {shownPrompts.some(Boolean) && (
+              <div className="prompt-preview" aria-label="Prompts sent to Dream-1">
+                <strong>Prompt sent to Dream-1</strong>
+                {shownPrompts.filter(Boolean).map((text, index) => <span key={index}>{shownPrompts.length > 1 ? `Task ${index + 1}: ` : ""}{text}</span>)}
+              </div>
+            )}
             <div className="row" style={{ marginTop: 8 }}>
               <button disabled={running || taskCount >= MAX_ATTEMPTS} onClick={addTask}>Add task</button>
             </div>
@@ -926,7 +966,7 @@ export default function App() {
               {running ? (
                 <button className="danger" disabled={task?.finalizing} onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop</button>
               ) : (
-                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady} onClick={() => { setLastRequest(request); void run("Task started", () => api("/api/tasks/execute", request)); }}>
+                <button className="primary" disabled={locked || !connected || !instruction.trim() || !suiteReady || judges.find((item) => item.id === judge)?.available === false} onClick={() => { setLastRequest(request); void run("Task started", () => api("/api/tasks/execute", request)); }}>
                   {extras.length ? `Run ${extras.length + 1} tasks` : "Run task"}
                 </button>
               )}

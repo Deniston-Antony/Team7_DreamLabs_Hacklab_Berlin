@@ -126,13 +126,13 @@ def judge_task(task, folder, ask=ask_claude, on_attempt=None, only=None):
     if not sims and task.get("outcome") in ("SUCCESS", "FAILURE"):
         sims = {1: task["outcome"] == "SUCCESS"}
     plan = task.get("plan") or []  # with several tasks, each run says which one (1-based) it ran
-    instructions = {r["attempt"]: plan[r["task"] - 1]["instruction"]
+    instructions = {r["attempt"]: plan[r["task"] - 1].get("prompt") or plan[r["task"] - 1]["instruction"]
                     for r in task.get("attempt_results") or [] if 0 < r.get("task", 0) <= len(plan)}
     for path in sorted(folder.glob("attempt-*.mp4"), key=lambda p: int(p.stem.split("-")[1])):
         number = int(path.stem.split("-")[1])
         if only is not None and number not in only:
             continue
-        instruction = instructions.get(number) or task["instruction"]
+        instruction = instructions.get(number) or (plan[0].get("prompt") if plan else None) or task["instruction"]
         try:
             verdict = judge_video(instruction, path, sims.get(number), ask)
         except Exception as error:  # one bad video must not stop the others

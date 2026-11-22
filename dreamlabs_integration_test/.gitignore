@@ -7,5 +7,5 @@ frontend/dist/
 .env
 backend/task_videos/
 backend/evaluation_data/
-backend/.vision-venv/
-backend/.vision-cache/
+backend/.vision-venv
+backend/.vision-cache

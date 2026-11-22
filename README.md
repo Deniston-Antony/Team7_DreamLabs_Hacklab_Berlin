@@ -37,7 +37,7 @@ The simulator runs on your own computer through the official Dream Labs library.
 | Evaluation | 0 to 100 score, outcome, penalties, task checks and missing-evidence notes for each attempt |
 | Benchmarks | Numbered, renamable history with old reports, videos and timestamps |
 | Video | A video for every run, a combined video, and 1x, 1.5x, 2x and 4x playback |
-| Video judge | Claude watches frames from each attempt video, gives Pass, Fail or Unsure, and flags disagreements with the simulator |
+| Video judges | Choose the free Offline judge (OWLv2) or the Claude judge. Each sends its own task prompt to Dream-1 and reports on the video |
 | Final reports | Task and scene comparison, best task, best and hardest scene, and recommendations from each run's data |
 | Suggestion testing | Selectable one-change tests, unchanged controls, a test viewer and a before/after graph |
 | Hosting | Runs from your computer on a custom domain through Cloudflare Tunnel, behind an email login |
@@ -52,7 +52,7 @@ FastAPI backend ───────► evaluation engine, reports and saved be
    │
    ├─ live MuJoCo simulator
    ├─ hidden worker processes for parallel runs
-   └─ background Claude video judge
+   └─ selected video judge: local OWLv2 or Claude
    │
    ▼
 Dream-1 API (the key stays on the backend machine)
@@ -63,7 +63,9 @@ Dream-1 API (the key stays on the backend machine)
 | `dreamlabs_integration_test/frontend/` | Website |
 | `dreamlabs_integration_test/backend/` | API, simulator control, scenes and run sessions |
 | `dreamlabs_integration_test/backend/evaluation/` | Scoring, insights, reports, storage and suggestion comparison |
+| `dreamlabs_integration_test/backend/judges.py` | Judge choices and their task prompts |
 | `dreamlabs_integration_test/backend/video_judge.py` | Claude video judge |
+| `dreamlabs_integration_test/backend/vision/` | Offline OWLv2 judge |
 | `SortFlow/` | Success checks, parallel workers, capacity retries, live feeds and recording |
 | `dreamlabs_integration_test/EVALUATION.md` | Detailed scoring and evidence rules |
 
@@ -95,9 +97,18 @@ npm ci
 cd ..
 ```
 
-### Optional: turn on the video judge
+### Optional: install the Offline judge
 
-Without an Anthropic key, runs and scoring still work, and reports say the video was not judged. To turn it on, run this in the terminal that starts the backend:
+```bash
+cd backend
+uv venv --python 3.12 .vision-venv
+uv pip install --python .vision-venv/bin/python -r vision/requirements.txt
+cd ..
+```
+
+### Optional: turn on the Claude judge
+
+Without an Anthropic key, the Claude option is unavailable. To turn it on, run this in the terminal that starts the backend:
 
 ```bash
 printf 'Paste your Anthropic API key, then press Enter: '
@@ -184,7 +195,14 @@ Each attempt gets a score from 0 to 100:
 
 Outcomes are **Success**, **Partial success**, **Failure**, **Unsafe** and **Not evaluable**. Penalties and score caps are explained in [EVALUATION.md](dreamlabs_integration_test/EVALUATION.md).
 
-Dream-1 returns robot actions, not what it internally detected. After each run, the **video judge** sends 8 frames from each attempt video to Claude, weighted toward the ending. It returns Pass, Fail or Unsure with a confidence and reason, and flags any disagreement with the simulator. It is not scored, so simulator evidence remains the source of the score.
+Dream-1 returns robot actions, not what it internally detected. Choose a **Judge** in the Tasks panel or Suggestion testing tab:
+
+| Judge | Runs on | Prompt sent to Dream-1 for `put apple into the bowl` | What it reports |
+| --- | --- | --- | --- |
+| Offline judge | This computer, using OWLv2 | `put red apple into the white bowl` | Which objects moved in the video |
+| Claude judge | Anthropic API | `put apple into the bowl and let go so it rests there` | Pass, Fail or Unsure, with a reason and any disagreement with the simulator |
+
+The page shows the exact prompt before a run. Conditions you write, such as `without moving the banana`, are kept. Judges are not scored, so simulator evidence remains the source of the score. Because the prompts differ, results from different judges are not a clean model comparison unless an unchanged control uses the same prompt.
 
 ## Suggestion testing
 
@@ -308,7 +326,8 @@ Use `MUJOCO_GL=egl` on headless Linux.
 | Website says **Reconnecting** | Start the backend, then refresh |
 | Task fails with a key or credit error | Check `~/.dreamlabs/credentials` and your Dream Labs balance |
 | Dream-1 reports no capacity | The run waits and retries. Use fewer parallel runs or try later |
-| Video judge says no Anthropic credential | Set `ANTHROPIC_API_KEY` in the backend terminal and restart it, then press **Judge videos** |
+| Claude judge is not available | Set `ANTHROPIC_API_KEY` in the backend terminal and restart it |
+| Offline judge is not available | Install the optional Offline judge |
 | Domain does not open in Chrome | Check that the backend and tunnel are running, then try Cloudflare secure DNS |
 | Page differs from this README | Restart the servers after pulling, rebuild if hosted, and refresh |
 | `task_videos` is large | Delete old run folders you no longer need |
@@ -324,6 +343,6 @@ Use `MUJOCO_GL=egl` on headless Linux.
 | `suggestion_testing` | One-change tests, controls, test viewer and before/after results |
 | `web-integration` | Custom-domain hosting through Cloudflare Tunnel and this README |
 | `umair-video-judge` | Claude video judge |
-| `Umair+Deniston_code_combined` | Web interface with the Claude judge replacing the earlier OWLv2 check |
+| `Umair+Deniston_code_combined` | Web interface with a choice of Offline or Claude judge |
 
 **Team:** Deniston (website and simulator integration), Umair (evaluation, scoring, reports and video judge) and Ashiq (robot, CLI and execution).

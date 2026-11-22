@@ -40,6 +40,8 @@ def task_report(task: TaskDefinition, evidence: Evidence, result: TaskResult) ->
             "instruction": task.instruction,
             "started_at": task.started_at,
             "protected_objects": task.protected_objects,
+            "judge": task.judge,
+            "robot_prompt": task.robot_prompt,
             "test_kind": task.test_kind,
             "test_change": task.test_change,
             "source_attempt": task.source_attempt,
@@ -134,7 +136,7 @@ def task_body(report: dict[str, Any]) -> str:
     <section><h1>Attempt {task['attempt']} report</h1><p class="muted">{escape(task['task_id'])} · {escape(task['scene'])} · {escape(task['robot'])}</p>
     <p><strong>{escape(task['instruction'])}</strong></p><div class="score">{escape(score)}</div>
     <p>{escape(result['outcome'])} · coverage {result['coverage']:g}% · scoring {escape(result['config_version'])}</p><p>{escape(result['summary'])}</p></section>
-    <section><h2>Execution</h2><table>{rows([['Status', execution['status']], ['Robot movement (s)', execution['duration_seconds']], ['Dream-1 decision time (s)', execution['decision_seconds']], ['Waiting for a Dream-1 seat (s)', execution['wait_seconds']], ['Actions', execution['action_count']], ['Dream-1 calls', execution['model_calls']]])}</table></section>
+    <section><h2>Execution</h2><table>{rows([['Judge', report['task'].get('judge') or 'n/a'], ['Prompt sent to Dream-1', report['task'].get('robot_prompt') or report['task']['instruction']], ['Status', execution['status']], ['Robot movement (s)', execution['duration_seconds']], ['Dream-1 decision time (s)', execution['decision_seconds']], ['Waiting for a Dream-1 seat (s)', execution['wait_seconds']], ['Actions', execution['action_count']], ['Dream-1 calls', execution['model_calls']]])}</table></section>
     <section><h2>Score breakdown</h2><table><tr><th>Component</th><th>Status</th><th>Points</th><th>Detail</th></tr>{rows(components)}</table></section>
     <section><h2>Penalties</h2>{'<table><tr><th>Type</th><th>Object</th><th>Severity</th><th>Points</th><th>Explanation</th></tr>' + rows(penalties) + '</table>' if penalties else '<p class="muted">No penalties.</p>'}</section>
     <section><h2>Task checks</h2><table><tr><th>Type</th><th>Check</th><th>Status</th><th>Detail</th></tr>{rows(checks)}</table></section>

@@ -130,6 +130,21 @@ class EvaluationStore:
                 output.append({"run_id": name, "started_at": rows[0][0].started_at, "comparison": compare_tests(source, rows)})
             return output
 
+    def vision_items(self, run_id: str):
+        with self.lock:
+            return [(task, evidence) for task, evidence, _ in self._run_records(run_id) if evidence.initial_snapshot]
+
+    def attach_vision(self, task_id: str, vision: dict):
+        with self.lock:
+            record = self.records.get(task_id)
+            if record is None:
+                return
+            task, evidence, _ = record
+            evidence.vision = vision
+            result = evaluate_task(task, evidence, self.config)  # perception is read from the finished video analysis
+            self.records[task_id] = (task, evidence, result)
+            self._save(task, evidence, result)
+
     def attach_video_judge(self, task_id: str, verdict: dict):
         with self.lock:
             record = self.records.get(task_id)

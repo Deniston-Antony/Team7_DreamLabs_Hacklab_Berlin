@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { SpeedButtons, VideoPlayer } from "./VideoPlayer";
 import { SuggestionTests } from "./SuggestionTests";
 import type { TestViewerState } from "./SuggestionTests";
+import type { JudgeId, JudgeOption } from "./JudgePicker";
 
 type Component = {
   status: "MEASURED" | "NOT_MEASURED";
@@ -83,7 +84,7 @@ type Vision = {
 };
 type VideoJudgeVerdict = { verdict: string; confidence?: number; reason?: string; frames?: number; agrees_with_sim?: boolean };
 type AttemptReport = {
-  task: { task_id: string; attempt: number; where: string; instruction: string; scene_number?: number; scene_label?: string | null; test_kind?: string | null; test_change?: string | null };
+  task: { task_id: string; attempt: number; where: string; instruction: string; scene_number?: number; scene_label?: string | null; test_kind?: string | null; test_change?: string | null; judge?: JudgeId | null; robot_prompt?: string | null };
   execution: { status: string; duration_seconds: number | null; action_count: number | null; model_calls: number | null };
   evidence: { videos: string[]; vision?: Vision | null; video_judge?: VideoJudgeVerdict | null };
   result: Result;
@@ -182,6 +183,13 @@ function ScoreHead({ score, outcome, children }: { score: number | null; outcome
   );
 }
 
+function movementLabel(video: VideoAnalysis) {
+  if (video.status === "PASS") return "Target moved";
+  if (video.status === "FAIL") return "Wrong object moved";
+  if (video.status === "PARTIAL") return video.target && video.moved_objects.includes(video.target) ? "Target and others moved" : "Target did not move";
+  return "Not measured";
+}
+
 function VisionCheck({ vision }: { vision?: Vision | null }) {
   if (!vision) return <><h3>Vision check</h3><p className="hint">This older report has no vision check.</p></>;
   if (vision.status === "running") return <><h3>Vision check</h3><p className="hint">Analysing this run's camera frames and video...</p></>;
@@ -190,7 +198,8 @@ function VisionCheck({ vision }: { vision?: Vision | null }) {
   const names = Object.keys(cameras[0]?.[1].objects ?? {});
   return (
     <>
-      <h3>Vision check (not scored)</h3>
+      <h3>Offline judge (not scored)</h3>
+      <p className="hint">This checks object movement in the video. Movement does not mean the task succeeded.</p>
       <p>
         Target <strong>{vision.target ?? "n/a"}</strong>: {vision.target_detected_in?.length ? `detected in ${vision.target_detected_in.join(", ")}` : "not detected"}
         {vision.destination ? <> · Destination <strong>{vision.destination}</strong>: {vision.destination_detected_in?.length ? `detected in ${vision.destination_detected_in.join(", ")}` : "not detected"}</> : null}
@@ -198,7 +207,7 @@ function VisionCheck({ vision }: { vision?: Vision | null }) {
       {!!vision.agreement?.total && <p className="hint">First-frame detections match MuJoCo visibility in {vision.agreement.matching} of {vision.agreement.total} checks.</p>}
       {vision.video && (
         <div className="video-analysis">
-          <strong>From this run's video</strong> <span className={`pill small ${statusClass(vision.video.status)}`}>{label(vision.video.status)}</span>
+          <strong>From this run's video</strong> <span className="pill small neutral">{movementLabel(vision.video)}</span>
           <p>{vision.video.detail}</p>
           <table>
             <thead><tr><th>Object</th><th>Located in frames</th><th>Video shows</th></tr></thead>
@@ -279,6 +288,7 @@ function AttemptView({ report }: { report: AttemptReport }) {
         <p className="hint">
           {report.task.instruction} · {report.task.scene_label ?? `Scene ${report.task.scene_number ?? report.task.attempt}`} · {report.task.where === "live" ? "live" : "parallel"} run · coverage {result.coverage}% · {show(report.execution.action_count)} actions · {show(report.execution.model_calls)} Dream-1 calls · {result.config_version}
         </p>
+        <p className="hint">{report.task.judge === "claude" ? "Claude judge" : report.task.judge === "offline" ? "Offline judge" : "Judge not recorded"} · Prompt sent to Dream-1: {report.task.robot_prompt ?? report.task.instruction}</p>
         {result.caps_applied.map((cap) => <p className="hint" key={cap}>{cap}</p>)}
       </ScoreHead>
       <h3>Score breakdown</h3>
@@ -455,7 +465,7 @@ function RunView({ runId }: { runId: string }) {
   }, [runId]);
 
   useEffect(() => {
-    if (!report?.attempts.some((item) => item.evidence.video_judge?.verdict === "RUNNING")) return;
+    if (!report?.attempts.some((item) => item.evidence.video_judge?.verdict === "RUNNING" || item.evidence.vision?.status === "running")) return;
     const timer = window.setTimeout(() => {
       getJson<RunReport>(`/api/reports/runs/${runId}`).then(setReport).catch(() => undefined);
     }, 2500);
@@ -465,7 +475,12 @@ function RunView({ runId }: { runId: string }) {
   if (error) return <div className="status error">{error}</div>;
   if (!report) return <p className="hint">Loading report...</p>;
   const current = report.attempts.find((item) => item.task.attempt === tab);
-  const needsVideoCheck = report.attempts.some((item) => item.evidence.videos.length > 0 && !["PASS", "FAIL", "UNSURE", "RUNNING"].includes(item.evidence.video_judge?.verdict ?? ""));
+  const savedJudge = report.attempts.find((item) => item.task.judge)?.task.judge ?? (report.attempts.some((item) => item.evidence.video_judge) ? "claude" : "offline");
+  const needsVideoCheck = report.attempts.some((item) =>
+    item.evidence.videos.length > 0 &&
+    (savedJudge === "claude"
+      ? !["PASS", "FAIL", "UNSURE", "RUNNING"].includes(item.evidence.video_judge?.verdict ?? "")
+      : !item.evidence.vision?.video && item.evidence.vision?.status !== "running"));
   const analyse = async () => {
     await fetch(`/api/reports/runs/${runId}/analyze-videos`, { method: "POST" });
     setReport(await getJson<RunReport>(`/api/reports/runs/${runId}`));
@@ -475,7 +490,7 @@ function RunView({ runId }: { runId: string }) {
       <div className="stream-bar" style={{ marginTop: 14 }}>
         <h3 style={{ margin: 0 }}>{report.run.instruction} <span className="muted">· {when(report.run.started_at)}</span></h3>
         <span className="report-links">
-          {needsVideoCheck && <button onClick={() => void analyse()}>Judge videos</button>}
+          {needsVideoCheck && <button onClick={() => void analyse()}>{savedJudge === "claude" ? "Judge videos" : "Analyse videos"}</button>}
           <a href={`/api/reports/runs/${runId}?format=html`} target="_blank" rel="noreferrer">HTML</a>
           <a href={`/api/reports/runs/${runId}`} target="_blank" rel="noreferrer">JSON</a>
         </span>
@@ -496,7 +511,7 @@ function RunView({ runId }: { runId: string }) {
   );
 }
 
-export function BenchmarksPage({ latestRunId, latestBatchId, locked, testsActive, viewer }: { latestRunId: string; latestBatchId: string; locked: boolean; testsActive: boolean; viewer: TestViewerState }) {
+export function BenchmarksPage({ latestRunId, latestBatchId, locked, testsActive, viewer, judge, judges, onJudge }: { latestRunId: string; latestBatchId: string; locked: boolean; testsActive: boolean; viewer: TestViewerState; judge: JudgeId; judges: JudgeOption[]; onJudge: (judge: JudgeId) => void }) {
   const [view, setView] = useState<"report" | "suggestions">(testsActive ? "suggestions" : "report");
   const [batches, setBatches] = useState<BatchEntry[]>([]);
   const [batchId, setBatchId] = useState("");
@@ -643,7 +658,7 @@ export function BenchmarksPage({ latestRunId, latestBatchId, locked, testsActive
                     </select>
                   </label>
                 )}
-                {runId && <SuggestionTests key={runId} runId={runId} locked={locked} viewer={viewer} renderRun={(id) => <RunView key={id} runId={id} />} />}
+                {runId && <SuggestionTests key={runId} runId={runId} locked={locked} viewer={viewer} judge={judge} judges={judges} onJudge={onJudge} renderRun={(id) => <RunView key={id} runId={id} />} />}
               </>
             )}
             {summary.total_tasks === 0 ? <p className="hint">No test runs yet. Run a task on the Simulator page to add it here.</p> : view === "report" && (

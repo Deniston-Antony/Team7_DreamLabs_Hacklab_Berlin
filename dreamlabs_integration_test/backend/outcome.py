@@ -128,7 +128,7 @@ class Workers:
             str(SORTFLOW / "parallel_bench.py"),
             "--worker",
             "--task",
-            job["instruction"],
+            job.get("prompt") or job["instruction"],
             "--seconds",
             str(job.get("max_seconds") or self.seconds),
             "--actions",
@@ -276,7 +276,7 @@ class Session:
         self.task, self.env, self.finished, self.workers = task, env, False, None
         self.clock, self.held, self.live_passed = clock, 0.0, None
         self.plan = [
-            {"instruction": p["instruction"], "attempts": int(p.get("attempts", 1)), "goal": g}
+            {"instruction": p["instruction"], "prompt": p.get("prompt"), "attempts": int(p.get("attempts", 1)), "goal": g}
             for p, g in zip(task["plan"], goals)
         ]
         self.folder = VIDEOS / task["task_id"]
@@ -294,6 +294,7 @@ class Session:
                 self.jobs.append(
                     {
                         "instruction": entry["instruction"],
+                        "prompt": entry["prompt"],
                         "goal": entry["goal"],
                         "attempt": number,
                         "index": index,
@@ -490,7 +491,7 @@ class SuggestionSession(Session):
         self.plan, self.jobs = [], []
         for index, test in enumerate(tests):
             goal = {"object": test["target"], "target": test["destination"]}
-            self.plan.append({"instruction": test["instruction"], "attempts": 1, "goal": goal})
+            self.plan.append({"instruction": test["instruction"], "prompt": test["prompt"], "attempts": 1, "goal": goal})
             attempt = index + 2
             model, state = self.folder / f"test-{attempt}.mjb", self.folder / f"test-{attempt}.npz"
             shutil.copyfile(test["model_path"], model)
@@ -498,6 +499,7 @@ class SuggestionSession(Session):
             self.jobs.append(
                 {
                     "instruction": test["instruction"],
+                    "prompt": test["prompt"],
                     "goal": goal,
                     "attempt": attempt,
                     "index": index,

@@ -132,6 +132,15 @@ class VideoJudgeTest(unittest.TestCase):
         self.assertTrue(finished.wait(5))
         self.assertEqual(saved, [(2, "PASS")])
 
+    def test_the_judge_reads_the_prompt_the_robot_received(self):
+        plan = [{"instruction": "put apple into the bowl", "prompt": "put apple into the bowl and let go so it rests there", "attempts": 1}]
+        task = self.task(plan=plan)
+        write_video(self.root / "t1" / "attempt-1.mp4")
+        task["video_judge"] = {"status": "RUNNING", "attempts": []}
+        ask = fake_claude({})
+        video_judge.judge_task(task, self.root / "t1", ask=ask)
+        self.assertEqual(ask.calls[0][0], plan[0]["prompt"])
+
     def test_no_credentials_or_cancelled_is_skipped(self):
         with mock.patch.object(video_judge, "has_credentials", return_value=False):
             task = self.task()

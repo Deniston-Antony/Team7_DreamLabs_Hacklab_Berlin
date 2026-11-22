@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEventHandler, ReactNode } from "react";
 import { RunProgress, runTone } from "./RunProgress";
+import { JudgePicker } from "./JudgePicker";
+import type { JudgeId, JudgeOption } from "./JudgePicker";
 
-type PlannedTest = { test: number; kind: string; label: string; change: string; suggestion: string; source_attempt: number; max_seconds: number };
+type PlannedTest = { test: number; kind: string; label: string; change: string; suggestion: string; prompt: string; source_attempt: number; max_seconds: number };
 type TestWorker = { attempt: number; name?: string; env?: string; state: string; timer_s?: number; limit_s?: number };
 type Stats = { average_score: number | null; successes: number; attempts: number };
 type ResultRow = {
@@ -16,10 +18,13 @@ type ResultRow = {
   before_score: number | null;
   after_score: number | null;
   after_outcome: string;
+  prompt?: string;
+  judge?: JudgeId | null;
+  judge_verdict?: string | null;
   effect: number | null;
   verdict: "control" | "helped" | "worse" | "no_change" | "not_scored";
 };
-type Comparison = { before: Stats; after: Stats; control: Stats; control_change: number | null; rows: ResultRow[]; recommendation: string; note: string; best_attempt: number | null };
+type Comparison = { before: Stats; after: Stats; control: Stats; control_change: number | null; rows: ResultRow[]; recommendation: string; note: string; best_attempt: number | null; judge?: JudgeId | null; judging?: boolean };
 type SavedResult = { run_id: string; started_at: number | null; comparison: Comparison };
 type SuggestionState = {
   ready: boolean;
@@ -29,6 +34,7 @@ type SuggestionState = {
   cost_per_120s: number;
   running: { task_id: string; phase: string } | null;
   results: SavedResult[];
+  source_judge?: JudgeId;
 };
 export type TestViewerState = {
   frameUrl: string;
@@ -126,11 +132,11 @@ function ResultView({ comparison }: { comparison: Comparison }) {
       <BeforeAfterChart rows={comparison.rows} />
       <div className="table-scroll">
         <table>
-          <thead><tr><th>Test</th><th>One change</th><th>Suggestion tested</th><th>From</th><th>Before</th><th>After</th><th>Effect vs control</th><th>Result</th></tr></thead>
+          <thead><tr><th>Test</th><th>One change</th><th>Suggestion tested</th><th>From</th><th>Before</th><th>After</th><th>Effect vs control</th><th>Result</th><th>Judge says</th></tr></thead>
           <tbody>{comparison.rows.map((row) => (
             <tr key={row.attempt}>
-              <td>{testName(row)}</td><td>{row.change}</td><td>{row.suggestion}</td><td>Attempt {row.source_attempt}</td>
-              <td>{show(row.before_score)}</td><td>{show(row.after_score)}</td><td>{signed(row.effect)}</td><td>{VERDICT[row.verdict]}</td>
+              <td>{testName(row)}</td><td>{row.change}{row.prompt && <small className="test-prompt">Prompt: {row.prompt}</small>}</td><td>{row.suggestion}</td><td>Attempt {row.source_attempt}</td>
+              <td>{show(row.before_score)}</td><td>{show(row.after_score)}</td><td>{signed(row.effect)}</td><td>{VERDICT[row.verdict]}</td><td>{row.judge_verdict === "RUNNING" ? "Judging..." : row.judge_verdict ?? "n/a"}</td>
             </tr>
           ))}</tbody>
         </table>
@@ -201,7 +207,7 @@ function TestViewer({ viewer }: { viewer: TestViewerState }) {
   );
 }
 
-export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: string; locked: boolean; renderRun: (id: string) => ReactNode; viewer: TestViewerState }) {
+export function SuggestionTests({ runId, locked, renderRun, viewer, judge, judges, onJudge }: { runId: string; locked: boolean; renderRun: (id: string) => ReactNode; viewer: TestViewerState; judge: JudgeId; judges: JudgeOption[]; onJudge: (judge: JudgeId) => void }) {
   const [data, setData] = useState<SuggestionState | null>(null);
   const [problem, setProblem] = useState("");
   const [starting, setStarting] = useState(false);
@@ -209,7 +215,9 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
   const [chosen, setChosen] = useState<Set<number> | null>(null);
   const [round, setRound] = useState("");
   const allBox = useRef<HTMLInputElement | null>(null);
-  const url = `/api/reports/runs/${runId}/suggestion-tests`;
+  const lastPlan = useRef("");
+  const base = `/api/reports/runs/${runId}/suggestion-tests`;
+  const url = `${base}?judge=${judge}`;
 
   const load = useCallback(async () => {
     const response = await fetch(url);
@@ -221,7 +229,7 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
     load().catch((reason) => setProblem(reason.message));
   }, [load, locked]);
 
-  const waiting = !!data?.running || !!data?.reason?.includes("analysing");
+  const waiting = !!data?.running || !!data?.reason?.includes("analysing") || !!data?.results.some((item) => item.comparison.judging);
   useEffect(() => {
     if (!waiting) return;
     const timer = window.setTimeout(() => load().catch(() => undefined), data?.running ? 1000 : 2500);
@@ -230,13 +238,10 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
 
   const planKey = data?.ready ? data.tests.map((test) => `${test.test}:${test.kind}:${test.source_attempt}`).join("|") : "";
   useEffect(() => {
-    if (!planKey || !data) return;
-    const numbers = data.tests.map((test) => test.test);
-    setChosen((current) => {
-      const kept = current ? numbers.filter((number) => current.has(number)) : numbers;
-      return new Set(current && !kept.length ? [] : kept);
-    });
-  }, [planKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!planKey) return;
+    if (lastPlan.current && lastPlan.current !== planKey) setChosen(null); // a different judge can plan different tests
+    lastPlan.current = planKey;
+  }, [planKey]);
 
   const newest = data?.results[0]?.run_id ?? "";
   useEffect(() => {
@@ -246,7 +251,7 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
 
   const tests = data?.tests ?? [];
   const running = !!data?.running;
-  const isChosen = (number: number) => running || !!chosen?.has(number);
+  const isChosen = (number: number) => running || chosen === null || chosen.has(number);
   const picked = tests.filter((test) => isChosen(test.test));
   const everyChosen = tests.length > 0 && picked.length === tests.length;
   useEffect(() => {
@@ -255,7 +260,7 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
 
   const toggle = (number: number) =>
     setChosen((current) => {
-      const next = new Set(current ?? []);
+      const next = new Set(current ?? tests.map((test) => test.test));
       if (next.has(number)) next.delete(number);
       else next.add(number);
       return next;
@@ -266,7 +271,7 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
     setStarting(true);
     setProblem("");
     try {
-      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tests: picked.map((test) => test.test) }) });
+      const response = await fetch(base, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tests: picked.map((test) => test.test), judge }) });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(typeof body.detail === "string" ? body.detail : `Could not start the tests (${response.status})`);
@@ -297,11 +302,13 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
         {running ? (
           <button className="danger" onClick={() => void stop()}>Stop tests</button>
         ) : (
-          <button className="primary test-run-button" disabled={!data.ready || locked || starting || !picked.length} onClick={() => void start()}>
+          <button className="primary test-run-button" disabled={!data.ready || locked || starting || !picked.length || judges.find((item) => item.id === judge)?.available === false} onClick={() => void start()}>
             {data.ready ? `Run ${picked.length} selected test${picked.length === 1 ? "" : "s"} · up to $${cost.toFixed(2)}` : "Run tests"}
           </button>
         )}
       </div>
+      <JudgePicker judge={judge} judges={judges} onChange={onJudge} disabled={running} />
+      {!running && data.source_judge && data.source_judge !== judge && <p className="hint test-warning">The original run used the {data.source_judge === "claude" ? "Claude" : "offline"} judge. These tests use this judge's prompt, so compare each change with the unchanged control.</p>}
       {problem && <div className="status error">{problem}</div>}
       {data.reason && !running && <p className="hint">{data.reason}</p>}
       {tests.length > 0 && (
@@ -322,7 +329,7 @@ export function SuggestionTests({ runId, locked, renderRun, viewer }: { runId: s
               <tbody>{tests.map((test) => (
                 <tr key={test.test} className={isChosen(test.test) ? "chosen" : ""}>
                   <td><input type="checkbox" aria-label={`Run ${testName(test)}`} checked={isChosen(test.test)} disabled={running} onChange={() => toggle(test.test)} /></td>
-                  <td>{testName(test)}</td><td>{test.change}</td><td>Attempt {test.source_attempt}</td><td>{test.max_seconds} s</td><td>{test.suggestion}</td>
+                  <td>{testName(test)}</td><td>{test.change}<small className="test-prompt">Prompt: {test.prompt}</small></td><td>Attempt {test.source_attempt}</td><td>{test.max_seconds} s</td><td>{test.suggestion}</td>
                 </tr>
               ))}</tbody>
             </table>

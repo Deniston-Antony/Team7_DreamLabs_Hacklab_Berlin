@@ -72,6 +72,8 @@ class TaskDefinition(BaseModel):
     test_kind: str | None = None
     test_change: str | None = None
     test_suggestion: str | None = None
+    judge: Literal["offline", "claude"] | None = None
+    robot_prompt: str | None = None
 
     @property
     def run(self) -> str:
