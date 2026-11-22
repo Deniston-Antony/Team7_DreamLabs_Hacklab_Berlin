@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent } from "react";
-import { ReportsCenter } from "./EvaluationPanels";
+import { BenchmarksPage } from "./EvaluationPanels";
 import type { EvaluationRef } from "./EvaluationPanels";
 
 type SceneObject = {
@@ -27,6 +27,8 @@ type Task = {
   attempts_note?: string;
   attempts_error?: string;
   waiting_for_attempts?: boolean;
+  finalizing?: boolean;
+  waiting_for_capacity?: boolean;
   evaluation?: EvaluationRef | null;
   evaluation_error?: string | null;
 };
@@ -47,17 +49,12 @@ type Live = {
   robot: Record<string, number[]>;
   contacts: number;
 };
-type Sessions = {
-  sessions: { session_id: string; name: string; busy: boolean }[];
-  max_parallel: number;
-  parallel_supported: boolean;
-};
 type Point = { camera: string; u: number; v: number };
 
 const CAMERAS = ["top", "left", "right", "free"];
 const CAMERA_LABEL: Record<string, string> = { top: "top", left: "left", right: "right", free: "3D view" };
 const MAX_TASK_SECONDS = 200;
-const MAX_ATTEMPTS = 8;
+const MAX_ATTEMPTS = 9;
 const FRAME_WIDTH = 640;
 const FRAME_HEIGHT = 360;
 
@@ -158,7 +155,7 @@ function AttemptsPanel({ task }: { task: Task }) {
 export default function App() {
   const [scenes, setScenes] = useState<Option[]>([]);
   const [robots, setRobots] = useState<Option[]>([]);
-  const [sessions, setSessions] = useState<Sessions | null>(null);
+  const [page, setPage] = useState<"simulator" | "benchmarks">("simulator");
   const [live, setLive] = useState<Live | null>(null);
   const [connected, setConnected] = useState(false);
   const [frameUrl, setFrameUrl] = useState("");
@@ -178,7 +175,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const socket = useRef<WebSocket | null>(null);
   const cameraRef = useRef(camera);
-  const drag = useRef<{ active: boolean; sending: boolean; next: Point | null }>({ active: false, sending: false, next: null });
+  const drag = useRef<{ active: boolean; pressed: boolean; sending: boolean; next: Point | null }>({ active: false, pressed: false, sending: false, next: null });
   const orbit = useRef({ active: false, sending: false, x: 0, y: 0, dx: 0, dy: 0 });
   const zoom = useRef({ sending: false, delta: 0 });
   const viewRef = useRef<HTMLDivElement | null>(null);
@@ -242,14 +239,12 @@ export default function App() {
 
   useEffect(() => {
     run("Connected to the real local MuJoCo simulator", async () => {
-      const [sceneList, robotList, sessionList] = await Promise.all([
+      const [sceneList, robotList] = await Promise.all([
         api<{ scene_id: string; name: string }[]>("/api/scenes"),
         api<{ robot_id: string; name: string; executable: boolean }[]>("/api/robots"),
-        api<Sessions>("/api/sessions"),
       ]);
       setScenes(sceneList.map((scene) => ({ id: scene.scene_id, name: scene.name })));
       setRobots(robotList.map((robot) => ({ id: robot.robot_id, name: robot.name, executable: robot.executable })));
-      setSessions(sessionList);
     });
   }, [run]);
 
@@ -376,6 +371,7 @@ export default function App() {
     const pointerId = event.pointerId;
     const point = framePoint(event);
     event.preventDefault();
+    drag.current.pressed = true;
     try {
       const picked = await api<{ object_id: string | null; movable: boolean }>("/api/view/pick", point);
       if (!picked.object_id) {
@@ -384,6 +380,11 @@ export default function App() {
       }
       if (!picked.movable) {
         setStatus({ text: `Selected ${picked.object_id}. It is fixed, so it cannot be dragged.`, error: false });
+        return;
+      }
+      if (!drag.current.pressed) {
+        await api("/api/view/drop", {});
+        setStatus({ text: `Selected ${picked.object_id}`, error: false });
         return;
       }
       target.setPointerCapture(pointerId);
@@ -417,6 +418,7 @@ export default function App() {
       return;
     }
     const state = drag.current;
+    state.pressed = false;
     if (!state.active) return;
     state.active = false;
     while (state.sending) await new Promise((resolve) => window.setTimeout(resolve, 15));
@@ -482,7 +484,12 @@ export default function App() {
     <main>
       <h1>Dream Labs Integration Test</h1>
       <p className="note">Live view of the real local Dream YAM Sim. The hosted Playground is not embedded or controlled.</p>
-      <div className="layout">
+      <nav className="page-tabs" aria-label="Pages">
+        <button className={page === "simulator" ? "active" : ""} onClick={() => setPage("simulator")}>Simulator</button>
+        <button className={page === "benchmarks" ? "active" : ""} onClick={() => setPage("benchmarks")}>Benchmarks</button>
+      </nav>
+      {page === "benchmarks" && <BenchmarksPage latestRunId={task?.evaluation ? task.task_id : ""} locked={running} />}
+      <div className="layout" hidden={page !== "simulator"}>
         <section>
           <div className="panel">
             <div className="stream-bar">
@@ -525,7 +532,13 @@ export default function App() {
             </p>
           </div>
           {task && <AttemptsPanel key={task.task_id} task={task} />}
-          <ReportsCenter latestRunId={task?.evaluation ? task.task_id : ""} error={task?.evaluation_error} locked={running} />
+          {task?.evaluation && (
+            <div className="panel report-prompt">
+              <span>This task's report is ready.</span>
+              <button className="primary" onClick={() => setPage("benchmarks")}>Open report</button>
+            </div>
+          )}
+          {task?.evaluation_error && <div className="panel"><div className="status error">{task.evaluation_error}</div></div>}
           <div className="panel">
             <h2>Live scene state from simulator <span className="muted">{live?.contacts ?? 0} contacts</span></h2>
             <table>
@@ -562,17 +575,6 @@ export default function App() {
           </div>
         </section>
         <aside>
-          <div className="panel">
-            <h2>Simulations</h2>
-            {sessions?.sessions.map((session) => (
-              <div className="session" key={session.session_id}>
-                <strong>{session.name}</strong>
-                <span>{running ? "Running" : "Active"}</span>
-              </div>
-            ))}
-            <button disabled title="Multiple simulations are planned">Add simulation (coming soon)</button>
-            <p className="hint">One simulation runs at a time for now.</p>
-          </div>
           <div className="panel">
             <h2>Setup</h2>
             <div className="row">
@@ -619,7 +621,7 @@ export default function App() {
           <div className="panel">
             <h2>Task</h2>
             <textarea aria-label="Task instruction" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
-            <label style={{ marginTop: 8 }}>Time limit (seconds)
+            <label style={{ marginTop: 8 }}>Robot movement time (seconds)
               <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Number(event.target.value))} />
             </label>
             <label style={{ marginTop: 8 }}>Attempts at once (each uses credits)
@@ -628,9 +630,13 @@ export default function App() {
             <div className="timer" aria-label="Task timer">
               {clock(task?.elapsed_s ?? 0)} <span>/ {clock(task?.max_seconds ?? maxSeconds)}</span>
             </div>
+            {running && task?.waiting_for_capacity && <p className="hint">Dream-1 is busy. Waiting for a free seat; the robot holds still and its movement time is paused.</p>}
+            {running && !task?.waiting_for_capacity && !task?.finalizing && !task?.waiting_for_attempts && !task?.elapsed_s && <p className="hint">Starting. The timer counts robot movement from Dream-1's first action.</p>}
+            {running && task?.waiting_for_attempts && <p className="hint">Live attempt finished. Hidden attempts are finishing their full movement time.</p>}
+            {task?.finalizing && <p className="hint">Robots stopped. Saving videos and reports...</p>}
             <div className="row">
               {running ? (
-                <button className="danger" onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop task</button>
+                <button className="danger" disabled={task?.finalizing} onClick={() => run("Stop requested", () => api(`/api/tasks/${task!.task_id}/cancel`, {}))}>Stop task</button>
               ) : (
                 <button className="primary" disabled={locked || !connected || !instruction.trim()} onClick={() => run("Task started", () => api("/api/tasks/execute", { instruction, max_seconds: maxSeconds, attempts }))}>
                   Execute task (uses credits)

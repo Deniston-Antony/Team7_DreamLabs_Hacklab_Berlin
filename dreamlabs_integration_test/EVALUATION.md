@@ -70,12 +70,26 @@ Only the most serious incident per object is scored, which prevents one collisio
 | `GET` | `/api/reports/batches/{batch_id}?format=json\|html` | Full benchmark report |
 | `GET` | `/api/reports/batches/{batch_id}/summary` | Website summary |
 
+## Timing and Dream-1 capacity
+
+The time limit is **robot movement time**. Every attempt moves for that long unless it succeeds first. Loading, Dream-1 thinking pauses and waiting for a free seat do not use it, so real time is longer than the limit.
+
+When Dream-1 reports no capacity, the attempt holds still and retries with increasing delays for up to 90 seconds. Attempts also start 1.5 seconds apart.
+
 ## Limitations
 
 - Dream-1's API returns arm actions, not detections or attention maps. **Perception (inferred)** uses which object the gripper reached first. It is evidence of behaviour, is not scored, and does not prove what the model recognised.
+- The vision check uses OWLv2 on the first frame of each camera. It is unscored, runs locally after the task, and checks the camera view rather than Dream-1's understanding. On 108 simulator checks it reached 94% agreement with MuJoCo visibility, with 6 missed objects and no false detections.
 - Contacts are sampled at control steps, so very brief contacts can be missed.
 - Uploaded STL collisions use a convex shape.
 - A small number of runs does not establish statistically meaningful performance.
+
+Install the optional vision model from `backend`:
+
+```bash
+uv venv --python 3.12 .vision-venv
+uv pip install --python .vision-venv/bin/python -r vision/requirements.txt
+```
 
 Run the tests from `backend`:
 

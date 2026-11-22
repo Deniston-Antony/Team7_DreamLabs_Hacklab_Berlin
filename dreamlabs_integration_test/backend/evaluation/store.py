@@ -25,7 +25,29 @@ class EvaluationStore:
         self.order: list[str] = []
         self.current_batch = f"batch-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         self.load_errors: list[str] = []
+        self.names_path = self.folder / "benchmark_names.meta"
+        self.names: dict[str, str] = self._load_names()
         self._load()
+
+    def _load_names(self) -> dict[str, str]:
+        try:
+            data = json.loads(self.names_path.read_text())
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {key: value for key, value in data.items() if isinstance(key, str) and isinstance(value, str)}
+
+    def rename_batch(self, batch_id: str, name: str) -> str | None:
+        with self.lock:
+            known = batch_id == self.current_batch or any(record[0].batch_id == batch_id for record in self.records.values())
+            if not known:
+                return None
+            self.names[batch_id] = name
+            temporary = self.names_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self.names))
+            os.replace(temporary, self.names_path)
+            return name
 
     def _path(self, task_id: str) -> Path:
         if not SAFE_ID.match(task_id):
@@ -89,6 +111,18 @@ class EvaluationStore:
             key=lambda record: record[0].attempt,
         )
 
+    def vision_items(self, run_id: str):
+        with self.lock:
+            return [(task, evidence) for task, evidence, _ in self._run_records(run_id) if evidence.initial_snapshot]
+
+    def attach_vision(self, task_id: str, vision: dict):
+        with self.lock:
+            record = self.records.get(task_id)
+            if record is None:
+                return
+            record[1].vision = vision
+            self._save(*record)
+
     def has_run(self, run_id: str) -> bool:
         with self.lock:
             return any(record[0].run == run_id for record in self.records.values())
@@ -113,6 +147,7 @@ class EvaluationStore:
                 output.append(
                     {
                         "batch_id": name,
+                        "name": self.names.get(name),
                         "is_current": name == self.current_batch,
                         "first_started_at": report["first_started_at"],
                         "last_started_at": report["last_started_at"],
@@ -122,7 +157,10 @@ class EvaluationStore:
                         "batch_score": report["batch_score"],
                     }
                 )
-            output.sort(key=lambda item: (item["is_current"], item["last_started_at"] or 0), reverse=True)
+            output.sort(key=lambda item: item["first_started_at"] if item["first_started_at"] is not None else float("inf"))
+            for number, item in enumerate(output, 1):
+                item["number"] = number
+            output.reverse()
             return {"current_batch": self.current_batch, "batches": output}
 
     def batch_report(self, batch_id: str):
@@ -132,4 +170,6 @@ class EvaluationStore:
                 for task, evidence, result in (self.records[task_id] for task_id in self.order)
                 if task.batch_id == batch_id
             ]
-        return None if not rows and batch_id != self.current_batch else aggregate(batch_id, rows)
+        if not rows and batch_id != self.current_batch:
+            return None
+        return {**aggregate(batch_id, rows), "name": self.names.get(batch_id)}

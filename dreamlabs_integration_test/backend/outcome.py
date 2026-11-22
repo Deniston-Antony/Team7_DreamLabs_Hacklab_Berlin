@@ -23,14 +23,15 @@ SORTFLOW = Path(__file__).resolve().parents[2] / "SortFlow"
 # Appended, so `dream_control` and `yam_env` stay the ones main.py already imported from the installed example.
 if str(SORTFLOW) not in sys.path:
     sys.path.append(str(SORTFLOW))
+import capacity  # noqa: E402
 import recording  # noqa: E402
 
 VIDEOS = Path(__file__).resolve().parent / "task_videos"
-MAX_ATTEMPTS = 8
-STAGGER_S = 0.5  # between worker starts, so they do not open their Dream sessions in one burst
+MAX_ATTEMPTS = 9
+STAGGER_S = 1.5  # between worker starts, so they do not open their Dream sessions in one burst
 CLIP = re.compile(r"^(attempt-[1-9][0-9]*|grid)$")  # the video names the API serves
 POLL_S = 0.5
-WAIT_AFTER_LIVE_S = 90  # how long past the time limit a worker may take to report
+WORKER_STARTUP_S = 30  # time a hidden attempt may take to load before its own clock starts
 WORKER_EXIT_S = 10  # how long a stopped worker gets to finish its video
 
 
@@ -46,6 +47,9 @@ class Workers:
         @param count How many workers; their videos are attempt-2.mp4, attempt-3.mp4, ...
         """
         self.folder, self.count, self.procs, self.objects = folder, count, [], objects
+        self.deadline = (
+            time.monotonic() + capacity.wall_limit(task["max_seconds"]) + WORKER_STARTUP_S + count * STAGGER_S
+        )
         model_path, state_path = folder / "scene.mjb", folder / "scene.npz"
         mujoco.mj_saveModel(env.model, str(model_path))
         np.savez(state_path, qpos=env.data.qpos, qvel=env.data.qvel, ctrl=env.data.ctrl)
@@ -141,6 +145,8 @@ class Workers:
             tail = ((err or "").strip().splitlines() or ["no output"])[-1]
             if lines:
                 record = json.loads(lines[-1][len("RESULT ") :])
+                if record.get("error") == "exit 143":  # stopped at the task's time limit
+                    record["error"] = None
                 if str(record.get("error") or "").startswith("exit "):  # dream_control refused to start: say why
                     record["error"] = f"{record['error']}: {tail}"
                 records.append(record)
@@ -192,7 +198,7 @@ class Session:
         elif self.workers:
             self.task["waiting_for_attempts"] = True
             records = self.workers.results(
-                self.task["max_seconds"] + WAIT_AFTER_LIVE_S, lambda: bool(self.task.get("cancel_requested"))
+                max(0.0, self.workers.deadline - time.monotonic()), lambda: bool(self.task.get("cancel_requested"))
             )
             self.task["waiting_for_attempts"] = False
             if records is None:
@@ -209,6 +215,7 @@ class Session:
                             "error": record.get("error"),
                         }
                     )
+        self.task["finalizing"] = True
         entries = []
         for r in results:
             clip = self.folder / f"attempt-{r['attempt']}.mp4"

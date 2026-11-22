@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(list(dream_examples.__path__)[0]) / "yam_mujoco"))
 import dream_control as dc  # noqa: E402
 import yam_env  # noqa: E402
 import outcome  # noqa: E402
+import capacity  # noqa: E402
 import evaluation  # noqa: E402
 
 DEFAULT_SCENE = "yam_tabletop"
@@ -233,6 +234,7 @@ class SimAdapter:
         self.type_overrides = {}
         self.goal = None
         self.capture = None
+        self.clock = None
         self.view_lock = threading.Lock()
         self.free_camera = mujoco.MjvCamera()
         self.free_camera.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -248,8 +250,10 @@ class SimAdapter:
         now = time.monotonic()
         self.feed.last_step = now
         self._check_goal()
+        if self.clock is not None:
+            self.clock.tick()
         if self.capture is not None:
-            self.capture.on_step()
+            self.capture.on_step(images)
         if now - self.last_publish < STREAM_PERIOD_S:
             return
         self.last_publish = now
@@ -767,16 +771,20 @@ sim = pool.submit(SimAdapter, feed).result()
 tasks = {}
 active_task = None
 active_stop = None
+active_clock = None
 app = FastAPI(title="Dream Labs integration test")
 evaluations = evaluation.EvaluationStore(
     Path(os.environ.get("DREAM_EVALUATION_DATA", Path(__file__).resolve().parent / "evaluation_data"))
 )
 app.include_router(evaluation.create_router(evaluations))
+vision_checks = evaluation.VisionQueue(evaluations, Path(__file__).resolve().parent)
 _open_policy = dc.open_policy
 
 
 def open_counted_policy(config, key):
     client = _open_policy(config, key)
+    if active_clock is not None:
+        client = capacity.CapacityClient(client, active_clock)
     if sim.capture is not None:
         sim.capture.watch_model_calls(client)
     return client
@@ -831,6 +839,8 @@ def hidden_evidence(task, number, record, folder):
     try:
         proof = evaluation.Evidence.model_validate_json(path.read_text())
         proof.task_id = attempt_id
+        if proof.execution_status == "CANCELLED" and not task.get("cancel_requested"):
+            proof.execution_status = "TIMED_OUT"
     except (OSError, ValueError):
         status = "FAILED"
         errors = [record["error"]] if record.get("error") else ["The hidden attempt did not return simulator evidence."]
@@ -860,6 +870,7 @@ def evaluate_run(task, definition, capture, result):
         proof.run_videos = list(videos)
         attempt = definition.model_copy(update={"task_id": proof.task_id, "attempt": number, "where": "hidden"})
         evaluations.submit(attempt, proof)
+    vision_checks.submit(task["task_id"], folder)
     run = evaluations.run_report(task["task_id"])["run"]
     return {
         "outcome": run["outcome"],
@@ -872,20 +883,28 @@ def evaluate_run(task, definition, capture, result):
 
 
 def run_task(task, stop):
-    global active_task, active_stop
+    global active_task, active_stop, active_clock
     result = {}
     goal = parse_goal(task["instruction"], list(sim._joint_by_body()))
     if goal and goal["target"] not in sim.managed():
         goal = None
     if goal:
         sim.goal = {**goal, "frames": 0, "met": False, "stop": stop}
+    clock = capacity.AttemptClock(
+        task["max_seconds"], stop, lambda: task.update(time_limit_reached=True)
+    )
+    active_clock = clock
+    sim.clock = clock
     session = None
     definition = None
     capture = None
     try:
         definition = task_definition(task)
         capture = evaluation.EvidenceCapture(
-            sim.env, sim.managed(), (dc.FRAMES - 1) * dc.FRAME_EVERY_STEPS + 1
+            sim.env,
+            sim.managed(),
+            (dc.FRAMES - 1) * dc.FRAME_EVERY_STEPS + 1,
+            outcome.VIDEOS / task["task_id"] / "attempt-1.frames",
         )
         sim.capture = capture
     except Exception as error:  # scoring must never stop the robot run
@@ -893,7 +912,7 @@ def run_task(task, stop):
     try:
         session = outcome.Session(task, sim.env, goal, sim.managed())
         dc.main(
-            [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(task["max_seconds"])],
+            [f"--task={task['instruction']}", "--headless", "--quiet", "--seconds", str(capacity.wall_limit(task["max_seconds"]))],
             shared_env=sim.env,
             stop_event=stop,
         )
@@ -901,7 +920,7 @@ def run_task(task, stop):
             result["status"] = "COMPLETED"
             result["outcome"] = "SUCCESS"
             result["result_message"] = f"{goal['object'].replace('_', ' ')} is in the {goal['target']}."
-        elif stop.is_set():
+        elif stop.is_set() and not task.get("time_limit_reached"):
             result["status"] = "CANCELLED"
             result["result_message"] = "ended by the user."
         elif goal:
@@ -913,9 +932,17 @@ def run_task(task, stop):
             result["outcome"] = "NOT_EVALUATED"
             result["result_message"] = "this instruction cannot be checked automatically."
     except (Exception, SystemExit) as error:
-        result["status"] = "FAILED"
-        result["error"] = f"{type(error).__name__}: {error}"
+        if task.get("cancel_requested"):
+            result["status"] = "CANCELLED"
+            result["result_message"] = "ended by the user."
+        else:
+            result["status"] = "FAILED"
+            result["error"] = f"{type(error).__name__}: {error}"
     finally:
+        sim.clock = None
+        clock.close()
+        result["robot_seconds"] = round(clock.used(), 1)
+        task["robot_seconds"] = result["robot_seconds"]
         sim.goal = None
         sim.capture = None
         try:
@@ -933,6 +960,7 @@ def run_task(task, stop):
         sim.publish()
         active_task = None
         active_stop = None
+        active_clock = None
         task.update(result, finished_at=finished_at)
 
 
@@ -940,7 +968,14 @@ def task_view(task):
     if task is None:
         return None
     finished = task["finished_at"] or time.time()
-    return {**task, "elapsed_s": round(max(0.0, finished - task["started_at"]), 1)}
+    clock = active_clock if task is active_task else None
+    if clock is not None:
+        elapsed = clock.used()
+    elif task.get("robot_seconds") is not None:
+        elapsed = task["robot_seconds"]
+    else:
+        elapsed = min(max(0.0, finished - task["started_at"]), task["max_seconds"])
+    return {**task, "elapsed_s": round(elapsed, 1), "waiting_for_capacity": bool(clock and clock.waiting)}
 
 
 def live_phase():
@@ -1073,21 +1108,6 @@ async def view_drop():
     return await change_scene(sim.drop)
 
 
-@app.get("/api/sessions")
-def sessions():
-    return {
-        "active_session": "simulation-1",
-        "sessions": [{"session_id": "simulation-1", "name": "Simulation 1", "scene_id": sim.scene_id, "busy": active_task is not None}],
-        "max_parallel": 1,
-        "parallel_supported": False,
-    }
-
-
-@app.post("/api/sessions")
-def create_session():
-    return unsupported("parallel_simulations", "Multiple simulations are planned but not implemented yet.")
-
-
 @app.post("/api/objects/add")
 async def add_object(body: AddObject):
     if body.type != "block":
@@ -1177,6 +1197,14 @@ def task_video(task_id: str, clip: str):
     if not known or not outcome.CLIP.match(clip) or not path.is_file():
         raise HTTPException(404, "no such video")
     return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/api/tasks/{task_id}/frames/{attempt}/{camera}")
+def task_frame(task_id: str, attempt: int, camera: str):
+    path = outcome.VIDEOS / task_id / f"attempt-{attempt}.frames" / f"{camera}.jpg"
+    if not evaluations.has_run(task_id) or not 1 <= attempt <= outcome.MAX_ATTEMPTS or camera not in CAMERAS or not path.is_file():
+        raise HTTPException(404, "no such frame")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.websocket("/ws/live")

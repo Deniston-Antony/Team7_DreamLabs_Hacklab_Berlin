@@ -21,6 +21,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import capacity  # noqa: E402
+
 RESULT = "RESULT "  # a worker's last stdout line starts with this, followed by its JSON record
 MAX_WORKERS = 16
 STAGGER_S = 1.0  # seconds between the first workers' starts, so they do not open their sessions in one burst
@@ -64,7 +66,8 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
     item, target = spec
     Watcher = GoalWatcher if goal else SuccessWatcher
     runner = runner or dream_control.main
-    argv = ["--task", task, "--headless", "--quiet", "--seconds", str(seconds), "--actions", str(actions)]
+    run_seconds = capacity.wall_limit(seconds) if evidence else seconds
+    argv = ["--task", task, "--headless", "--quiet", "--seconds", str(run_seconds), "--actions", str(actions)]
     if model:
         argv += ["--model", model]
     env = YamEnv()
@@ -90,6 +93,7 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
 
         recording = attach(env, video)
     capture = None
+    clock = capacity.AttemptClock(seconds, threading.Event()) if evidence else None
     record = {"task": task, "success": False, "success_try": None, "tries_used": 0, "sim_seconds": None, "error": None}
     closest = float("inf")
     started = time.monotonic()
@@ -100,19 +104,20 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
                 try:
                     from evaluation.evidence import EvidenceCapture
 
-                    capture = EvidenceCapture(env, evidence[1], (dream_control.FRAMES - 1) * dream_control.FRAME_EVERY_STEPS + 1)
+                    capture = EvidenceCapture(env, evidence[1], (dream_control.FRAMES - 1) * dream_control.FRAME_EVERY_STEPS + 1, str(evidence[0]).removesuffix(".evidence.json") + ".frames")
                     rendered = env.images
 
                     def images():
                         result = rendered()
-                        capture.on_step()
+                        capture.on_step(result)
+                        clock.tick()
                         return result
 
                     env.images = images
                     opened = dream_control.open_policy
 
                     def open_policy(config, key):
-                        client = opened(config, key)
+                        client = capacity.CapacityClient(opened(config, key), clock)
                         capture.watch_model_calls(client)
                         return client
 
@@ -123,6 +128,8 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
             record["tries_used"] = attempt
             for refusals in range(3):  # a retryable refusal (no capacity, say) is asked again, at most twice
                 done = threading.Event()
+                if clock:
+                    clock.stop = done
                 watcher = Watcher(env, item, target, done)
                 watcher.start()
                 error = None
@@ -150,6 +157,8 @@ def run_worker(task, seconds, actions, tries, runner=None, retry_pause=2.0, mode
             if record["success"] or record["error"]:
                 break
     finally:
+        if clock:
+            clock.close()
         if capture:
             try:
                 write_evidence(capture, evidence[0], record)

@@ -47,6 +47,7 @@ def task_report(task: TaskDefinition, evidence: Evidence, result: TaskResult) ->
             "videos": [f"/api/tasks/{task.run}/video/{name}" for name in evidence.videos if name == f"attempt-{task.attempt}"],
             "approach": evidence.approach,
             "model_output_keys": evidence.model_output_keys,
+            "vision": evidence.vision,
         },
     }
 
@@ -61,6 +62,22 @@ def bullets(items: list[str]) -> str:
 
 def page(title: str, body: str) -> str:
     return f'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{escape(title)}</title><style>{STYLE}</style></head><body><main>{body}</main></body></html>'
+
+
+def vision_section(vision: dict[str, Any] | None) -> str:
+    if not vision:
+        return ""
+    if vision.get("status") != "done":
+        return f'<section><h2>Vision check</h2><p class="muted">{escape(str(vision.get("detail") or vision.get("status")))}</p></section>'
+    table = [
+        [camera, name, "Yes" if item["detected"] else "No", item["score"], "n/a" if item["simulator_visible"] is None else "Yes" if item["simulator_visible"] else "No"]
+        for camera, value in vision["cameras"].items()
+        for name, item in value["objects"].items()
+    ]
+    agreement = vision["agreement"]
+    return f"""<section><h2>Vision check (not scored)</h2><p>Target {escape(str(vision['target']))} detected in: {escape(', '.join(vision['target_detected_in']) or 'no camera')}.
+    Matches simulator visibility in {agreement['matching']} of {agreement['total']} checks.</p><p class="muted">{escape(vision['model'])}. This checks the camera view, not what Dream-1 understood.</p>
+    <table><tr><th>Camera</th><th>Object</th><th>Detected</th><th>Confidence</th><th>Simulator visible</th></tr>{rows(table)}</table></section>"""
 
 
 def task_body(report: dict[str, Any]) -> str:
@@ -93,6 +110,7 @@ def task_body(report: dict[str, Any]) -> str:
     <section><h2>What went well</h2>{bullets(result['went_well'])}<h2>What went wrong</h2>{bullets(result['went_wrong'])}<h2>Recommendations</h2>{bullets(result['recommendations'])}<h2>Missing evidence</h2>{bullets(result['missing_evidence'])}</section>
     <section><h2>Evidence</h2>{videos}<h3>Initial and final object positions</h3><table><tr><th>Object</th><th>Initial (m)</th><th>Final (m)</th></tr>{rows(moved)}</table>
     <p class="muted">Contact events recorded: {escape(str(report['evidence']['contact_events_total']))}</p></section>
+    {vision_section(report['evidence'].get('vision'))}
     """
     return body
 
@@ -124,7 +142,7 @@ def batch_html(report: dict[str, Any]) -> str:
     counts = [[name.replace("_", " ").title(), report[name]] for name in ("total_tasks", "successful", "partial", "failed", "unsafe", "timed_out", "not_evaluable", "total_disturbances", "total_penalties")]
     stats = [[name.replace("_", " ").title(), "n/a" if report[name] is None else report[name]] for name in ("average_score", "median_score", "highest_score", "lowest_score", "success_rate", "score_coverage")]
     body = f"""
-    <section><h1>Benchmark report</h1><p class="muted">{escape(report['batch_id'])}</p><div class="score">{escape(score)}</div><p>{escape(report['sample_note'])}</p></section>
+    <section><h1>{escape(report.get('name') or 'Benchmark report')}</h1><p class="muted">{escape(report['batch_id'])}</p><div class="score">{escape(score)}</div><p>{escape(report['sample_note'])}</p></section>
     <section><h2>Overview</h2><table>{rows(counts)}{rows(stats)}</table></section>
     <section><h2>Tasks</h2><table><tr><th>Task</th><th>Instruction</th><th>Scene</th><th>Execution</th><th>Outcome</th><th>Score</th></tr>{rows(tasks)}</table></section>
     <section><h2>Common issues</h2><table>{rows([[item['type'].replace('_', ' '), item['count']] for item in report['common_failures']])}</table><h2>Recommendations</h2>{bullets(report['recommendations'])}</section>
