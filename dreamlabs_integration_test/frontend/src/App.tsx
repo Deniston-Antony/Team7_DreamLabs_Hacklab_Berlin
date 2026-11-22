@@ -248,7 +248,7 @@ export default function App() {
   const [uploadKey, setUploadKey] = useState(0);
   const [instruction, setInstruction] = useState("put apple into the bowl");
   const [maxSeconds, setMaxSeconds] = useState(MAX_TASK_SECONDS);
-  const [attempts, setAttempts] = useState(1);
+  const [totalRuns, setTotalRuns] = useState(1); // every task's runs together; task 1 gets what the others leave
   const [extras, setExtras] = useState<{ text: string; attempts: number }[]>([]);
   const [lastRequest, setLastRequest] = useState<Record<string, unknown> | null>(null);
   const [envMode, setEnvMode] = useState<"same" | "shuffle" | "shuffle_style">("same");
@@ -391,7 +391,30 @@ export default function App() {
   const selectedPosition = selectedObject?.position.join(",");
   const task = live?.task ?? null;
   const running = task?.status === "RUNNING";
-  const totalAttempts = attempts + extras.reduce((sum, extra) => sum + extra.attempts, 0);
+  const extraRuns = extras.reduce((sum, extra) => sum + extra.attempts, 0);
+  const totalAttempts = totalRuns;
+  const attempts = totalRuns - extraRuns; // task 1's runs: always at least 1
+  const changeTotal = (value: number) => {
+    const total = Math.min(MAX_ATTEMPTS, Math.max(extras.length + 1, Math.floor(value) || 1));
+    let deficit = extraRuns + 1 - total; // runs to take back from the other tasks, last task first
+    const next = [...extras];
+    for (let i = next.length - 1; i >= 0 && deficit > 0; i--) {
+      const give = Math.min(deficit, next[i].attempts - 1);
+      next[i] = { ...next[i], attempts: next[i].attempts - give };
+      deficit -= give;
+    }
+    setExtras(next);
+    setTotalRuns(total);
+  };
+  const changeTaskRuns = (index: number, value: number) => {
+    const most = extras[index].attempts + attempts - 1; // it can take task 1's runs, down to 1
+    const runs = Math.min(most, Math.max(1, Math.floor(value) || 1));
+    setExtras(extras.map((e, i) => (i === index ? { ...e, attempts: runs } : e)));
+  };
+  const addTask = () => {
+    if (attempts <= 1) setTotalRuns(totalRuns + 1); // task 1 has none to spare: the total grows
+    setExtras([...extras, { text: "", attempts: 1 }]);
+  };
   const suiteReady = extras.every((extra) => extra.text.trim()) && totalAttempts <= MAX_ATTEMPTS;
   const variation = totalAttempts > 1 ? { environments: envMode, seed } : {};
   const request: Record<string, unknown> = extras.length
@@ -615,8 +638,8 @@ export default function App() {
           <div className="panel viewer">
             <nav className="run-tabs" aria-label="Runs">
               <div className="run-tabs-title">Runs</div>
-              <label className="run-count">Runs for this task
-                <input aria-label="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS - (totalAttempts - attempts)} value={attempts} disabled={running} onChange={(event) => setAttempts(Math.min(MAX_ATTEMPTS - (totalAttempts - attempts), Math.max(1, Number(event.target.value) || 1)))} />
+              <label className="run-count" title="Shared out over the tasks in the Tasks panel">Total runs
+                <input aria-label="Total runs" type="number" min={extras.length + 1} max={MAX_ATTEMPTS} value={totalRuns} disabled={running} onChange={(event) => changeTotal(Number(event.target.value))} />
               </label>
               <label className="run-count" title="Applies to every run of every task">Time limit per run (s)
                 <input aria-label="Time limit" type="number" min={5} max={MAX_TASK_SECONDS} value={maxSeconds} disabled={running} onChange={(event) => setMaxSeconds(Math.min(MAX_TASK_SECONDS, Math.max(5, Number(event.target.value) || 5)))} />
@@ -802,16 +825,19 @@ export default function App() {
           <div className="panel">
             <h2>Tasks</h2>
             <textarea aria-label="Task instruction" placeholder="e.g. put apple into the bowl" rows={2} value={instruction} disabled={running} onChange={(event) => setInstruction(event.target.value)} />
-            <p className="hint">Runs for this task and the time limit (shared by every run) are in the Runs list next to the camera view.</p>
+            <div className="hint">
+              Task 1 runs: <strong>{attempts}</strong>
+              {extras.length > 0 ? " (what is left of the total)" : ""}. Set the total and the time limit in the Runs list.
+            </div>
             {extras.map((extra, index) => (
               <div className="extra-task" key={index}>
                 <input aria-label={`Task ${index + 2}`} placeholder="e.g. put orange into the bowl" value={extra.text} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, text: event.target.value } : e)))} />
-                <input aria-label={`Runs for task ${index + 2}`} title="Runs for this task" type="number" min={1} max={MAX_ATTEMPTS} value={extra.attempts} disabled={running} onChange={(event) => setExtras(extras.map((e, i) => (i === index ? { ...e, attempts: Math.min(MAX_ATTEMPTS, Math.max(1, Number(event.target.value) || 1)) } : e)))} />
+                <input aria-label={`Runs for task ${index + 2}`} title="Runs for this task: taken from task 1's runs" type="number" min={1} max={extra.attempts + attempts - 1} value={extra.attempts} disabled={running} onChange={(event) => changeTaskRuns(index, Number(event.target.value))} />
                 <button disabled={running} onClick={() => setExtras(extras.filter((_, i) => i !== index))} aria-label={`Remove task ${index + 2}`} title="Remove task">×</button>
               </div>
             ))}
             <div className="row" style={{ marginTop: 8 }}>
-              <button disabled={running || totalAttempts >= MAX_ATTEMPTS} onClick={() => setExtras([...extras, { text: "", attempts: 1 }])}>Add task</button>
+              <button disabled={running || (attempts <= 1 && totalRuns >= MAX_ATTEMPTS)} onClick={addTask}>Add task</button>
             </div>
             <div className="hint">
               {extras.length + 1} task{extras.length ? "s" : ""} · {totalAttempts} parallel run{totalAttempts > 1 ? "s" : ""} (max {MAX_ATTEMPTS}) · up to ${((totalAttempts * maxSeconds) / 120 * CREDITS_PER_ATTEMPT_120S).toFixed(2)} in credits
