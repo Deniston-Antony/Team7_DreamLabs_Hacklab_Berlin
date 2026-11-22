@@ -80,14 +80,21 @@ function DreamClientLog({ taskId, attempt, running }: { taskId: string; attempt:
     };
   }, [taskId, attempt, running]);
 
-  if (error) return <div className="status error spaced">Dream client log: {error}</div>;
+  if (error) return <div className="dream-log-section"><div className="status error">Dream client log: {error}</div></div>;
   if (!log) return null;
   const s = log.summary;
   return (
-    <div className="dream-client-log">
-      <h3>
-        Dream client log <span className="muted">this run only</span>
-      </h3>
+    <div className="dream-log-section">
+      <div className="dream-log-head">
+        <h3>
+          Dream client log <span className="muted">this run only</span>
+        </h3>
+        {log.entries.length > 0 && (
+          <button className="dream-log-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
+            {open ? "Hide lines" : `Show ${log.entries.length} line${log.entries.length === 1 ? "" : "s"}`}
+          </button>
+        )}
+      </div>
       {log.entries.length === 0 && <p className="hint">{running ? "Nothing logged yet for this run." : "No dream client log for this run."}</p>}
       {log.entries.length > 0 && (
         <>
@@ -97,9 +104,6 @@ function DreamClientLog({ taskId, attempt, running }: { taskId: string; attempt:
             <span className={s.replaced ? "bad" : ""} title="Dream-1 restarted a session mid-run"><b>{s.replaced}</b> session restart{s.replaced === 1 ? "" : "s"}</span>
             <span className={s.warnings ? "bad" : ""}><b>{s.warnings}</b> warning{s.warnings === 1 ? "" : "s"}</span>
           </div>
-          <button className="dream-log-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
-            {open ? "Hide client log" : `Show client log (${log.entries.length} lines)`}
-          </button>
           {open && (
             <div className="dream-log-table">
               <table>
@@ -163,8 +167,18 @@ export function DreamLogPanel({ taskId, attempt, runLabel, running }: { taskId: 
   return (
     <div className="panel dream-log">
       <h2>
-        Dream-1 log <span className="muted">{runLabel}</span>
+        Log <span className="muted">{runLabel}</span>
       </h2>
+      <DreamClientLog taskId={taskId} attempt={attempt} running={running} />
+      <div className="dream-log-section">
+      <div className="dream-log-head">
+        <h3>Dream-1 requests</h3>
+        {s && s.requests > 0 && (
+          <button className="dream-log-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
+            {open ? "Hide requests" : `Show ${s.requests} request${s.requests === 1 ? "" : "s"}${flagged ? ` · ${flagged} flagged` : ""}`}
+          </button>
+        )}
+      </div>
       {error && <div className="status error">{error}</div>}
       {s && s.requests === 0 && <p className="hint">{running ? "Waiting for the first Dream-1 request…" : "This run made no Dream-1 requests."}</p>}
       {s && s.requests > 0 && (
@@ -177,9 +191,6 @@ export function DreamLogPanel({ taskId, attempt, runLabel, running }: { taskId: 
             <span title="The whole round trip; the robot holds still while it waits">total <b>{ms(s.rtt_ms?.mean)}</b> ms avg, <b>{ms(s.rtt_ms?.max)}</b> max</span>
             <span className={s.errors ? "bad" : ""}><b>{s.errors}</b> error{s.errors === 1 ? "" : "s"}{s.error_codes.length ? ` (${s.error_codes.join(", ")})` : ""}</span>
           </div>
-          <button className="dream-log-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
-            {open ? "Hide requests" : `Show requests${flagged ? ` · ${flagged} flagged` : ""}`}
-          </button>
           {open && (
             <div className="dream-log-table">
               <table>
@@ -215,7 +226,7 @@ export function DreamLogPanel({ taskId, attempt, runLabel, running }: { taskId: 
           )}
         </>
       )}
-      <DreamClientLog taskId={taskId} attempt={attempt} running={running} />
+      </div>
     </div>
   );
 }

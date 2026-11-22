@@ -224,12 +224,9 @@ tr.run-row { cursor: pointer; }
 .result-head h3 { margin: 0; }
 .dream-log-summary { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: #4b545c; }
 .dream-log-summary .bad { color: #8a1f17; }
-.dream-log-toggle { margin-top: 8px; }
 .dream-log-table { margin-top: 8px; max-height: 320px; overflow-y: auto; }
 .dream-log-table tr.warn td { background: #f9eeda; }
 .dream-log-table tr.bad td { background: #fdecea; color: #8a1f17; }
-.dream-client-log { margin-top: 14px; padding-top: 10px; border-top: 1px solid #e3e6e9; }
-.dream-client-log h3 { margin: 0 0 6px; font-size: 13px; }
 .dream-log-summary .warn { color: #8a5a00; }
 /* Runs under the view: settings in one row, then one card per run in a horizontal strip; the open run's log follows. */
 .viewer.viewer-stacked { display: block; }
@@ -251,3 +248,7 @@ tr.run-row { cursor: pointer; }
 .run-log-button.open { background: #eef3fd; border-color: #2563eb; color: #1c4fbf; font-weight: 600; }
 .run-log-tab { margin-top: 6px; border: 1px solid #c9d6f2; border-top: 3px solid #2563eb; border-radius: 0 0 6px 6px; background: #fafcff; }
 .run-log-tab .panel { margin: 0; border: 0; background: transparent; }
+.dream-log-section + .dream-log-section { margin-top: 12px; padding-top: 10px; border-top: 1px solid #e3e6e9; }
+.dream-log-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.dream-log-head h3 { margin: 0; font-size: 13px; }
+.dream-log-toggle { flex: 0 0 auto; padding: 3px 10px; font-size: 12px; }
