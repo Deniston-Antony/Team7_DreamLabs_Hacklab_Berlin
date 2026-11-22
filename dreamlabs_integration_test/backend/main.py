@@ -18,6 +18,7 @@ import dream_ik
 import mujoco
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -42,6 +43,9 @@ STREAM_PERIOD_S = 0.1
 JPEG_QUALITY = 70
 WAITING_AFTER_S = 0.3
 ALLOWED_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
+PUBLIC_ORIGIN = os.environ.get("DREAM_PUBLIC_ORIGIN", "").rstrip("/")  # the hosted address, behind its login
+if PUBLIC_ORIGIN:
+    ALLOWED_ORIGINS.add(PUBLIC_ORIGIN)
 MAX_TASK_SECONDS = 200
 SUGGESTION_COST_PER_120S = 0.07  # the website's displayed estimate
 MAX_STL_BYTES = 60 * 1024 * 1024
@@ -1877,3 +1881,8 @@ async def live(socket: WebSocket):
         pass
     finally:
         receiver.cancel()
+
+
+WEBSITE = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if PUBLIC_ORIGIN and WEBSITE.is_dir():  # hosted: one address serves the built website and the API
+    app.mount("/", StaticFiles(directory=WEBSITE, html=True), name="website")

@@ -1,45 +1,89 @@
-# Team7 Dream Labs Hacklab Berlin
+# RoboTester: Dream-1 Robot Evaluation and Benchmarking Platform
 
-A website for configuring a MuJoCo robot scene, sending natural-language tasks to Dream-1, and watching the simulated YAM arms live.
+Team 7, Dream Labs Hacklab Berlin.
 
-It also measures how reliable Dream-1 is: one task or several different tasks can run as parallel runs, each run is checked for success automatically, every run can be watched live, and every run is recorded to video.
+RoboTester is a website for testing the Dream-1 robot model in a MuJoCo simulator. You set up a tabletop scene, give Dream-1 natural-language tasks, watch one or many runs live, and get scored reports from the simulator's evidence. It can then test the report's suggestions and show what changed before and after.
 
-The simulator runs on your computer through the official Dream Labs library. The hosted Dream Labs Playground is not embedded or controlled.
+The simulator runs on your own computer through the official Dream Labs library. The hosted Dream Labs Playground is not embedded or controlled. Simulation results do not prove real-robot safety or reliability.
 
-## System support
+## Contents
 
-| System | Status |
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Run locally](#run-locally)
+- [Use the website](#use-the-website)
+- [Scoring and reports](#scoring-and-reports)
+- [Suggestion testing](#suggestion-testing)
+- [Host it on a domain](#host-it-on-a-domain)
+- [API](#api)
+- [Tests](#tests)
+- [Costs and limitations](#costs-and-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Project history](#project-history)
+
+## What it does
+
+| Area | Features |
 | --- | --- |
-| macOS on Apple Silicon | Clean install tested |
-| Ubuntu 22.04 or newer | Supported by the Dream Labs library, not yet tested with this project |
-| Windows | Not tested. Use Ubuntu under WSL2 and follow the Ubuntu steps |
+| Scene setup | Six scene styles, shuffle, save layout, add blocks, import STL meshes, mark objects Movable or Fixed |
+| Object editing | Click to select and outline, drag, rotate and move objects in the overhead or 3D view |
+| 3D view | Ctrl + drag to rotate and two-finger scroll to zoom, for live and parallel runs |
+| Dream-1 runs | Several tasks across shared scenes, up to 9 runs at once |
+| Fair comparison | The n-th run of every task starts from the same object layout |
+| Live tracking | Each run has its own tab, cameras, timer and 0 to 100% progress bar |
+| Timing | The limit counts movement, Dream-1 decisions and waiting for a free seat, and the site holds until the full time has passed |
+| Reliability | Waits and retries when Dream-1 reports no free capacity |
+| Evaluation | 0 to 100 score, outcome, penalties, task checks and missing-evidence notes for each attempt |
+| Benchmarks | Numbered, renamable history with old reports, videos and timestamps |
+| Video | A video for every run, a combined video, and 1x, 1.5x, 2x and 4x playback |
+| Vision check | A separate local OWLv2 model checks camera visibility and which objects moved in each video |
+| Final reports | Task and scene comparison, best task, best and hardest scene, and recommendations from each run's data |
+| Suggestion testing | Selectable one-change tests, unchanged controls, a test viewer and a before/after graph |
+| Hosting | Runs from your computer on a custom domain through Cloudflare Tunnel, behind an email login |
 
-## Requirements
+## How it works
 
-- Python 3.12, installed automatically by `uv` below
-- Node.js 20.19+ or 22.12+
-- Git and curl
-- OpenGL support for camera rendering
-- A [Dream Labs API key](https://platform.dreamlabs.ai/api-keys)
-
-On Ubuntu, install the basic tools first:
-
-```bash
-sudo apt update
-sudo apt install -y git curl
+```text
+Browser (React + TypeScript)
+   │  HTTP and WebSocket
+   ▼
+FastAPI backend ───────► evaluation engine, reports and saved benchmarks
+   │
+   ├─ live MuJoCo simulator
+   ├─ hidden worker processes for parallel runs
+   └─ local OWLv2 vision check
+   │
+   ▼
+Dream-1 API (the key stays on the backend machine)
 ```
 
-Install Node.js from [nodejs.org](https://nodejs.org/) if `node -v` is missing or too old.
+| Folder | Purpose |
+| --- | --- |
+| `dreamlabs_integration_test/frontend/` | Website |
+| `dreamlabs_integration_test/backend/` | API, simulator control, scenes and run sessions |
+| `dreamlabs_integration_test/backend/evaluation/` | Scoring, insights, reports, storage and suggestion comparison |
+| `dreamlabs_integration_test/backend/vision/` | Separate local vision model |
+| `SortFlow/` | Success checks, parallel workers, capacity retries, live feeds and recording |
+| `dreamlabs_integration_test/EVALUATION.md` | Detailed scoring and evidence rules |
+
+Run data is saved locally in `backend/evaluation_data/` and `backend/task_videos/`. Both are ignored by Git.
 
 ## Install
 
-Run these from the folder where you want the project:
+**Requirements:** Python 3.12 (installed by `uv` below), Node.js 20.19+ or 22.12+, Git, curl, OpenGL support and a [Dream Labs API key](https://platform.dreamlabs.ai/api-keys).
+
+| System | Status |
+| --- | --- |
+| macOS on Apple Silicon | Used for development |
+| Ubuntu 22.04 or newer | Supported by the Dream Labs library, not tested with this project |
+| Windows | Not tested. Use Ubuntu under WSL2 |
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-git clone -b ashiq-integration-v2 https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
+git clone -b web-integration https://github.com/Deniston-Antony/Team7_DreamLabs_Hacklab_Berlin.git
 cd Team7_DreamLabs_Hacklab_Berlin/dreamlabs_integration_test
 
 cd backend
@@ -51,9 +95,18 @@ npm ci
 cd ..
 ```
 
-The parallel runs, run tabs and videos are on the `ashiq-integration-v2` branch. Once it is merged, clone `Deniston` instead.
+### Optional: install the vision check
 
-## Add your API key
+This is a large download. Without it, runs and scoring still work, and reports say the vision check is unavailable.
+
+```bash
+cd backend
+uv venv --python 3.12 .vision-venv
+uv pip install --python .vision-venv/bin/python -r vision/requirements.txt
+cd ..
+```
+
+### Add your API key
 
 Paste this block, then paste your key when asked. The key stays hidden and is saved outside the project.
 
@@ -76,127 +129,197 @@ Paste this block, then paste your key when asked. The key stays hidden and is sa
 
 Never commit this file or put the key in frontend code.
 
-## Run
+Before the first run on a new computer, a person should check what the model receives, as the [Dream Labs docs](https://platform.dreamlabs.ai/api-documentation/control-loop/#check-what-the-model-sees) require.
 
-Start from the `dreamlabs_integration_test` folder and use two terminals.
+## Run locally
 
-**Terminal 1: backend**
+From `dreamlabs_integration_test`, use two terminals.
 
 ```bash
 cd backend
 .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Wait for `Uvicorn running on http://127.0.0.1:8000`.
-
-**Terminal 2: website**
-
 ```bash
 cd frontend
 npm run dev
 ```
 
-Open **http://127.0.0.1:5173**. Press `Ctrl+C` in each terminal to stop.
+Open **http://127.0.0.1:5173**. API docs are at http://127.0.0.1:8000/docs. In local mode, `http://127.0.0.1:8000` showing `{"detail":"Not Found"}` is normal.
 
-| Service | Link |
-| --- | --- |
-| Website | http://127.0.0.1:5173 |
-| API docs | http://127.0.0.1:8000/docs |
-| Backend check | http://127.0.0.1:8000/api/scenes |
+## Use the website
 
-`http://127.0.0.1:8000` showing `{"detail":"Not Found"}` is normal because the backend has no home page.
+### Set up and run
 
-## Use it
+1. On **Simulator**, press **Reset scene** for a clean start.
+2. Choose a scene style and arrange the objects.
+3. Enter a task such as `put apple into the bowl` or `put orange on the plate`. Use **Add task** for more tasks.
+4. Set **Scenes per task**. For example, 2 tasks × 3 scenes = 6 runs, up to 9.
+5. Choose **Start scenes**: copies of the live scene, shuffled positions, or shuffled positions with scene styles.
+6. Set **Time limit per run**, from 5 to 200 seconds. Start with at least 120 seconds.
+7. Press **Run task** and click any run card to watch it.
 
-### Run one task
+**Layout seed** is the number that decides the shuffled layouts and styles. The same starting scene, mode and seed give the same layouts again. **New layouts** picks a new seed and replaces hand edits in the parallel scenes.
 
-1. Press **Reset scene** for a clean scene.
-2. Choose a scene. Click an object in the **Overhead** or **3D view** camera to select and outline it, then drag it, rotate it, or set it to **Movable** or **Fixed** in the **Scene objects** table. You can also add a block, import a `.stl` file with **Import mesh**, or press **Shuffle**. In 3D view, hold **Ctrl** and drag to rotate the camera, and scroll with two fingers to zoom.
-3. In **Tasks**, enter a task in the form `put <object> into the bowl` or `put <object> on the plate`, such as `put apple into the bowl`.
-4. Set **Time limit per run** from 5 to 200 seconds.
-5. Press **Run task** and watch the live view and timer. The run stops with **Succeeded** as soon as the simulator confirms the object has settled in the bowl or on the plate, or ends with **Time limit reached**. Use **Stop** to end early.
+### Time limit
 
-### Run a task several times at once
+Each run's timer starts at its first Dream-1 request and counts robot movement, Dream-1 decision time and waiting for a free seat. Loading is not counted. A finished run leaves Dream-1, but the website waits for the full limit before creating videos and reports.
 
-Set **Runs for this task** to more than 1, for example 4. The first run is the live one in the picture; the others are parallel runs in the background. Each parallel run starts from a copy of the scene as it is when you press **Run task**, including objects you moved, added or removed, and is judged by the same success check. Parallel runs exist only while a task runs, so **Reset scene** before **Run task** gives every run, live and parallel, the same clean start. A stopped parallel run still keeps its video and shows **Stopped**. At the end the result reads, for example, **3 of 4 runs succeeded**, with each run's time or how close it got.
+### Reports
 
-### Give each parallel run its own environment
+Open **Benchmarks** to see every benchmark, rename it, and open its runs. Each run has a **Final report** and a tab for each attempt.
 
-With more than one run, **Parallel run environments** chooses what the parallel runs start from:
+## Scoring and reports
 
-- **Same as the live scene**: an exact copy of your scene.
-- **Shuffled object positions**: each parallel run gets its own collision-free layout of the movable objects (the bowl and plate stay put).
-- **Shuffled positions and scene styles**: each parallel run also gets another scene style (table, floor, walls and light), cycling through the other styles.
+Each attempt gets a score from 0 to 100:
 
-The live run always keeps your scene. Before you press **Run**, the **Runs** tabs show every environment as **Ready**; click a tab to see its starting scene. **Layout seed** makes the environments reproducible (the same scene and seed give the same layouts), and **New layouts** picks a new seed. Editing the scene or pressing **Reset scene** rebuilds the environments from the new scene. Results name each run's environment, for example `Parallel run 3 (Sunny apartment style, shuffled)`. A shuffled layout can be harder than yours (an object farther from the arms), so compare success rates with that in mind.
+| Component | Points |
+| --- | ---: |
+| Goal completion | 40 |
+| Correct object and placement | 20 |
+| Scene preservation | 15 |
+| Interaction quality | 15 |
+| Efficiency | 10 |
 
-### Run several different tasks at once
+Outcomes are **Success**, **Partial success**, **Failure**, **Unsafe** and **Not evaluable**. Penalties and score caps are explained in [EVALUATION.md](dreamlabs_integration_test/EVALUATION.md).
 
-Press **Add task** and enter another task, such as `put orange into the bowl`. Each task has its own number of runs. Press **Run 2 tasks**. The result lists each task, for example **2 of 3 tasks succeeded**. A task the checker cannot understand is refused before anything starts, and the message names it.
+Dream-1 returns robot actions, not what it internally detected. The local vision check therefore describes what the cameras and videos show. It is not scored and does not prove what Dream-1 understood.
 
-At most 8 runs can run at once, counting every task. The line under **Add task** shows the total and the most it can cost.
+## Suggestion testing
 
-### Watch every run
+Open a benchmark and choose the **Suggestion testing** tab beside its title. Testing is available after a run and its analysis have finished, when at least one attempt failed.
 
-The **Runs** tabs on the left of the picture list **Live run**, **Parallel run 2**, and so on, each with its goal (such as `Orange → Bowl`) and its state: Starting, Running, Succeeded, Failed or Stopped. Click a tab to watch that run live. Parallel runs show their camera view only (Overhead, Left wrist and Right wrist); the **Scene objects** table always shows the live run. Editing the scene is turned off while a parallel run is shown.
+1. Tick the tests to run, or use **Select all / Deselect all**.
+2. Press **Run selected tests**. The button shows the most they can cost.
+3. Watch each test in the simulator-style viewer.
+4. Compare the before/after graph, result table and saved rounds.
 
-### Reset, save a layout, restart
+Each test starts from a failed attempt's saved scene and makes **one change**:
 
-- **Reset scene** puts every object and both arms back where they started. It also works while a task runs: after you confirm, it stops the live run and every parallel run, keeps their videos, then resets. Parallel runs only exist while a task runs; once it ends, their tabs show their last picture until **Reset scene** clears them, and the next task starts every run from the reset scene.
-- **Save layout** remembers the scene as it is now, including objects you moved, added, removed or set to Fixed. From then on, **Reset scene** puts that layout back instead of the default table. **Use default instead** forgets it.
-- **Restart** stops whatever is running, resets the scene and runs the last tasks again with the same runs and time limit. It uses credits again.
+- Move the object closer to an arm.
+- Shorten the carry to the destination.
+- Add clear space around the object.
+- Use the orientation from a successful attempt.
+- Name the object more clearly.
+- Give the run more time.
 
-### Videos
+An **unchanged control** measures normal run-to-run variation. A change is marked **Helped** or **Worse** only when it differs from the control's change by at least 10 points. Each test runs once, so repeat a promising result before relying on it.
 
-Every run is recorded. When a task ends, a video player appears under the result, with links to each run (**Live run**, **Parallel run 2**, ...) and, with more than one run, **All runs**: one video with every run side by side, framed green for success and red for failure. The files are saved in `dreamlabs_integration_test/backend/task_videos/<task id>/`.
+These tests do not change the benchmark score and do not retrain Dream-1. Fine-tuning Dream-1 requires an uploaded dataset of robot demonstrations, not written suggestions.
 
-**Every run uses Dream Labs credits, parallel runs included.** About $0.06 for a 120-second run; the page shows the most a request can cost before you press **Run**. Check current prices on the [Billing page](https://platform.dreamlabs.ai/billing).
+## Host it on a domain
 
-Before the first run on a new computer, a person should check what the model receives, as the [Dream Labs docs](https://platform.dreamlabs.ai/api-documentation/control-loop/#check-what-the-model-sees) require.
+This setup serves the site from your computer through Cloudflare Tunnel. GitHub stores the code, but GitHub Pages cannot run this app because it needs the Python backend, MuJoCo and a private API key.
 
-## Current limitations
+**Do not expose the app without a login. Anyone who can open it can spend your Dream-1 credits.**
 
-- Six local tabletop scene styles. They change colors, lighting and walls, and are not the hosted Playground rooms.
-- Only the YAM robot can run. Other arms are listed as setup required until each has simulator actuators, cameras and a person-measured tool center point.
-- Automatic success checks cover putting a movable object in the bowl or on the plate. Other instructions run until the time limit or until stopped, and cannot have parallel runs.
-- One request runs at a time, with up to 8 runs in it. **Add simulation** is a placeholder.
-- Parallel runs show the camera view only, not the 3D view, the object table or the joint values.
-- STL uploads are limited to 60 MB and 1.5 million triangles, are simplified to 60,000 triangles when larger, and are scaled to the size you enter. MuJoCo uses a convex collision shape, so hollow objects such as cups behave as solid.
-- Objects and arms stay where a task leaves them until you press **Reset scene**.
-- The saved layout is kept only while the backend runs; restarting the backend forgets it.
-- The website only accepts connections from the same computer.
-- Simulation results do not prove real-robot safety or reliability.
+1. Add your domain to Cloudflare and change the nameservers at your registrar.
+2. In Cloudflare Zero Trust, create a **Self-hosted** Access application for the domain, with an **Allow** policy listing only approved email addresses.
+3. Install and approve the tunnel:
+
+```bash
+brew install cloudflared
+cloudflared tunnel login
+cloudflared tunnel create robotester
+cloudflared tunnel route dns robotester your-domain.example
+```
+
+4. Create `~/.cloudflared/robotester.yml`, using the tunnel ID printed above. Never commit this file or the tunnel's credentials.
+
+```yaml
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /Users/YOUR_USER/.cloudflared/YOUR_TUNNEL_ID.json
+ingress:
+  - hostname: your-domain.example
+    service: http://127.0.0.1:8020
+  - service: http_status:404
+```
+
+5. Build the website and start the backend from `dreamlabs_integration_test`:
+
+```bash
+(cd frontend && npm run build)
+cd backend
+DREAM_PUBLIC_ORIGIN=https://your-domain.example MUJOCO_GL=cgl caffeinate -i .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8020
+```
+
+On Linux, leave out `caffeinate -i` and use a suitable `MUJOCO_GL` value.
+
+6. In a second terminal, start the tunnel:
+
+```bash
+cloudflared tunnel --config ~/.cloudflared/robotester.yml run
+```
+
+7. In a private browser window, confirm that the domain asks for a login before showing the website.
+
+The site is online only while the computer is awake, connected and running both commands. Everyone who logs in shares one simulator and the owner's Dream-1 credits. If a network cannot resolve a new domain, try Chrome's **Use secure DNS** setting with Cloudflare (1.1.1.1), or another network.
+
+## API
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/tasks/execute` | Start a run |
+| `GET` | `/api/tasks/{task_id}/status` | Run status |
+| `POST` | `/api/tasks/{task_id}/cancel` | Stop a run |
+| `GET` | `/api/tasks/{task_id}/video/{clip}` | Run video |
+| `GET`, `POST` | `/api/evaluation/batches` | List or start benchmarks |
+| `PATCH` | `/api/evaluation/batches/{batch_id}` | Rename a benchmark |
+| `GET` | `/api/reports/tasks/{task_id}?format=json\|html` | Attempt report |
+| `GET` | `/api/reports/runs/{run_id}?format=json\|html` | Final run report |
+| `GET` | `/api/reports/batches/{batch_id}?format=json\|html` | Benchmark report |
+| `POST` | `/api/reports/runs/{run_id}/analyze-videos` | Analyse an older run's videos |
+| `GET` | `/api/reports/runs/{run_id}/suggestion-tests` | Test plan, progress and results |
+| `POST` | `/api/reports/runs/{run_id}/suggestion-tests` | Start selected tests |
+| `WS` | `/ws/live` | Live state and camera frames |
+
+## Tests
+
+These tests use no API key and no credits:
+
+```bash
+cd dreamlabs_integration_test/backend
+uv pip install --python .venv/bin/python httpx
+DREAM_VISION=off DREAM_GATEWAY_URL=https://127.0.0.1:9 MUJOCO_GL=cgl .venv/bin/python -m unittest test_evaluation test_outcome
+cd ../../SortFlow
+MUJOCO_GL=cgl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest test_capacity test_parallel_bench test_recording
+```
+
+Use `MUJOCO_GL=egl` on headless Linux.
+
+## Costs and limitations
+
+- Every live, parallel and suggestion run uses Dream Labs credits. The website estimates about $0.07 for a 120-second run and shows the most a request can cost. Check the [Billing page](https://platform.dreamlabs.ai/billing) for current prices.
+- One request runs at a time, with up to 9 runs, or up to 8 for suggestion tests.
+- Only the YAM robot can run. Other arms are listed until they have simulator actuators, cameras and a measured tool center point.
+- Automatic success checks cover putting a movable object in the bowl or on the plate.
+- Small benchmarks can vary a lot from run to run. Repeat results before drawing conclusions.
+- STL uploads are limited to 60 MB and 1.5 million triangles. Hollow objects behave as solid because MuJoCo uses a convex collision shape.
+- A saved layout lasts only while the backend runs.
 
 ## Troubleshooting
 
 | Problem | Fix |
 | --- | --- |
-| `cd: no such file or directory` | Move to the `dreamlabs_integration_test` folder first |
 | `No module named uvicorn` | Run the install step and use `.venv/bin/python` from `backend` |
-| Port 8000 or 5173 is in use | Stop the other server using that port |
+| Port 8000, 5173 or 8020 is in use | Stop the other server using that port |
 | Website says **Reconnecting** | Start the backend, then refresh |
-| Camera rendering fails on headless Linux | Try `MUJOCO_GL=egl` before the backend command on a compatible GPU |
-| Task fails with an API key or credit error | Check `~/.dreamlabs/credentials` and your Dream Labs balance |
-| A parallel run shows `exit 2` or "Use /login, set DREAM_API_KEY" | Parallel runs read the same key as the backend. Save it with the step above, then restart the backend |
-| A parallel run shows **Stopped** without a result | Its process ended early; its error is listed under the result. Check the backend terminal |
-| Buttons do not match this README | Restart both servers after pulling, then refresh the page |
-| `task_videos` is getting large | Delete old folders in `dreamlabs_integration_test/backend/task_videos/`; they are not part of the project |
+| Task fails with a key or credit error | Check `~/.dreamlabs/credentials` and your Dream Labs balance |
+| Dream-1 reports no capacity | The run waits and retries. Use fewer parallel runs or try later |
+| Vision check is unavailable | Install the optional vision environment |
+| Domain does not open in Chrome | Check that the backend and tunnel are running, then try Cloudflare secure DNS |
+| Page differs from this README | Restart the servers after pulling, rebuild if hosted, and refresh |
+| `task_videos` is large | Delete old run folders you no longer need |
 
-## Tests
+## Project history
 
-The success check, parallel runs, live run view and videos have offline tests that need no API key and no credits:
+| Branch | What it added |
+| --- | --- |
+| `Deniston` | Website, live MuJoCo stream, scene editing, STL import and timers |
+| `ashiq-integration-v2` | SortFlow parallel runs, run tabs, recording and scene environments |
+| `Deniston+improved_report` | Evaluation engine, reports, benchmark history, vision check and fair timing |
+| `Deniston+Final_Report` | Shared scenes, combined videos, playback speeds, scene comparison, parallel 3D editing and per-run timers |
+| `suggestion_testing` | One-change tests, controls, test viewer and before/after results |
+| `web-integration` | Custom-domain hosting through Cloudflare Tunnel and this README |
 
-```bash
-cd dreamlabs_integration_test/backend
-uv pip install --python .venv/bin/python httpx   # only once: the API tests need it
-MUJOCO_GL=egl .venv/bin/python -m unittest test_outcome
-cd ../../SortFlow
-MUJOCO_GL=egl ../dreamlabs_integration_test/backend/.venv/bin/python -m unittest test_sortflow test_parallel_bench test_livefeed test_recording
-```
-
-On macOS, leave out `MUJOCO_GL=egl`.
-
-## More
-
-- `SortFlow/` holds the success checker, the parallel-run worker, live streaming and recording the website uses, and a terminal version of the simulator with the same features. See [SortFlow/README.md](SortFlow/README.md).
-- More detail is in the [integration feasibility report](dreamlabs_integration_test/DREAMLABS_INTEGRATION_FEASIBILITY_REPORT.md).
+**Team:** Deniston (website and simulator integration), Umar (evaluation, scoring and reports) and Ashiq (robot, CLI and execution).
